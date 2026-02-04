@@ -1,6 +1,6 @@
 {
   "name": "kanban-vsix",
-  "displayName": "Folder Kanban",
+  "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
   "version": "0.0.1",
   "publisher": "local",
@@ -9,9 +9,6 @@
   },
   "categories": [
     "Other"
-  ],
-  "activationEvents": [
-    "onCustomEditor:kanban.board"
   ],
   "main": "./out/extension.js",
   "contributes": {

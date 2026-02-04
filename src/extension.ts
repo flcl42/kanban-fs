@@ -7,6 +7,7 @@ type Card = {
   title: string;
   body: string;
   bodyHtml: string;
+  tags: string[];
   createdAt: number;
 };
 
@@ -102,6 +103,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await sendBoard();
         return;
       }
+      if (message?.type === "openFile" && message?.cardUri) {
+        const target = vscode.Uri.parse(message.cardUri);
+        await vscode.window.showTextDocument(target, { preview: true });
+        return;
+      }
     });
 
     await sendBoard();
@@ -169,7 +175,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const fileUri = vscode.Uri.joinPath(columnUri, name);
       const raw = await vscode.workspace.fs.readFile(fileUri);
       const text = Buffer.from(raw).toString("utf8");
-      const { title, body } = parseMarkdown(text, name);
+      const { title, body, tags } = parseMarkdown(text, name);
       const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
       cards.push({
@@ -178,6 +184,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         title,
         body,
         bodyHtml,
+        tags,
         createdAt: stat.ctime,
       });
     }
@@ -303,6 +310,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       font-size: 12px;
       color: var(--muted);
     }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .tag {
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
     .details {
       background: #fff;
       border: 1px solid var(--line);
@@ -350,17 +370,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const vscode = acquireVsCodeApi();
     const boardEl = document.getElementById("board");
     const detailsEl = document.getElementById("details");
+    let selectedCard = null;
+    let lastBoard = null;
+    let refreshTimer = null;
 
     const renderDetails = (card) => {
       if (!card) {
         detailsEl.innerHTML = '<div class="empty">Select a card to view details.</div>';
         return;
       }
-      const created = new Date(card.createdAt).toLocaleString();
+      selectedCard = card;
+      const created = new Date(card.createdAt);
+      const createdLabel = created.toLocaleString();
+      const createdRelative = formatRelativeTime(created);
       const bodyHtml = card.bodyHtml || '';
+      const tagsHtml = renderTags(card.tags || []);
       detailsEl.innerHTML = \`
         <h1>\${escapeHtml(card.title)}</h1>
-        <div class="meta">Created: \${created}</div>
+        <div class="meta">Created: \${createdLabel} · \${createdRelative}</div>
+        \${tagsHtml}
         <hr />
         <div>\${bodyHtml}</div>
       \`;
@@ -373,6 +401,70 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+    };
+
+    const hashString = (value) => {
+      let hash = 0;
+      for (let i = 0; i < value.length; i++) {
+        hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+      }
+      return hash;
+    };
+
+    const hslToRgb = (h, s, l) => {
+      const c = (1 - Math.abs(2 * l - 1)) * s;
+      const hp = h / 60;
+      const x = c * (1 - Math.abs((hp % 2) - 1));
+      let [r1, g1, b1] = [0, 0, 0];
+      if (hp >= 0 && hp < 1) [r1, g1, b1] = [c, x, 0];
+      else if (hp >= 1 && hp < 2) [r1, g1, b1] = [x, c, 0];
+      else if (hp >= 2 && hp < 3) [r1, g1, b1] = [0, c, x];
+      else if (hp >= 3 && hp < 4) [r1, g1, b1] = [0, x, c];
+      else if (hp >= 4 && hp < 5) [r1, g1, b1] = [x, 0, c];
+      else if (hp >= 5 && hp < 6) [r1, g1, b1] = [c, 0, x];
+      const m = l - c / 2;
+      return [r1 + m, g1 + m, b1 + m];
+    };
+
+    const readableTextColor = (r, g, b) => {
+      const srgb = [r, g, b].map((v) => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)));
+      const luminance = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+      return luminance > 0.5 ? "#1f1b14" : "#fff";
+    };
+
+    const tagStyle = (tag) => {
+      const hash = hashString(tag.toLowerCase());
+      const hue = hash % 360;
+      const saturation = 0.55;
+      const lightness = 0.5;
+      const [r, g, b] = hslToRgb(hue, saturation, lightness);
+      const text = readableTextColor(r, g, b);
+      const rgb = \`rgb(\${Math.round(r * 255)}, \${Math.round(g * 255)}, \${Math.round(b * 255)})\`;
+      return { background: rgb, color: text };
+    };
+
+    const renderTags = (tags) => {
+      if (!tags?.length) return "";
+      const pills = tags.map((tag) => {
+        const safe = escapeHtml(tag);
+        const style = tagStyle(tag);
+        return \`<span class="tag" style="background:\${style.background};color:\${style.color}">\${safe}</span>\`;
+      }).join("");
+      return \`<div class="tags">\${pills}</div>\`;
+    };
+
+    const openCard = (card) => {
+      if (!card?.uri) return;
+      vscode.postMessage({ type: "openFile", cardUri: card.uri });
+    };
+
+    const findCard = (board, uri) => {
+      for (const column of board?.columns || []) {
+        for (const card of column.cards || []) {
+          if (card.uri === uri) return card;
+        }
+      }
+      return null;
     };
 
     const renderBoard = (board) => {
@@ -407,11 +499,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           cardEl.className = "card";
           cardEl.draggable = true;
           cardEl.dataset.uri = card.uri;
+          const tagsHtml = renderTags(card.tags || []);
+          const created = new Date(card.createdAt);
+          const createdLabel = created.toLocaleDateString();
+          const createdRelative = formatRelativeTime(created);
           cardEl.innerHTML = \`
             <h3>\${escapeHtml(card.title)}</h3>
-            <div class="meta">\${new Date(card.createdAt).toLocaleDateString()}</div>
+            <div class="meta">\${createdLabel} · \${createdRelative}</div>
+            \${tagsHtml}
           \`;
           cardEl.addEventListener("click", () => renderDetails(card));
+          cardEl.addEventListener("dblclick", () => openCard(card));
           cardEl.addEventListener("dragstart", (event) => {
             event.dataTransfer.setData("text/uri-list", card.uri);
           });
@@ -421,24 +519,83 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
     };
 
+    detailsEl.addEventListener("dblclick", () => openCard(selectedCard));
+
     window.addEventListener("message", (event) => {
       const message = event.data;
       if (message?.type === "boardData") {
+        lastBoard = message.board;
         renderBoard(message.board);
+        if (selectedCard && lastBoard?.columns) {
+          const updated = findCard(lastBoard, selectedCard.uri);
+          if (updated) {
+            renderDetails(updated);
+          }
+        }
+        if (!refreshTimer) {
+          refreshTimer = setInterval(() => {
+            if (!lastBoard) return;
+            renderBoard(lastBoard);
+            if (selectedCard) {
+              const refreshed = findCard(lastBoard, selectedCard.uri);
+              if (refreshed) {
+                renderDetails(refreshed);
+              }
+            }
+          }, 60000);
+        }
       }
     });
 
     vscode.postMessage({ type: "ready" });
+
+    function formatRelativeTime(date) {
+      const now = new Date();
+      const diffMs = date.getTime() - now.getTime();
+      const diffSec = Math.round(diffMs / 1000);
+      const absSec = Math.abs(diffSec);
+
+      if (absSec < 60) {
+        return "just now";
+      }
+
+      const units = [
+        { name: "minute", seconds: 60 },
+        { name: "hour", seconds: 3600 },
+        { name: "day", seconds: 86400 },
+        { name: "week", seconds: 604800 },
+        { name: "month", seconds: 2592000 },
+        { name: "year", seconds: 31536000 },
+      ];
+
+      let unit = units[0];
+      for (const next of units) {
+        if (absSec >= next.seconds) {
+          unit = next;
+        } else {
+          break;
+        }
+      }
+
+      const value = Math.round(absSec / unit.seconds);
+      const label = value === 1 ? unit.name : unit.name + "s";
+      return diffSec < 0 ? \`\${value} \${label} ago\` : \`in \${value} \${label}\`;
+    }
   </script>
 </body>
 </html>`;
   }
 }
 
-function parseMarkdown(content: string, fallbackTitle: string): { title: string; body: string } {
+function parseMarkdown(
+  content: string,
+  fallbackTitle: string
+): { title: string; body: string; tags: string[] } {
   const lines = content.split(/\r?\n/);
   let title = fallbackTitle.replace(/\.md$/i, "");
   let bodyStart = 0;
+  const tags: string[] = [];
+  const tagPattern = /^tags\s*:\s*(.+)$/i;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (line.startsWith("# ")) {
@@ -447,8 +604,32 @@ function parseMarkdown(content: string, fallbackTitle: string): { title: string;
       break;
     }
   }
-  const body = lines.slice(bodyStart).join("\n").trim();
-  return { title, body };
+  for (let i = 0; i < bodyStart; i++) {
+    const match = lines[i].match(tagPattern);
+    if (match) {
+      const parsed = match[1]
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+      tags.push(...parsed);
+    }
+  }
+  const bodyLines: string[] = [];
+  for (let i = bodyStart; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(tagPattern);
+    if (match) {
+      const parsed = match[1]
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter((tag) => tag.length > 0);
+      tags.push(...parsed);
+      continue;
+    }
+    bodyLines.push(line);
+  }
+  const body = bodyLines.join("\n").trim();
+  return { title, body, tags };
 }
 
 function getNonce(): string {
