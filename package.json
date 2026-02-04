@@ -1,0 +1,45 @@
+{
+  "name": "kanban-vsix",
+  "displayName": "Folder Kanban",
+  "description": "Kanban board backed by folders and markdown files.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCustomEditor:kanban.board"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "kanban.board",
+        "displayName": "Kanban Board",
+        "selector": [
+          {
+            "filenamePattern": "*.kanban"
+          }
+        ],
+        "priority": "default"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "tsc -p ./",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/markdown-it": "^13.0.7",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.5.4"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0"
+  }
+}
