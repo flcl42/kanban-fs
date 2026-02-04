@@ -2,14 +2,16 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "0.0.1",
-  "publisher": "local",
+  "version": "1.0.2",
+  "publisher": "flcl42",
+  "repository": "https://github.com/flcl42/kanban-fs",
   "engines": {
     "vscode": "^1.90.0"
   },
   "categories": [
     "Other"
   ],
+  "icon": "icon.png",
   "main": "./out/extension.js",
   "contributes": {
     "customEditors": [
