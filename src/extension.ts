@@ -8,11 +8,14 @@ type Card = {
   body: string;
   bodyHtml: string;
   tags: string[];
+  priority: number | null;
   createdAt: number;
 };
 
 type Column = {
+  id: string;
   name: string;
+  order: number | null;
   cards: Card[];
 };
 
@@ -98,8 +101,55 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await sendBoard();
         return;
       }
+      if (message?.type === "requestNewCard") {
+        const columnId = String(
+          message?.columnId ?? message?.columnName ?? ""
+        ).trim();
+        if (!columnId) {
+          return;
+        }
+        const title = await vscode.window.showInputBox({
+          prompt: "Ticket title",
+          placeHolder: "New ticket",
+          ignoreFocusOut: true,
+        });
+        if (title === undefined) {
+          return;
+        }
+        await this.createCard(document.uri, columnId, title);
+        await sendBoard();
+        return;
+      }
+      if (message?.type === "reorderCards") {
+        const orderedUris = Array.isArray(message?.orderedUris)
+          ? message.orderedUris
+          : [];
+        await this.reorderCards(
+          document.uri,
+          message?.cardUri,
+          message?.sourceColumnId,
+          message?.targetColumnId,
+          orderedUris
+        );
+        await sendBoard();
+        return;
+      }
+      if (message?.type === "reorderColumns") {
+        await this.reorderColumns(
+          document.uri,
+          message?.sourceColumnId,
+          message?.targetColumnId,
+          message?.position
+        );
+        await sendBoard();
+        return;
+      }
       if (message?.type === "moveCard") {
-        await this.moveCard(document.uri, message.cardUri, message.targetColumn);
+        await this.moveCard(
+          document.uri,
+          message.cardUri,
+          message.targetColumnId ?? message.targetColumn
+        );
         await sendBoard();
         return;
       }
@@ -156,11 +206,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         continue;
       }
       const columnUri = vscode.Uri.joinPath(boardFolder, name);
+      const meta = await this.readColumnMeta(columnUri, name);
       const cards = await this.readCards(columnUri);
-      columns.push({ name, cards });
+      columns.push({
+        id: name,
+        name: meta.title,
+        order: meta.order,
+        cards,
+      });
     }
 
-    columns.sort((a, b) => a.name.localeCompare(b.name));
+    columns.sort((a, b) => {
+      const orderA = a.order ?? Number.POSITIVE_INFINITY;
+      const orderB = b.order ?? Number.POSITIVE_INFINITY;
+      if (orderA !== orderB) {
+        return orderA - orderB;
+      }
+      return a.name.localeCompare(b.name);
+    });
     return { columns };
   }
 
@@ -172,10 +235,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (type !== vscode.FileType.File || !name.toLowerCase().endsWith(".md")) {
         continue;
       }
+      if (name.toLowerCase() === "folder.md") {
+        continue;
+      }
       const fileUri = vscode.Uri.joinPath(columnUri, name);
       const raw = await vscode.workspace.fs.readFile(fileUri);
       const text = Buffer.from(raw).toString("utf8");
-      const { title, body, tags } = parseMarkdown(text, name);
+      const { title, body, tags, priority } = parseMarkdown(text, name);
       const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
       cards.push({
@@ -185,25 +251,47 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         body,
         bodyHtml,
         tags,
+        priority,
         createdAt: stat.ctime,
       });
     }
 
-    cards.sort((a, b) => a.title.localeCompare(b.title));
+    cards.sort((a, b) => {
+      const priorityA = a.priority ?? Number.POSITIVE_INFINITY;
+      const priorityB = b.priority ?? Number.POSITIVE_INFINITY;
+      if (priorityA !== priorityB) {
+        return priorityA - priorityB;
+      }
+      return a.title.localeCompare(b.title);
+    });
     return cards;
+  }
+
+  private async readColumnMeta(
+    columnUri: vscode.Uri,
+    fallbackTitle: string
+  ): Promise<{ title: string; order: number | null }> {
+    const metaUri = vscode.Uri.joinPath(columnUri, "folder.md");
+    try {
+      const raw = await vscode.workspace.fs.readFile(metaUri);
+      const text = Buffer.from(raw).toString("utf8");
+      return parseColumnMarkdown(text, fallbackTitle);
+    } catch {
+      return { title: fallbackTitle, order: null };
+    }
   }
 
   private async moveCard(
     kanbanUri: vscode.Uri,
     cardUriString: string,
-    targetColumnName: string
+    targetColumnId: string
   ): Promise<void> {
-    if (!cardUriString || !targetColumnName) {
+    if (!cardUriString || !targetColumnId) {
       return;
     }
     const cardUri = vscode.Uri.parse(cardUriString);
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
-    const targetColumnUri = vscode.Uri.joinPath(boardFolder, targetColumnName);
+    const targetColumnUri = vscode.Uri.joinPath(boardFolder, targetColumnId);
     const fileName = cardUri.path.split("/").pop();
     if (!fileName) {
       return;
@@ -213,6 +301,213 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
     await vscode.workspace.fs.rename(cardUri, newUri, { overwrite: false });
+    const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
+    await this.resequenceColumnPriorities(sourceColumnUri);
+    if (sourceColumnUri.toString() !== targetColumnUri.toString()) {
+      await this.resequenceColumnPriorities(targetColumnUri);
+    }
+  }
+
+  private async createCard(
+    kanbanUri: vscode.Uri,
+    columnId: string,
+    title: string
+  ): Promise<void> {
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const columnUri = vscode.Uri.joinPath(boardFolder, columnId);
+    let stat: vscode.FileStat;
+    try {
+      stat = await vscode.workspace.fs.stat(columnUri);
+    } catch {
+      return;
+    }
+    if (stat.type !== vscode.FileType.Directory) {
+      return;
+    }
+
+    const trimmedTitle = title.trim();
+    const safeTitle = trimmedTitle || "New ticket";
+    const baseName = slugifyFileName(trimmedTitle) || "new-ticket";
+    const entries = await vscode.workspace.fs.readDirectory(columnUri);
+    const existing = new Set(
+      entries
+        .filter(([, type]) => type === vscode.FileType.File)
+        .map(([name]) => name.toLowerCase())
+    );
+
+    let fileName = `${baseName}.md`;
+    if (existing.has(fileName.toLowerCase())) {
+      let counter = 2;
+      while (existing.has(`${baseName}-${counter}.md`)) {
+        counter += 1;
+      }
+      fileName = `${baseName}-${counter}.md`;
+    }
+
+    const existingCards = await this.readCards(columnUri);
+    const maxPriority = existingCards.reduce((max, card) => {
+      return typeof card.priority === "number" && Number.isFinite(card.priority)
+        ? Math.max(max, card.priority)
+        : max;
+    }, 0);
+    const nextPriority = maxPriority + 1;
+    const fileUri = vscode.Uri.joinPath(columnUri, fileName);
+    const content = `# ${safeTitle}\n\nPriority: ${nextPriority}\n\n`;
+    await vscode.workspace.fs.writeFile(fileUri, Buffer.from(content, "utf8"));
+  }
+
+  private async reorderCards(
+    kanbanUri: vscode.Uri,
+    cardUriString: string,
+    sourceColumnId: string,
+    targetColumnId: string,
+    orderedUris: string[]
+  ): Promise<void> {
+    if (!targetColumnId || !Array.isArray(orderedUris)) {
+      return;
+    }
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const targetColumnUri = vscode.Uri.joinPath(boardFolder, targetColumnId);
+    let movedCardUriString = cardUriString;
+
+    if (cardUriString && sourceColumnId && sourceColumnId !== targetColumnId) {
+      const cardUri = vscode.Uri.parse(cardUriString);
+      const fileName = cardUri.path.split("/").pop();
+      if (fileName) {
+        const newUri = vscode.Uri.joinPath(targetColumnUri, fileName);
+        if (cardUri.toString() !== newUri.toString()) {
+          await vscode.workspace.fs.rename(cardUri, newUri, { overwrite: false });
+        }
+        movedCardUriString = newUri.toString();
+      }
+    }
+
+    const normalizedUris = orderedUris.map((uri) =>
+      uri === cardUriString && movedCardUriString ? movedCardUriString : uri
+    );
+    await this.updateCardPriorities(normalizedUris);
+
+    if (sourceColumnId && sourceColumnId !== targetColumnId) {
+      const sourceColumnUri = vscode.Uri.joinPath(boardFolder, sourceColumnId);
+      await this.resequenceColumnPriorities(sourceColumnUri);
+    }
+  }
+
+  private async updateCardPriorities(
+    orderedUris: string[]
+  ): Promise<void> {
+    const seen = new Set<string>();
+    let priority = 1;
+    for (const uriString of orderedUris) {
+      if (!uriString || seen.has(uriString)) {
+        continue;
+      }
+      seen.add(uriString);
+      const fileUri = vscode.Uri.parse(uriString);
+      try {
+        await this.updateMarkdownNumber(fileUri, "Priority", priority);
+        priority += 1;
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  private async resequenceColumnPriorities(
+    columnUri: vscode.Uri
+  ): Promise<void> {
+    try {
+      const cards = await this.readCards(columnUri);
+      const orderedUris = cards.map((card) => card.uri);
+      await this.updateCardPriorities(orderedUris);
+    } catch {
+      return;
+    }
+  }
+
+  private async reorderColumns(
+    kanbanUri: vscode.Uri,
+    sourceColumnId: string,
+    targetColumnId: string,
+    position: "before" | "after" | undefined
+  ): Promise<void> {
+    if (!sourceColumnId || !targetColumnId || sourceColumnId === targetColumnId) {
+      return;
+    }
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const entries = await vscode.workspace.fs.readDirectory(boardFolder);
+    const columns: { id: string; name: string; order: number | null }[] = [];
+
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory) {
+        continue;
+      }
+      const columnUri = vscode.Uri.joinPath(boardFolder, name);
+      const meta = await this.readColumnMeta(columnUri, name);
+      columns.push({ id: name, name: meta.title, order: meta.order });
+    }
+
+    columns.sort((a, b) => {
+      const orderA = a.order ?? Number.POSITIVE_INFINITY;
+      const orderB = b.order ?? Number.POSITIVE_INFINITY;
+      if (orderA !== orderB) {
+        return orderA - orderB;
+      }
+      return a.name.localeCompare(b.name);
+    });
+
+    const orderedIds = columns.map((column) => column.id);
+    const sourceIndex = orderedIds.indexOf(sourceColumnId);
+    const targetIndex = orderedIds.indexOf(targetColumnId);
+    if (sourceIndex === -1 || targetIndex === -1) {
+      return;
+    }
+    orderedIds.splice(sourceIndex, 1);
+    const nextTargetIndex = orderedIds.indexOf(targetColumnId);
+    const insertIndex =
+      position === "after" ? nextTargetIndex + 1 : nextTargetIndex;
+    orderedIds.splice(insertIndex, 0, sourceColumnId);
+
+    let orderValue = 1;
+    for (const id of orderedIds) {
+      const columnUri = vscode.Uri.joinPath(boardFolder, id);
+      const meta = columns.find((column) => column.id === id);
+      await this.updateColumnOrder(columnUri, meta?.name ?? id, orderValue);
+      orderValue += 1;
+    }
+  }
+
+  private async updateColumnOrder(
+    columnUri: vscode.Uri,
+    fallbackTitle: string,
+    order: number
+  ): Promise<void> {
+    const metaUri = vscode.Uri.joinPath(columnUri, "folder.md");
+    let content = "";
+    try {
+      const raw = await vscode.workspace.fs.readFile(metaUri);
+      content = Buffer.from(raw).toString("utf8");
+    } catch {
+      content = `# ${fallbackTitle}\n`;
+    }
+    const updated = upsertNumberLine(content, "Order", order);
+    await vscode.workspace.fs.writeFile(metaUri, Buffer.from(updated, "utf8"));
+  }
+
+  private async updateMarkdownNumber(
+    fileUri: vscode.Uri,
+    key: string,
+    value: number
+  ): Promise<void> {
+    const raw = await vscode.workspace.fs.readFile(fileUri);
+    const text = Buffer.from(raw).toString("utf8");
+    const updated = upsertNumberLine(text, key, value);
+    if (updated !== text) {
+      await vscode.workspace.fs.writeFile(
+        fileUri,
+        Buffer.from(updated, "utf8")
+      );
+    }
   }
 
   private getHtml(webview: vscode.Webview): string {
@@ -277,12 +572,42 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       flex-direction: column;
       gap: 10px;
     }
+    .column-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      cursor: grab;
+    }
+    .column-header:active {
+      cursor: grabbing;
+    }
     .column h2 {
       font-size: 14px;
       letter-spacing: 0.08em;
       text-transform: uppercase;
       margin: 0;
       color: var(--muted);
+    }
+    .add-card {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease;
+    }
+    .add-card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 10px -8px var(--shadow);
+      border-color: var(--accent);
+    }
+    .add-card:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
     }
     .card {
       background: #fff;
@@ -300,6 +625,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .card:hover {
       transform: translateY(-2px);
       box-shadow: 0 16px 24px -16px var(--shadow);
+    }
+    .card-drop-target {
+      outline: 2px dashed var(--accent);
+      outline-offset: 2px;
     }
     .card h3 {
       margin: 0;
@@ -373,6 +702,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let selectedCard = null;
     let lastBoard = null;
     let refreshTimer = null;
+    const cardDragType = "application/x-kanban-card";
+    const columnDragType = "application/x-kanban-column";
+    let draggingCard = null;
+    let draggingColumn = null;
 
     const renderDetails = (card) => {
       if (!card) {
@@ -385,9 +718,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const createdRelative = formatRelativeTime(created);
       const bodyHtml = card.bodyHtml || '';
       const tagsHtml = renderTags(card.tags || []);
+      const priorityLabel = formatPriority(card.priority);
+      const metaLine = "Created: " + createdLabel + " · " + createdRelative + (priorityLabel ? " · Priority " + priorityLabel : "");
       detailsEl.innerHTML = \`
         <h1>\${escapeHtml(card.title)}</h1>
-        <div class="meta">Created: \${createdLabel} · \${createdRelative}</div>
+        <div class="meta">\${metaLine}</div>
         \${tagsHtml}
         <hr />
         <div>\${bodyHtml}</div>
@@ -401,6 +736,30 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+    };
+
+    const formatPriority = (value) => {
+      return Number.isFinite(value) ? String(value) : "";
+    };
+
+    const getDragTypes = (event) => {
+      return Array.from(event?.dataTransfer?.types || []);
+    };
+
+    const buildOrderedUris = (cards, cardUri, targetUri, position) => {
+      const list = (cards || []).map((card) => card.uri).filter((uri) => uri !== cardUri);
+      if (!targetUri) {
+        list.push(cardUri);
+        return list;
+      }
+      const targetIndex = list.indexOf(targetUri);
+      if (targetIndex === -1) {
+        list.push(cardUri);
+        return list;
+      }
+      const insertIndex = position === "after" ? targetIndex + 1 : targetIndex;
+      list.splice(insertIndex, 0, cardUri);
+      return list;
     };
 
     const hashString = (value) => {
@@ -473,24 +832,86 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         boardEl.innerHTML = '<div class="card">No columns found. Create folders next to the .kanban file.</div>';
         return;
       }
+      const firstColumnId = board.columns[0]?.id ?? board.columns[0]?.name;
       for (const column of board.columns) {
+        const columnId = column.id ?? column.name;
         const columnEl = document.createElement("div");
         columnEl.className = "column";
-        columnEl.dataset.column = column.name;
-        columnEl.innerHTML = \`<h2>\${escapeHtml(column.name)}</h2>\`;
+        columnEl.dataset.column = columnId;
+        const headerEl = document.createElement("div");
+        headerEl.className = "column-header";
+        headerEl.draggable = true;
+        headerEl.addEventListener("dragstart", (event) => {
+          draggingColumn = columnId;
+          event.dataTransfer.setData(columnDragType, columnId);
+          event.dataTransfer.effectAllowed = "move";
+        });
+        headerEl.addEventListener("dragend", () => {
+          draggingColumn = null;
+        });
+        const titleEl = document.createElement("h2");
+        titleEl.textContent = column.name;
+        headerEl.appendChild(titleEl);
+        if (columnId === firstColumnId) {
+          const addButton = document.createElement("button");
+          addButton.className = "add-card";
+          addButton.type = "button";
+          addButton.textContent = "+ Add ticket";
+          addButton.draggable = false;
+          addButton.addEventListener("click", () => {
+            vscode.postMessage({ type: "requestNewCard", columnId });
+          });
+          headerEl.appendChild(addButton);
+        }
+        columnEl.appendChild(headerEl);
         columnEl.addEventListener("dragover", (event) => {
-          event.preventDefault();
-          columnEl.classList.add("drop-target");
+          const types = getDragTypes(event);
+          if (types.includes(columnDragType) || types.includes(cardDragType) || types.includes("text/uri-list")) {
+            event.preventDefault();
+            columnEl.classList.add("drop-target");
+          }
         });
         columnEl.addEventListener("dragleave", () => {
           columnEl.classList.remove("drop-target");
         });
         columnEl.addEventListener("drop", (event) => {
+          const types = getDragTypes(event);
+          if (types.includes(columnDragType)) {
+            event.preventDefault();
+            columnEl.classList.remove("drop-target");
+            const sourceColumnId = draggingColumn || event.dataTransfer.getData(columnDragType);
+            if (!sourceColumnId || sourceColumnId === columnId) {
+              return;
+            }
+            const rect = columnEl.getBoundingClientRect();
+            const position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
+            vscode.postMessage({
+              type: "reorderColumns",
+              sourceColumnId,
+              targetColumnId: columnId,
+              position,
+            });
+            return;
+          }
           event.preventDefault();
           columnEl.classList.remove("drop-target");
           const cardUri = event.dataTransfer.getData("text/uri-list");
           if (cardUri) {
-            vscode.postMessage({ type: "moveCard", cardUri, targetColumn: column.name });
+            let sourceColumnId = draggingCard?.columnId;
+            if (!sourceColumnId) {
+              try {
+                const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
+                sourceColumnId = payload.columnId;
+              } catch {}
+            }
+            const orderedUris = buildOrderedUris(column.cards, cardUri, null, "after");
+            vscode.postMessage({
+              type: "reorderCards",
+              cardUri,
+              sourceColumnId,
+              targetColumnId: columnId,
+              orderedUris,
+            });
           }
         });
 
@@ -499,26 +920,75 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           cardEl.className = "card";
           cardEl.draggable = true;
           cardEl.dataset.uri = card.uri;
+          cardEl.dataset.column = columnId;
           const tagsHtml = renderTags(card.tags || []);
           const created = new Date(card.createdAt);
           const createdLabel = created.toLocaleDateString();
           const createdRelative = formatRelativeTime(created);
+          const priorityLabel = formatPriority(card.priority);
+          const metaLine = createdLabel + " · " + createdRelative + (priorityLabel ? " · P" + priorityLabel : "");
           cardEl.innerHTML = \`
             <h3>\${escapeHtml(card.title)}</h3>
-            <div class="meta">\${createdLabel} · \${createdRelative}</div>
+            <div class="meta">\${metaLine}</div>
             \${tagsHtml}
           \`;
           cardEl.addEventListener("click", () => renderDetails(card));
           cardEl.addEventListener("dblclick", () => openCard(card));
           cardEl.addEventListener("dragstart", (event) => {
+            draggingCard = { uri: card.uri, columnId };
             event.dataTransfer.setData("text/uri-list", card.uri);
+            event.dataTransfer.setData(cardDragType, JSON.stringify(draggingCard));
+            event.dataTransfer.effectAllowed = "move";
+          });
+          cardEl.addEventListener("dragend", () => {
+            draggingCard = null;
+          });
+          cardEl.addEventListener("dragover", (event) => {
+            const types = getDragTypes(event);
+            if (types.includes(columnDragType)) {
+              return;
+            }
+            event.preventDefault();
+            cardEl.classList.add("card-drop-target");
+          });
+          cardEl.addEventListener("dragleave", () => {
+            cardEl.classList.remove("card-drop-target");
+          });
+          cardEl.addEventListener("drop", (event) => {
+            const types = getDragTypes(event);
+            if (types.includes(columnDragType)) {
+              return;
+            }
+            event.preventDefault();
+            event.stopPropagation();
+            cardEl.classList.remove("card-drop-target");
+            const cardUri = event.dataTransfer.getData("text/uri-list");
+            if (!cardUri) {
+              return;
+            }
+            let sourceColumnId = draggingCard?.columnId;
+            if (!sourceColumnId) {
+              try {
+                const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
+                sourceColumnId = payload.columnId;
+              } catch {}
+            }
+            const rect = cardEl.getBoundingClientRect();
+            const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+            const orderedUris = buildOrderedUris(column.cards, cardUri, card.uri, position);
+            vscode.postMessage({
+              type: "reorderCards",
+              cardUri,
+              sourceColumnId,
+              targetColumnId: columnId,
+              orderedUris,
+            });
           });
           columnEl.appendChild(cardEl);
         }
         boardEl.appendChild(columnEl);
       }
     };
-
     detailsEl.addEventListener("dblclick", () => openCard(selectedCard));
 
     window.addEventListener("message", (event) => {
@@ -590,12 +1060,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 function parseMarkdown(
   content: string,
   fallbackTitle: string
-): { title: string; body: string; tags: string[] } {
+): { title: string; body: string; tags: string[]; priority: number | null } {
   const lines = content.split(/\r?\n/);
   let title = fallbackTitle.replace(/\.md$/i, "");
   let bodyStart = 0;
   const tags: string[] = [];
   const tagPattern = /^tags\s*:\s*(.+)$/i;
+  const priorityPattern = /^priority\s*:\s*(.+)$/i;
+  let priority: number | null = null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (line.startsWith("# ")) {
@@ -613,6 +1085,13 @@ function parseMarkdown(
         .filter((tag) => tag.length > 0);
       tags.push(...parsed);
     }
+    const priorityMatch = lines[i].match(priorityPattern);
+    if (priorityMatch) {
+      const value = Number(priorityMatch[1].trim());
+      if (Number.isFinite(value)) {
+        priority = value;
+      }
+    }
   }
   const bodyLines: string[] = [];
   for (let i = bodyStart; i < lines.length; i++) {
@@ -626,10 +1105,78 @@ function parseMarkdown(
       tags.push(...parsed);
       continue;
     }
+    const priorityMatch = line.match(priorityPattern);
+    if (priorityMatch) {
+      const value = Number(priorityMatch[1].trim());
+      if (Number.isFinite(value)) {
+        priority = value;
+      }
+      continue;
+    }
     bodyLines.push(line);
   }
   const body = bodyLines.join("\n").trim();
-  return { title, body, tags };
+  return { title, body, tags, priority };
+}
+
+function parseColumnMarkdown(
+  content: string,
+  fallbackTitle: string
+): { title: string; order: number | null } {
+  const lines = content.split(/\r?\n/);
+  let title = fallbackTitle;
+  let order: number | null = null;
+  const orderPattern = /^order\s*:\s*(.+)$/i;
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith("# ")) {
+      title = line.replace(/^#\s+/, "").trim() || title;
+    }
+    const match = line.match(orderPattern);
+    if (match) {
+      const value = Number(match[1].trim());
+      if (Number.isFinite(value)) {
+        order = value;
+      }
+    }
+  }
+  return { title, order };
+}
+
+function upsertNumberLine(content: string, key: string, value: number): string {
+  const lines = content.split(/\r?\n/);
+  const pattern = new RegExp(`^\s*${key}\s*:\s*.*$`, "i");
+  const updated: string[] = [];
+  let replaced = false;
+  for (const line of lines) {
+    if (pattern.test(line)) {
+      if (!replaced) {
+        updated.push(`${key}: ${value}`);
+        replaced = true;
+      }
+      continue;
+    }
+    updated.push(line);
+  }
+  if (!replaced) {
+    const headingIndex = updated.findIndex((line) => line.trim().startsWith("# "));
+    if (headingIndex !== -1) {
+      updated.splice(headingIndex + 1, 0, "", `${key}: ${value}`, "");
+    } else {
+      updated.splice(0, 0, `${key}: ${value}`, "");
+    }
+  }
+  return updated.join("\n").replace(/\n{3,}/g, "\n\n").replace(/\n\n$/g, "\n\n");
+}
+function slugifyFileName(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 function getNonce(): string {
