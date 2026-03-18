@@ -1,6 +1,17 @@
 # Kanban-fs (VS Code Extension)
 
-Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban board. Columns are sibling directories, and cards are Markdown files. The first `# H1` becomes the card title, creation time is shown, and details render in the right panel.
+Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban board. Columns are sibling directories, cards are Markdown files, the first `# H1` becomes the card title, and the details panel renders task metadata plus the Markdown body.
+
+`.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
+
+```yaml
+folders:
+  Doing: In Progress
+  Backlog: Backlog
+  Done: Done!
+```
+
+Legacy `folder.md` files are still read as a fallback, but new boards should keep column metadata in `.kanban`.
 
 ## Run (Dev)
 
@@ -19,10 +30,15 @@ The `.vsix` file will be created in the project root.
 
 ## Contributing / Feature Requests
 
-Feature requests and contributions are welcome, but please keep as much configuration and state as possible in ticket Markdown files. The `.kanban` file should remain a lightweight trigger file. Use `.kanban` for parameters only when absolutely necessary, for example:
+Feature requests and contributions are welcome, but please keep as much configuration and state as possible in ticket Markdown files. Use `.kanban` for board-level settings that cannot live in a task file, for example:
 
 - Fixed color for a label
 - Mapping a directory name to a friendly column name
 - Other board-level settings that cannot live in card Markdown
 
 If you propose a feature that needs configuration, prefer putting it in the card Markdown first and only introduce `.kanban` parameters when there is no reasonable alternative.
+
+Task properties are plain `Key: Value` lines directly under the title block. Special handling:
+
+- `Agent: <guid>` shows a `Connect` action that runs `codex resume <guid>` in a terminal.
+- Absolute local paths show an `Open` action that opens a terminal in that folder (or the file's parent folder).

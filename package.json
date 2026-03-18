@@ -5,6 +5,9 @@
   "version": "1.0.2",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
+  "activationEvents": [
+    "onLanguage:markdown"
+  ],
   "engines": {
     "vscode": "^1.90.0"
   },
@@ -14,6 +17,16 @@
   "icon": "icon.png",
   "main": "./out/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "kanban.resumeAgent",
+        "title": "Kanban: Connect Agent"
+      },
+      {
+        "command": "kanban.openPath",
+        "title": "Kanban: Open Path"
+      }
+    ],
     "customEditors": [
       {
         "viewType": "kanban.board",
@@ -30,15 +43,19 @@
   "scripts": {
     "vscode:prepublish": "tsc -p ./",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && npm run test:webview && npm run test:task-links",
+    "test:webview": "node scripts/smoke-webview.js",
+    "test:task-links": "node scripts/test-task-links.js"
   },
   "devDependencies": {
-    "@types/node": "^20.11.30",
     "@types/markdown-it": "^13.0.7",
+    "@types/node": "^20.11.30",
     "@types/vscode": "^1.90.0",
     "typescript": "^5.5.4"
   },
   "dependencies": {
-    "markdown-it": "^14.1.0"
+    "markdown-it": "^14.1.0",
+    "yaml": "^2.8.2"
   }
 }
