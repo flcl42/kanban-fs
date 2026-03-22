@@ -84,6 +84,7 @@ sealed class TaskOrchestrator
         }
 
         EnsureFileExists(_paths.KanbanMarkerPath, BoardTemplates.CreateKanbanConfig(_paths.KanbanFolders));
+        EnsureFileExists(_paths.GitIgnorePath, BoardTemplates.ResolveGitIgnoreTemplate(_settings.InvocationDirectory));
         EnsureFileExists(_paths.ProjectsMapPath, BoardTemplates.ProjectsTemplate);
         EnsureFileExists(_paths.ContextPath, BoardTemplates.ResolveContextTemplate(_settings.InvocationDirectory));
         EnsureFileExists(_paths.TaskTemplatePath, BoardTemplates.ResolveTaskTemplate(_settings.InvocationDirectory));
@@ -1543,6 +1544,7 @@ sealed class BoardPaths
         CacheRoot = Path.Combine(Root, "cache");
         TrashRoot = Path.Combine(Root, "trash");
         LogsRoot = Path.Combine(Root, "logs");
+        GitIgnorePath = Path.Combine(Root, ".gitignore");
         ContextPath = Path.Combine(Root, "context.md");
         ProjectsMapPath = Path.Combine(Root, "projects.md");
         KanbanMarkerPath = Path.Combine(TasksRoot, ".kanban");
@@ -1592,6 +1594,7 @@ sealed class BoardPaths
     public string CacheRoot { get; }
     public string TrashRoot { get; }
     public string LogsRoot { get; }
+    public string GitIgnorePath { get; }
     public string ContextPath { get; }
     public string ProjectsMapPath { get; }
     public string KanbanMarkerPath { get; }
@@ -1773,6 +1776,14 @@ static class BoardTemplates
     public static string ProjectsTemplate =>
         "# alias = https://github.com/org/repo" + Environment.NewLine;
 
+    private static string DefaultGitIgnoreTemplate =>
+        """
+        projects/
+        cache/
+        trash/
+        logs/
+        """;
+
     private static string DefaultContextTemplate =>
         """
         # Task Agent Context
@@ -1829,6 +1840,9 @@ static class BoardTemplates
 
     public static string ResolveTaskTemplate(string invocationDirectory) =>
         ReadSeedFile(invocationDirectory, Path.Combine("tasks", "template.md"), DefaultTaskTemplate);
+
+    public static string ResolveGitIgnoreTemplate(string invocationDirectory) =>
+        ReadSeedFile(invocationDirectory, ".gitignore", DefaultGitIgnoreTemplate);
 
     public static string CreateKanbanConfig(IEnumerable<KanbanFolder> folders)
     {
