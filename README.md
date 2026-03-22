@@ -27,22 +27,14 @@ Legacy `folder.md` files are still read as a fallback, but new boards should kee
 ## Build a VSIX
 
 1. Install deps: `npm install`
-2. Package: `npm run package:vsix`
-
-The `.vsix` file will be created in the project root.
-
-## Publish
-
-1. Create a Visual Studio Marketplace personal access token and expose it as `VSCE_PAT`.
-2. Publish: `npm run publish:marketplace`
-
-The publish scripts run the test suite first, then use the local `vsce` binary from `devDependencies`.
+2. Package: `npm run package:vsix`,  the `.vsix` file will be created in the project root.
+3. Install locally: `code --install-extension .\kanban-vsix-<version>.vsix`
 
 ## Contributing / Feature Requests
 
 Feature requests and contributions are welcome, but please keep as much configuration and state as possible in ticket Markdown files. Use `.kanban` for board-level settings that cannot live in a task file, for example:
 
-- Fixed color for a label
+- Fixed color for a tag
 - Mapping a directory name to a friendly column name
 - Other board-level settings that cannot live in card Markdown
 
