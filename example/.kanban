@@ -1,4 +1,13 @@
 folders:
-  Backlog: Backlog
-  Doing: In Progress
-  Done: Done!
+  Backlog:
+    priorities:
+      - first-task.md
+  Doing:
+    title: In Progress
+    priorities:
+      - active-task.md
+  Done:
+    title: Done!
+    priorities:
+      - shipped-task.md
+      - another-one.md

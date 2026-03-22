@@ -30,6 +30,21 @@ assert.doesNotThrow(
   () => new Function(scriptMatch[1]),
   "webview script should parse"
 );
+assert.doesNotMatch(
+  html,
+  /\.board\s*\{[^}]*align-items:\s*start;/,
+  "board columns should stretch to a shared height"
+);
+assert.match(
+  html,
+  /\.layout\s*\{[^}]*min-height:\s*100vh;/,
+  "layout should be able to grow beyond the viewport for tall columns"
+);
+assert.match(
+  html,
+  /\.column-header\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;/,
+  "column headers should stay visible while scrolling long columns"
+);
 
 class FakeElement {
   constructor(tagName = "div") {
@@ -140,7 +155,28 @@ windowListeners.message({
           id: "Doing",
           name: "Doing",
           order: 1,
-          cards: [],
+          cards: [
+            {
+              uri: "file:///task.md",
+              fileName: "task.md",
+              title: "Ship it",
+              body: "",
+              bodyHtml: "",
+              properties: [
+                { key: "Tags", label: "Tags", value: "ship", action: null },
+                {
+                  key: "Path",
+                  label: "Path",
+                  value: "C:\\work\\demo",
+                  action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                },
+                { key: "Owner", label: "Owner", value: "Jane", action: null },
+              ],
+              tags: ["ship"],
+              priority: 2,
+              createdAt: Date.now(),
+            },
+          ],
         },
       ],
     },
@@ -149,3 +185,57 @@ windowListeners.message({
 
 assert.equal(boardEl.children.length, 1, "expected one rendered column");
 assert.equal(boardEl.children[0].dataset.column, "Doing", "column id should be rendered");
+assert.equal(boardEl.children[0].children.length, 2, "expected header and one card");
+assert.match(
+  boardEl.children[0].children[1].innerHTML,
+  /property-badge/,
+  "card should render property badges"
+);
+assert.doesNotMatch(
+  boardEl.children[0].children[1].innerHTML,
+  /Tags/,
+  "tag properties should not render as badges"
+);
+assert.ok(
+  boardEl.children[0].children[1].innerHTML.indexOf("Owner") <
+    boardEl.children[0].children[1].innerHTML.indexOf("Path"),
+  "card property badges should be sorted by name"
+);
+
+boardEl.children[0].children[1].listeners.click();
+
+assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
+assert.doesNotMatch(
+  detailsEl.innerHTML,
+  /Tags:/,
+  "tag properties should not render in the details property list"
+);
+assert.ok(
+  detailsEl.innerHTML.indexOf("Owner:") <
+    detailsEl.innerHTML.indexOf("Path:"),
+  "details properties should be sorted by name"
+);
+assert.doesNotMatch(
+  detailsEl.innerHTML,
+  /property-badge/,
+  "details should not render duplicate property badges"
+);
+assert.match(
+  detailsEl.innerHTML,
+  /data-action-type="openPath"/,
+  "details should render an open-path action for path properties"
+);
+
+const actionButton = new FakeElement("button");
+actionButton.setAttribute("data-action-type", "openPath");
+actionButton.setAttribute("data-action-value", "C:\\work\\demo");
+actionButton.closest = () => actionButton;
+
+detailsEl.listeners.click({
+  target: actionButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "openPath");
+assert.equal(messages.at(-1)?.path, "C:\\work\\demo");

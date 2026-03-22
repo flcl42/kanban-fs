@@ -1,20 +1,31 @@
 import * as path from "path";
 import * as vscode from "vscode";
 import MarkdownIt from "markdown-it";
-import YAML from "yaml";
+import {
+  buildFolderConfigMap,
+  createEmptyBoardConfig,
+  normalizeLineEndings,
+  orderColumnsByConfig,
+  parseBoardConfig,
+  serializeBoardConfig,
+  type BoardConfig,
+} from "./board-config";
+import {
+  parseTaskMarkdown,
+  type TaskProperty,
+} from "./task-metadata";
 import {
   findTaskLinkActions,
+  getTaskPropertyAction,
   isAbsoluteLocalPath as isTaskAbsoluteLocalPath,
   isGuidValue as isTaskGuidValue,
   normalizePropertyValue as normalizeTaskPropertyValue,
-  parseTaskPropertyLine,
+  type TaskPropertyAction,
   type TaskLinkAction,
 } from "./task-links";
 
-type CardProperty = {
-  key: string;
-  label: string;
-  value: string;
+type CardProperty = TaskProperty & {
+  action: TaskPropertyAction | null;
 };
 
 type Card = {
@@ -38,20 +49,6 @@ type Column = {
 
 type BoardData = {
   columns: Column[];
-};
-
-type BoardFolderConfig = {
-  id: string;
-  title: string | null;
-  order: number;
-  rawValue: unknown;
-};
-
-type BoardConfig = {
-  data: Record<string, unknown>;
-  folders: BoardFolderConfig[];
-  folderMap: Map<string, BoardFolderConfig>;
-  sourceText: string;
 };
 
 type EditContext = {
@@ -353,7 +350,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       const columnUri = vscode.Uri.joinPath(boardFolder, name);
       const meta = await this.readColumnMeta(columnUri, name, boardConfig);
-      const cards = await this.readCards(columnUri);
+      const cards = await this.readCards(columnUri, meta.cardPriorities);
       columns.push({
         id: name,
         name: meta.title,
@@ -375,17 +372,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     columns: T[],
     boardConfig: BoardConfig
   ): T[] {
-    if (boardConfig.folders.length === 0) {
-      return [...columns].sort(compareColumns);
-    }
-
-    const configured = boardConfig.folders
-      .map((folder) => columns.find((column) => column.id === folder.id))
-      .filter((column): column is T => !!column);
-    const extras = columns
-      .filter((column) => !boardConfig.folderMap.has(column.id))
-      .sort(compareColumns);
-    return [...configured, ...extras];
+    return orderColumnsByConfig(columns, boardConfig);
   }
 
   private async readBoardConfig(kanbanUri: vscode.Uri): Promise<BoardConfig> {
@@ -420,7 +407,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
-  private async readCards(columnUri: vscode.Uri): Promise<Card[]> {
+  private async readCards(
+    columnUri: vscode.Uri,
+    cardPriorities = new Map<string, number>()
+  ): Promise<Card[]> {
     const entries = await vscode.workspace.fs.readDirectory(columnUri);
     const cards: Card[] = [];
 
@@ -434,10 +424,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const fileUri = vscode.Uri.joinPath(columnUri, name);
       const raw = await vscode.workspace.fs.readFile(fileUri);
       const text = Buffer.from(raw).toString("utf8");
-      const { title, body, properties, tags, priority } = parseMarkdown(
+      const { title, body, properties, tags } = parseTaskMarkdown(
         text,
         name
       );
+      const propertiesWithActions = properties.map((property) => ({
+        ...property,
+        action: getTaskPropertyAction(property.key, property.value),
+      }));
       const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
       cards.push({
@@ -446,9 +440,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         title,
         body,
         bodyHtml,
-        properties,
+        properties: propertiesWithActions,
         tags,
-        priority,
+        priority: cardPriorities.get(name) ?? null,
         createdAt: stat.ctime,
       });
     }
@@ -468,12 +462,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     columnUri: vscode.Uri,
     fallbackTitle: string,
     boardConfig: BoardConfig
-  ): Promise<{ title: string; order: number | null }> {
+  ): Promise<{
+    title: string;
+    order: number | null;
+    cardPriorities: Map<string, number>;
+  }> {
     const configured = boardConfig.folderMap.get(fallbackTitle);
     if (configured) {
       return {
         title: configured.title?.trim() || fallbackTitle,
         order: configured.order,
+        cardPriorities: new Map(configured.cardPriorities),
       };
     }
     const metaUri = vscode.Uri.joinPath(columnUri, "folder.md");
@@ -484,9 +483,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return {
         title: legacy.title,
         order: boardConfig.folderMap.size > 0 ? null : legacy.order,
+        cardPriorities: new Map(),
       };
     } catch {
-      return { title: fallbackTitle, order: null };
+      return { title: fallbackTitle, order: null, cardPriorities: new Map() };
     }
   }
 
@@ -510,26 +510,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
     const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
+    const sourceColumnId = path.posix.basename(sourceColumnUri.path);
     const targetCards = await this.readCards(targetColumnUri);
-    const targetTargets = targetCards.map((card) => ({
-      displayUri: card.uri,
-      editUri: card.uri,
-    }));
-    targetTargets.push({
-      displayUri: newUri.toString(),
-      editUri: cardUri.toString(),
-    });
+    const targetOrderedUris = targetCards.map((card) => card.uri);
+    targetOrderedUris.push(newUri.toString());
     const sourceCards = await this.readCards(sourceColumnUri);
-    const sourceTargets = sourceCards
+    const sourceOrderedUris = sourceCards
       .filter((card) => card.uri !== cardUriString)
-      .map((card) => ({
-        displayUri: card.uri,
-        editUri: card.uri,
-      }));
+      .map((card) => card.uri);
     const context = this.createEditContext();
     await this.renameFile(cardUri, newUri, context);
-    await this.updateCardPriorities(targetTargets, context);
-    await this.updateCardPriorities(sourceTargets, context);
+    await this.updateBoardCardPriorities(
+      kanbanUri,
+      [
+        { columnId: targetColumnId, orderedUris: targetOrderedUris },
+        { columnId: sourceColumnId, orderedUris: sourceOrderedUris },
+      ],
+      context
+    );
     await this.applyEditContext(context);
   }
 
@@ -569,15 +567,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       fileName = `${baseName}-${counter}.md`;
     }
 
-    const existingCards = await this.readCards(columnUri);
-    const maxPriority = existingCards.reduce((max, card) => {
-      return typeof card.priority === "number" && Number.isFinite(card.priority)
-        ? Math.max(max, card.priority)
-        : max;
-    }, 0);
-    const nextPriority = maxPriority + 1;
     const fileUri = vscode.Uri.joinPath(columnUri, fileName);
-    const content = `# ${safeTitle}\n\nPriority: ${nextPriority}\n\n`;
+    const content = `# ${safeTitle}\n\n`;
     const context = this.createEditContext();
     await this.ensureFile(fileUri, context);
     this.queueInsertContent(context, fileUri, content);
@@ -614,79 +605,82 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const normalizedUris = orderedUris.map((uri) =>
       uri === cardUriString && movedCardUriString ? movedCardUriString : uri
     );
-    const orderedTargets = normalizedUris.map((uri) => ({
-      displayUri: uri,
-      editUri: uri,
-    }));
-    if (
-      cardUriString &&
-      movedCardUriString &&
-      sourceColumnId &&
-      sourceColumnId !== targetColumnId
-    ) {
-      const movedIndex = orderedTargets.findIndex(
-        (target) => target.displayUri === movedCardUriString
-      );
-      if (movedIndex !== -1) {
-        orderedTargets[movedIndex] = {
-          displayUri: movedCardUriString,
-          editUri: cardUriString,
-        };
-      }
-    }
-    await this.updateCardPriorities(orderedTargets, context);
+    const columnUpdates: { columnId: string; orderedUris: string[] }[] = [
+      { columnId: targetColumnId, orderedUris: normalizedUris },
+    ];
 
     if (sourceColumnId && sourceColumnId !== targetColumnId && cardUriString) {
       const sourceColumnUri = vscode.Uri.joinPath(boardFolder, sourceColumnId);
       const sourceCards = await this.readCards(sourceColumnUri);
-      const sourceTargets = sourceCards
+      const sourceOrderedUris = sourceCards
         .filter((card) => card.uri !== cardUriString)
-        .map((card) => ({
-          displayUri: card.uri,
-          editUri: card.uri,
-        }));
-      await this.updateCardPriorities(sourceTargets, context);
+        .map((card) => card.uri);
+      columnUpdates.push({
+        columnId: sourceColumnId,
+        orderedUris: sourceOrderedUris,
+      });
     }
+    await this.updateBoardCardPriorities(kanbanUri, columnUpdates, context);
     await this.applyEditContext(context);
   }
 
-  private async updateCardPriorities(
-    orderedTargets: { displayUri: string; editUri: string }[],
+  private async updateBoardCardPriorities(
+    kanbanUri: vscode.Uri,
+    columnUpdates: { columnId: string; orderedUris: string[] }[],
     context?: EditContext
   ): Promise<void> {
-    const seen = new Set<string>();
-    let priority = 1;
-    for (const target of orderedTargets) {
-      if (!target?.editUri || seen.has(target.editUri)) {
+    const normalizedUpdates = new Map<string, string[]>();
+    for (const update of columnUpdates) {
+      const columnId = String(update?.columnId ?? "").trim();
+      if (!columnId || normalizedUpdates.has(columnId)) {
         continue;
       }
-      seen.add(target.editUri);
-      const fileUri = vscode.Uri.parse(target.editUri);
-      try {
-        await this.updateMarkdownNumber(fileUri, "Priority", priority, context);
-        priority += 1;
-      } catch {
-        continue;
-      }
+      normalizedUpdates.set(
+        columnId,
+        Array.isArray(update?.orderedUris) ? update.orderedUris : []
+      );
     }
-  }
 
-  private async resequenceColumnPriorities(
-    columnUri: vscode.Uri,
-    context?: EditContext,
-    excludeUri?: string
-  ): Promise<void> {
-    try {
-      const cards = await this.readCards(columnUri);
-      const orderedTargets = cards
-        .filter((card) => card.uri !== excludeUri)
-        .map((card) => ({
-          displayUri: card.uri,
-          editUri: card.uri,
-        }));
-      await this.updateCardPriorities(orderedTargets, context);
-    } catch {
+    if (normalizedUpdates.size === 0) {
       return;
+    }
+
+    const boardConfig = await this.readBoardConfig(kanbanUri);
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const entries = await vscode.workspace.fs.readDirectory(boardFolder);
+    const columns: { id: string; name: string; order: number | null }[] = [];
+
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory) {
+        continue;
+      }
+      const columnUri = vscode.Uri.joinPath(boardFolder, name);
+      const meta = await this.readColumnMeta(columnUri, name, boardConfig);
+      columns.push({ id: name, name: meta.title, order: meta.order });
+    }
+
+    const priorityOverrides = new Map<string, string[]>();
+    for (const [columnId, orderedUris] of normalizedUpdates) {
+      priorityOverrides.set(columnId, buildCardPriorityList(orderedUris));
+    }
+
+    const nextData = { ...boardConfig.data };
+    if (columns.length === 0) {
+      delete nextData.folders;
+    } else {
+      nextData.folders = buildFolderConfigMap(
+        this.orderColumns(columns, boardConfig),
+        boardConfig,
+        priorityOverrides
+      );
+    }
+
+    const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    if (
+      normalizeLineEndings(serialized) !==
+      normalizeLineEndings(boardConfig.sourceText)
+    ) {
+      await this.applyContentEdit(kanbanUri, serialized, context);
     }
   }
 
@@ -783,20 +777,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       cwd,
     });
     terminal.show(true);
-  }
-
-  private async updateMarkdownNumber(
-    fileUri: vscode.Uri,
-    key: string,
-    value: number,
-    context?: EditContext
-  ): Promise<void> {
-    const raw = await vscode.workspace.fs.readFile(fileUri);
-    const text = Buffer.from(raw).toString("utf8");
-    const updated = upsertNumberLine(text, key, value);
-    if (updated !== text) {
-      await this.applyContentEdit(fileUri, updated, context);
-    }
   }
 
   private async renameFile(
@@ -922,7 +902,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       grid-template-columns: 2.2fr 1fr;
       gap: 16px;
       padding: 16px;
-      height: 100vh;
+      min-height: 100vh;
     }
     .board {
       display: grid;
@@ -948,6 +928,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding-bottom: 6px;
+      background: var(--panel);
       cursor: grab;
     }
     .column-header:active {
@@ -1022,6 +1007,39 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       border-radius: 999px;
       font-weight: 600;
       letter-spacing: 0.02em;
+    }
+    .property-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 4px;
+    }
+    .property-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      max-width: 100%;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      line-height: 1.4;
+    }
+    .property-badge-label {
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      font-size: 10px;
+      white-space: nowrap;
+    }
+    .property-badge-value {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .details {
       background: var(--panel);
@@ -1155,46 +1173,34 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/'/g, "&#039;");
     };
 
-    const normalizePropertyValue = (value) => {
-      const trimmed = String(value || "").trim();
-      if (trimmed.length >= 2) {
-        const first = trimmed[0];
-        const last = trimmed[trimmed.length - 1];
-        if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-          return trimmed.slice(1, -1).trim();
-        }
-      }
-      return trimmed;
-    };
-
-    const isGuidValue = (value) => {
-      return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        normalizePropertyValue(value)
-      );
-    };
-
-    const isAbsoluteLocalPath = (value) => {
-      const normalized = normalizePropertyValue(value);
-      return /^[a-zA-Z]:[\\/]/.test(normalized)
-        || normalized.startsWith("\\\\")
-        || normalized.startsWith("/");
-    };
-
     const getPropertyAction = (property) => {
-      const value = normalizePropertyValue(property?.value);
-      const key = String(property?.key || "").trim().toLowerCase();
-      if (key === "agent" && isGuidValue(value)) {
-        return { type: "resumeAgent", label: "Connect", value };
+      const action = property?.action;
+      const type = String(action?.command || "").trim();
+      const label = String(action?.title || "").trim();
+      const value = String(action?.value || "").trim();
+      if (!type || !label || !value) {
+        return null;
       }
-      if (isAbsoluteLocalPath(value)) {
-        return { type: "openPath", label: "Open", value };
+      if (type !== "resumeAgent" && type !== "openPath") {
+        return null;
       }
-      return null;
+      return { type, label, value };
+    };
+
+    const getVisibleProperties = (properties) => {
+      return (properties || [])
+        .filter((property) => String(property?.key || "").trim().toLowerCase() !== "tags")
+        .sort((a, b) => {
+          const aLabel = String(a?.label || a?.key || "").trim();
+          const bLabel = String(b?.label || b?.key || "").trim();
+          return aLabel.localeCompare(bLabel, undefined, { sensitivity: "base" });
+        });
     };
 
     const renderProperties = (properties) => {
-      if (!properties?.length) return "";
-      const rows = properties.map((property) => {
+      const visibleProperties = getVisibleProperties(properties);
+      if (!visibleProperties.length) return "";
+      const rows = visibleProperties.map((property) => {
         const action = getPropertyAction(property);
         const actionHtml = action
           ? \`<button class="property-action" type="button" data-action-type="\${escapeHtml(action.type)}" data-action-value="\${escapeHtml(action.value)}">\${escapeHtml(action.label)}</button>\`
@@ -1222,8 +1228,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const bodyHtml = card.bodyHtml || '';
       const tagsHtml = renderTags(card.tags || []);
       const propertiesHtml = renderProperties(card.properties || []);
-      const priorityLabel = formatPriority(card.priority);
-      const metaLine = "Created: " + createdLabel + " · " + createdRelative + (priorityLabel ? " · Priority " + priorityLabel : "");
+      const metaLine = "Created: " + createdLabel + " · " + createdRelative;
       detailsEl.innerHTML = \`
         <h1>\${escapeHtml(card.title)}</h1>
         <div class="meta">\${metaLine}</div>
@@ -1234,10 +1239,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <div>\${bodyHtml || '<div class="empty">No description.</div>'}</div>
         </div>
       \`;
-    };
-
-    const formatPriority = (value) => {
-      return Number.isFinite(value) ? String(value) : "";
     };
 
     const getDragTypes = (event) => {
@@ -1308,6 +1309,18 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return \`<span class="tag" style="background:\${style.background};color:\${style.color}">\${safe}</span>\`;
       }).join("");
       return \`<div class="tags">\${pills}</div>\`;
+    };
+
+    const renderPropertyBadges = (properties) => {
+      const badges = getVisibleProperties(properties)
+        .map((property) => \`
+          <span class="property-badge">
+            <span class="property-badge-label">\${escapeHtml(property.label)}</span>
+            <span class="property-badge-value">\${escapeHtml(property.value)}</span>
+          </span>
+        \`)
+        .join("");
+      return badges ? \`<div class="property-badges">\${badges}</div>\` : "";
     };
 
     const openCard = (card) => {
@@ -1420,15 +1433,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           cardEl.dataset.uri = card.uri;
           cardEl.dataset.column = columnId;
           const tagsHtml = renderTags(card.tags || []);
+          const propertyBadgesHtml = renderPropertyBadges(card.properties || []);
           const created = new Date(card.createdAt);
           const createdLabel = created.toLocaleDateString();
           const createdRelative = formatRelativeTime(created);
-          const priorityLabel = formatPriority(card.priority);
-          const metaLine = createdLabel + " · " + createdRelative + (priorityLabel ? " · P" + priorityLabel : "");
+          const metaLine = createdLabel + " · " + createdRelative;
           cardEl.innerHTML = \`
             <h3>\${escapeHtml(card.title)}</h3>
             <div class="meta">\${metaLine}</div>
             \${tagsHtml}
+            \${propertyBadgesHtml}
           \`;
           cardEl.addEventListener("click", () => renderDetails(card));
           cardEl.addEventListener("dblclick", () => openCard(card));
@@ -1501,7 +1515,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (!actionType || !actionValue) {
         return;
       }
-      vscode.postMessage({ type: actionType, path: actionValue, agentId: actionValue });
+      if (actionType === "resumeAgent") {
+        vscode.postMessage({ type: actionType, agentId: actionValue });
+        return;
+      }
+      if (actionType === "openPath") {
+        vscode.postMessage({ type: actionType, path: actionValue });
+      }
     });
     detailsEl.addEventListener("dblclick", () => openCard(selectedCard));
 
@@ -1592,285 +1612,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   }
 }
 
-function createEmptyBoardConfig(sourceText: string): BoardConfig {
-  return {
-    data: {},
-    folders: [],
-    folderMap: new Map(),
-    sourceText,
-  };
-}
-
-function parseBoardConfig(content: string): BoardConfig {
-  let data: Record<string, unknown> = {};
-  try {
-    const parsed = YAML.parse(content);
-    if (isPlainObject(parsed)) {
-      data = { ...parsed };
-    }
-  } catch {
-    data = {};
-  }
-
-  const folders: BoardFolderConfig[] = [];
-  const rawFolders = data.folders;
-
-  if (Array.isArray(rawFolders)) {
-    let order = 1;
-    for (const entry of rawFolders) {
-      if (typeof entry === "string") {
-        const id = entry.trim();
-        if (!id) {
-          continue;
-        }
-        folders.push({ id, title: id, order, rawValue: entry });
-        order += 1;
-        continue;
-      }
-      if (!isPlainObject(entry)) {
-        continue;
-      }
-      const id = coerceString(
-        entry.id ?? entry.folder ?? entry.path ?? entry.name
-      );
-      if (!id) {
-        continue;
-      }
-      folders.push({
-        id,
-        title: coerceString(entry.title) ?? id,
-        order,
-        rawValue: entry,
-      });
-      order += 1;
-    }
-  } else if (isPlainObject(rawFolders)) {
-    let order = 1;
-    for (const [id, value] of Object.entries(rawFolders)) {
-      const folderId = id.trim();
-      if (!folderId) {
-        continue;
-      }
-      folders.push({
-        id: folderId,
-        title: readFolderTitle(value) ?? folderId,
-        order,
-        rawValue: value,
-      });
-      order += 1;
-    }
-  }
-
-  return {
-    data,
-    folders,
-    folderMap: new Map(folders.map((folder) => [folder.id, folder])),
-    sourceText: content,
-  };
-}
-
-function serializeBoardConfig(
-  data: Record<string, unknown>,
-  existingText = ""
-): string {
-  const eol = detectLineEnding(existingText);
-  const serialized = YAML.stringify(data).trim();
-  return serialized ? `${serialized}${eol}` : "";
-}
-
-function buildFolderConfigMap(
-  columns: { id: string; name: string }[],
-  boardConfig: BoardConfig
-): Record<string, unknown> {
-  const folders: Record<string, unknown> = {};
-  for (const column of columns) {
-    const existing = boardConfig.folderMap.get(column.id);
-    folders[column.id] = buildFolderConfigValue(
-      column.id,
-      column.name,
-      existing?.rawValue
-    );
-  }
-  return folders;
-}
-
-function buildFolderConfigValue(
-  folderId: string,
-  title: string,
-  rawValue: unknown
-): unknown {
-  if (isPlainObject(rawValue)) {
-    const updated = { ...rawValue };
-    if (title === folderId) {
-      delete updated.title;
-    } else {
-      updated.title = title;
-    }
-    return Object.keys(updated).length > 0 ? updated : title;
-  }
-  return title;
-}
-
-function readFolderTitle(value: unknown): string | null {
-  if (typeof value === "string") {
-    return value.trim() || null;
-  }
-  if (isPlainObject(value)) {
-    return coerceString(value.title);
-  }
-  return null;
-}
-
-function coerceString(value: unknown): string | null {
-  if (typeof value !== "string") {
-    return null;
-  }
-  const trimmed = value.trim();
-  return trimmed ? trimmed : null;
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
-
-function compareColumns(
-  a: { name: string; order: number | null },
-  b: { name: string; order: number | null }
-): number {
-  const orderA = a.order ?? Number.POSITIVE_INFINITY;
-  const orderB = b.order ?? Number.POSITIVE_INFINITY;
-  if (orderA !== orderB) {
-    return orderA - orderB;
-  }
-  return a.name.localeCompare(b.name);
-}
-
-function detectLineEnding(text: string): "\n" | "\r\n" {
-  return text.includes("\r\n") ? "\r\n" : "\n";
-}
-
-function normalizeLineEndings(text: string): string {
-  return text.replace(/\r\n/g, "\n");
-}
-
-function normalizePropertyValue(value: string): string {
-  const trimmed = value.trim();
-  if (trimmed.length < 2) {
-    return trimmed;
-  }
-  const first = trimmed[0];
-  const last = trimmed[trimmed.length - 1];
-  if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
-    return trimmed.slice(1, -1).trim();
-  }
-  return trimmed;
-}
-
-function isGuidValue(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-    normalizePropertyValue(value)
-  );
-}
-
-function isAbsoluteLocalPath(value: string): boolean {
-  const normalized = normalizePropertyValue(value);
-  if (!normalized || /^[a-z][a-z0-9+.-]*:\/\//i.test(normalized)) {
-    return false;
-  }
-  return (
-    path.win32.isAbsolute(normalized) || path.posix.isAbsolute(normalized)
-  );
-}
-
-function parseMarkdown(
-  content: string,
-  fallbackTitle: string
-): {
-  title: string;
-  body: string;
-  properties: CardProperty[];
-  tags: string[];
-  priority: number | null;
-} {
-  const lines = content.split(/\r?\n/);
-  let title = fallbackTitle.replace(/\.md$/i, "");
-  let titleIndex = -1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (line.startsWith("# ")) {
-      title = line.replace(/^#\s+/, "").trim() || title;
-      titleIndex = i;
-      break;
-    }
-  }
-
-  const metadataStart = titleIndex === -1 ? 0 : titleIndex + 1;
-  const { properties, nextIndex } = extractPropertyBlock(lines, metadataStart);
-  const tags = new Set<string>();
-  let priority: number | null = null;
-
-  for (const property of properties) {
-    if (property.key.toLowerCase() === "tags") {
-      for (const tag of property.value
-        .split(",")
-        .map((item) => item.trim())
-        .filter((item) => item.length > 0)) {
-        tags.add(tag);
-      }
-    }
-    if (property.key.toLowerCase() === "priority") {
-      const value = Number(property.value.trim());
-      if (Number.isFinite(value)) {
-        priority = value;
-      }
-    }
-  }
-
-  const body = lines.slice(nextIndex).join("\n").trim();
-  return {
-    title,
-    body,
-    properties,
-    tags: Array.from(tags),
-    priority,
-  };
-}
-
-function extractPropertyBlock(
-  lines: string[],
-  startIndex: number
-): { properties: CardProperty[]; nextIndex: number } {
-  let index = startIndex;
-  while (index < lines.length && lines[index].trim() === "") {
-    index += 1;
-  }
-  const firstContentIndex = index;
-
-  const properties: CardProperty[] = [];
-  while (index < lines.length) {
-    const property = parseTaskPropertyLine(lines[index]);
-    if (!property) {
-      break;
-    }
-    properties.push(property);
-    index += 1;
-  }
-
-  if (
-    properties.length === 0 ||
-    (index < lines.length && lines[index].trim() !== "")
-  ) {
-    return { properties: [], nextIndex: firstContentIndex };
-  }
-
-  while (index < lines.length && lines[index].trim() === "") {
-    index += 1;
-  }
-
-  return { properties, nextIndex: index };
-}
-
 function parseColumnMarkdown(
   content: string,
   fallbackTitle: string
@@ -1895,36 +1636,6 @@ function parseColumnMarkdown(
   return { title, order };
 }
 
-function upsertNumberLine(content: string, key: string, value: number): string {
-  const lines = content.split(/\r?\n/);
-  const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*:\\s*.*$`, "i");
-  const updated: string[] = [];
-  let replaced = false;
-  for (const line of lines) {
-    if (pattern.test(line)) {
-      if (!replaced) {
-        updated.push(`${key}: ${value}`);
-        replaced = true;
-      }
-      continue;
-    }
-    updated.push(line);
-  }
-  if (!replaced) {
-    const headingIndex = updated.findIndex((line) => line.trim().startsWith("# "));
-    if (headingIndex !== -1) {
-      updated.splice(headingIndex + 1, 0, "", `${key}: ${value}`, "");
-    } else {
-      updated.splice(0, 0, `${key}: ${value}`, "");
-    }
-  }
-  return updated.join("\n").replace(/\n{3,}/g, "\n\n").replace(/\n\n$/g, "\n\n");
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function slugifyFileName(value: string): string {
   const trimmed = value.trim().toLowerCase();
   if (!trimmed) {
@@ -1934,6 +1645,30 @@ function slugifyFileName(value: string): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+function buildCardPriorityList(orderedUris: string[]): string[] {
+  const priorities: string[] = [];
+  const seen = new Set<string>();
+
+  for (const rawUri of orderedUris) {
+    if (typeof rawUri !== "string" || !rawUri.trim()) {
+      continue;
+    }
+    let fileName = "";
+    try {
+      fileName = path.posix.basename(vscode.Uri.parse(rawUri).path);
+    } catch {
+      fileName = "";
+    }
+    if (!fileName || seen.has(fileName)) {
+      continue;
+    }
+    seen.add(fileName);
+    priorities.push(fileName);
+  }
+
+  return priorities;
 }
 
 function getNonce(): string {

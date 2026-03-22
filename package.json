@@ -2,11 +2,13 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "1.0.2",
+  "version": "1.0.6",
+  "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
   "activationEvents": [
-    "onLanguage:markdown"
+    "onLanguage:markdown",
+    "onLanguage:kanban"
   ],
   "engines": {
     "vscode": "^1.90.0"
@@ -16,7 +18,38 @@
   ],
   "icon": "icon.png",
   "main": "./out/extension.js",
+  "files": [
+    "out/extension.js",
+    "LICENSE",
+    "icon.png",
+    "language-configuration.json",
+    "syntaxes/kanban.tmLanguage.json"
+  ],
   "contributes": {
+    "languages": [
+      {
+        "id": "kanban",
+        "aliases": [
+          "Kanban",
+          ".kanban"
+        ],
+        "extensions": [
+          ".kanban"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icon.png",
+          "dark": "./icon.png"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "kanban",
+        "scopeName": "source.kanban",
+        "path": "./syntaxes/kanban.tmLanguage.json"
+      }
+    ],
     "commands": [
       {
         "command": "kanban.resumeAgent",
@@ -41,10 +74,15 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "tsc -p ./",
+    "vscode:prepublish": "npm run build:release",
+    "bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --target=node20 --external:vscode --outfile=out/extension.js",
+    "build:release": "npm run compile && npm run bundle",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && npm run test:webview && npm run test:task-links",
+    "package:vsix": "npm test && vsce package",
+    "publish:marketplace": "npm test && vsce publish",
+    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config",
+    "test:board-config": "node scripts/test-board-config.js",
     "test:webview": "node scripts/smoke-webview.js",
     "test:task-links": "node scripts/test-task-links.js"
   },
@@ -52,6 +90,8 @@
     "@types/markdown-it": "^13.0.7",
     "@types/node": "^20.11.30",
     "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.27.4",
     "typescript": "^5.5.4"
   },
   "dependencies": {

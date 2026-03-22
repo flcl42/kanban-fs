@@ -1,5 +1,7 @@
 # Kanban-fs (VS Code Extension)
 
+[![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/flcl42.kanban-vsix)](https://marketplace.visualstudio.com/items?itemName=flcl42.kanban-vsix)
+
 Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban board. Columns are sibling directories, cards are Markdown files, the first `# H1` becomes the card title, and the details panel renders task metadata plus the Markdown body.
 
 `.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
@@ -22,11 +24,17 @@ Legacy `folder.md` files are still read as a fallback, but new boards should kee
 
 ## Build a VSIX
 
-1. Install the VS Code extension packaging tool: `npm install -g @vscode/vsce`
-2. Build: `npm run compile`
-3. Package: `vsce package`
+1. Install deps: `npm install`
+2. Package: `npm run package:vsix`
 
 The `.vsix` file will be created in the project root.
+
+## Publish
+
+1. Create a Visual Studio Marketplace personal access token and expose it as `VSCE_PAT`.
+2. Publish: `npm run publish:marketplace`
+
+The publish scripts run the test suite first, then use the local `vsce` binary from `devDependencies`.
 
 ## Contributing / Feature Requests
 

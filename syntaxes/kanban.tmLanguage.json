@@ -1,0 +1,8 @@
+{
+  "scopeName": "source.kanban",
+  "patterns": [
+    {
+      "include": "source.yaml"
+    }
+  ]
+}
