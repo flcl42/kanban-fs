@@ -4,6 +4,8 @@
 
 Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban board. Columns are sibling directories, cards are Markdown files, the first `# H1` becomes the card title, and the details panel renders task metadata plus the Markdown body.
 
+If `template.md` exists beside the board's `.kanban` file, `+ Add ticket` seeds new card files with that template content.
+
 `.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
 
 ```yaml

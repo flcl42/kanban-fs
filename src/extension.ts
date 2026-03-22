@@ -23,6 +23,10 @@ import {
   type TaskPropertyAction,
   type TaskLinkAction,
 } from "./task-links";
+import {
+  buildNewCardContent,
+  CARD_TEMPLATE_FILE_NAME,
+} from "./new-card";
 
 type CardProperty = TaskProperty & {
   action: TaskPropertyAction | null;
@@ -568,11 +572,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const fileUri = vscode.Uri.joinPath(columnUri, fileName);
-    const content = `# ${safeTitle}\n\n`;
+    const templateContent = await this.readNewCardTemplate(boardFolder);
+    const content = buildNewCardContent(safeTitle, templateContent);
     const context = this.createEditContext();
     await this.ensureFile(fileUri, context);
     this.queueInsertContent(context, fileUri, content);
     await this.applyEditContext(context);
+  }
+
+  private async readNewCardTemplate(
+    boardFolder: vscode.Uri
+  ): Promise<string | null> {
+    const templateUri = vscode.Uri.joinPath(boardFolder, CARD_TEMPLATE_FILE_NAME);
+    try {
+      const stat = await vscode.workspace.fs.stat(templateUri);
+      if (stat.type !== vscode.FileType.File) {
+        return null;
+      }
+      const raw = await vscode.workspace.fs.readFile(templateUri);
+      return Buffer.from(raw).toString("utf8");
+    } catch {
+      return null;
+    }
   }
 
   private async reorderCards(

@@ -81,8 +81,9 @@
     "watch": "tsc -watch -p ./",
     "package:vsix": "npm test && vsce package",
     "publish:marketplace": "npm test && vsce publish",
-    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config",
+    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card",
     "test:board-config": "node scripts/test-board-config.js",
+    "test:new-card": "node scripts/test-new-card.js",
     "test:webview": "node scripts/smoke-webview.js",
     "test:task-links": "node scripts/test-task-links.js"
   },
