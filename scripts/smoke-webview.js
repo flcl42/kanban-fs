@@ -45,6 +45,16 @@ assert.match(
   /\.column-header\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;/,
   "column headers should stay visible while scrolling long columns"
 );
+assert.match(
+  html,
+  /\.details\s*\{[^}]*align-self:\s*start;[^}]*position:\s*sticky;[^}]*top:\s*16px;/,
+  "details pane should stay pinned while the board scrolls"
+);
+assert.match(
+  html,
+  /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.details\s*\{[^}]*position:\s*static;[^}]*top:\s*auto;[^}]*height:\s*auto;/,
+  "mobile layout should reset the sticky details pane"
+);
 
 class FakeElement {
   constructor(tagName = "div") {
@@ -55,6 +65,10 @@ class FakeElement {
     this.style = {};
     this.draggable = false;
     this.textContent = "";
+    this.value = "";
+    this.hidden = false;
+    this.placeholder = "";
+    this.selected = false;
     this.listeners = {};
     this.attributes = new Map();
     this.children = [];
@@ -91,6 +105,21 @@ class FakeElement {
     return this.attributes.get(name) ?? null;
   }
 
+  focus() {
+    activeElement = this;
+  }
+
+  select() {
+    this.selected = true;
+    activeElement = this;
+  }
+
+  blur() {
+    if (activeElement === this) {
+      activeElement = null;
+    }
+  }
+
   closest() {
     return null;
   }
@@ -98,8 +127,12 @@ class FakeElement {
 
 const boardEl = new FakeElement("section");
 const detailsEl = new FakeElement("aside");
+const searchInputEl = new FakeElement("input");
+const searchMetaEl = new FakeElement("div");
+const searchClearEl = new FakeElement("button");
 const windowListeners = {};
 const messages = [];
+let activeElement = null;
 
 const context = {
   console,
@@ -127,7 +160,19 @@ const context = {
       if (id === "details") {
         return detailsEl;
       }
+      if (id === "board-search-input") {
+        return searchInputEl;
+      }
+      if (id === "search-meta") {
+        return searchMetaEl;
+      }
+      if (id === "search-clear") {
+        return searchClearEl;
+      }
       return new FakeElement();
+    },
+    get activeElement() {
+      return activeElement;
     },
     createElement(tagName) {
       return new FakeElement(tagName);
@@ -145,6 +190,8 @@ vm.runInNewContext(scriptMatch[1], context);
 
 assert.equal(messages[0]?.type, "ready", "webview should request board data");
 assert.equal(typeof windowListeners.message, "function", "message listener missing");
+assert.equal(typeof windowListeners.keydown, "function", "keydown listener missing");
+assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
 
 windowListeners.message({
   data: {
@@ -186,6 +233,8 @@ windowListeners.message({
 assert.equal(boardEl.children.length, 1, "expected one rendered column");
 assert.equal(boardEl.children[0].dataset.column, "Doing", "column id should be rendered");
 assert.equal(boardEl.children[0].children.length, 2, "expected header and one card");
+assert.match(searchMetaEl.textContent, /1 card/, "search summary should show card count");
+assert.equal(searchClearEl.hidden, true, "clear button should stay hidden with no filter");
 assert.match(
   boardEl.children[0].children[1].innerHTML,
   /property-badge/,
@@ -239,3 +288,52 @@ detailsEl.listeners.click({
 
 assert.equal(messages.at(-1)?.type, "openPath");
 assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+
+let prevented = false;
+windowListeners.keydown({
+  key: "f",
+  ctrlKey: true,
+  metaKey: false,
+  shiftKey: false,
+  target: boardEl,
+  preventDefault() {
+    prevented = true;
+  },
+});
+
+assert.equal(prevented, true, "Ctrl+F should override browser find");
+assert.equal(activeElement, searchInputEl, "Ctrl+F should focus the search input");
+assert.equal(searchInputEl.selected, true, "Ctrl+F should select search text");
+
+searchInputEl.value = "jane";
+searchInputEl.listeners.input();
+
+assert.equal(boardEl.children.length, 1, "filtering should keep the column visible");
+assert.equal(boardEl.children[0].children.length, 2, "matching filter should still render header and card");
+assert.equal(boardEl.children[0].children[0].draggable, false, "column drag should be disabled while filtering");
+assert.equal(boardEl.children[0].children[1].draggable, false, "card drag should be disabled while filtering");
+assert.match(
+  searchMetaEl.textContent,
+  /1 of 1 cards shown.*Dragging is disabled while filtering\./,
+  "search summary should explain filtered state"
+);
+assert.equal(searchClearEl.hidden, false, "clear button should appear with an active filter");
+
+searchInputEl.value = "missing";
+searchInputEl.listeners.input();
+
+assert.equal(boardEl.children[0].children.length, 2, "no-match filter should render header and empty state");
+assert.equal(boardEl.children[0].children[1].className, "column-empty", "column should show a filter empty state");
+assert.match(
+  detailsEl.innerHTML,
+  /Selected card is hidden by the current search/,
+  "details should explain when the selected card is filtered out"
+);
+assert.match(searchMetaEl.textContent, /No cards match "missing"\./, "search summary should show no-match text");
+
+searchClearEl.listeners.click();
+
+assert.equal(searchInputEl.value, "", "clear action should reset the query");
+assert.equal(searchClearEl.hidden, true, "clear button should hide after clearing");
+assert.equal(boardEl.children[0].children[1].dataset.uri, "file:///task.md", "clearing should restore matching cards");
+assert.match(detailsEl.innerHTML, /Owner:/, "clearing the filter should restore selected card details");

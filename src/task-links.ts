@@ -3,13 +3,16 @@ import { findTaskProperties } from "./task-metadata";
 export { parseTaskPropertyLine } from "./task-metadata";
 export type { TaskProperty as ParsedTaskPropertyLine } from "./task-metadata";
 
+export type TaskLinkCommand = "resumeAgent" | "openPath" | "openCode";
+export type TaskLinkTitle = "Connect" | "Open" | "Code";
+
 export type TaskLinkAction = {
   line: number;
   key: string;
   label: string;
   value: string;
-  command: "resumeAgent" | "openPath";
-  title: "Connect" | "Open";
+  command: TaskLinkCommand;
+  title: TaskLinkTitle;
 };
 
 export type TaskPropertyAction = Pick<
@@ -19,19 +22,16 @@ export type TaskPropertyAction = Pick<
 
 export function findTaskLinkActions(content: string): TaskLinkAction[] {
   return findTaskProperties(content)
-    .map((property) => {
-      const action = getTaskPropertyAction(property.key, property.value);
-      if (!action) {
-        return null;
-      }
-      return {
-        line: property.line,
-        key: property.key,
-        label: property.label,
-        ...action,
-      };
-    })
-    .filter((action): action is TaskLinkAction => !!action);
+    .flatMap((property) => {
+      return getTaskPropertyLinkActions(property.key, property.value).map(
+        (action) => ({
+          line: property.line,
+          key: property.key,
+          label: property.label,
+          ...action,
+        })
+      );
+    });
 }
 
 export function normalizePropertyValue(value: string): string {
@@ -67,14 +67,24 @@ export function getTaskPropertyAction(
   key: string,
   value: string
 ): TaskPropertyAction | null {
+  const [primaryAction] = getTaskPropertyLinkActions(key, value);
+  return primaryAction ?? null;
+}
+
+function getTaskPropertyLinkActions(
+  key: string,
+  value: string
+): TaskPropertyAction[] {
   const normalizedKey = key.trim().toLowerCase();
   const normalizedValue = normalizePropertyValue(value);
   if (normalizedKey === "agent" && isGuidValue(normalizedValue)) {
-    return {
-      command: "resumeAgent",
-      title: "Connect",
-      value: normalizedValue,
-    };
+    return [
+      {
+        command: "resumeAgent",
+        title: "Connect",
+        value: normalizedValue,
+      },
+    ];
   }
   if (
     (normalizedKey === "repo"
@@ -82,11 +92,18 @@ export function getTaskPropertyAction(
       || normalizedKey === "project")
     && isAbsoluteLocalPath(normalizedValue)
   ) {
-    return {
-      command: "openPath",
-      title: "Open",
-      value: normalizedValue,
-    };
+    return [
+      {
+        command: "openPath",
+        title: "Open",
+        value: normalizedValue,
+      },
+      {
+        command: "openCode",
+        title: "Code",
+        value: normalizedValue,
+      },
+    ];
   }
-  return null;
+  return [];
 }

@@ -6,6 +6,8 @@ Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban 
 
 If `template.md` exists beside the board's `.kanban` file, `+ Add ticket` seeds new card files with that template content.
 
+Press `Ctrl+F` (or `Cmd+F` on macOS) in the board view to filter cards by title, body text, tags, file name, and task properties.
+
 `.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
 
 ```yaml

@@ -14,7 +14,7 @@ Body starts here.
 
 const actions = findTaskLinkActions(task);
 
-assert.equal(actions.length, 2, "expected two task link actions");
+assert.equal(actions.length, 3, "expected three task link actions");
 assert.deepEqual(
   actions.map((action) => ({
     line: action.line,
@@ -33,6 +33,12 @@ assert.deepEqual(
       line: 3,
       title: "Open",
       command: "openPath",
+      value: "C:\\work\\demo",
+    },
+    {
+      line: 3,
+      title: "Code",
+      command: "openCode",
       value: "C:\\work\\demo",
     },
   ]
@@ -112,6 +118,11 @@ assert.deepEqual(
       command: "openPath",
       value: "C:\\work\\demo",
     },
+    {
+      line: 3,
+      command: "openCode",
+      value: "C:\\work\\demo",
+    },
   ]
 );
 
@@ -154,3 +165,35 @@ assert.deepEqual(updatedFolders, {
   },
   Doing: "In Progress",
 });
+
+const secondaryHeadingTitle = parseTaskMarkdown(
+  `## [bug] Ship it
+
+Owner: Jane
+`,
+  "fallback.md"
+);
+
+assert.equal(
+  secondaryHeadingTitle.title,
+  "[bug] Ship it",
+  "the first markdown heading should be usable as the card title even when it is not an H1"
+);
+
+const cursorDisplay = parseTaskMarkdown(
+  `# Example task
+
+Project: {{CURSOR}}
+Owner: Jane
+`,
+  "fallback.md"
+);
+
+assert.deepEqual(
+  cursorDisplay.properties,
+  [
+    { key: "Project", label: "Project", value: "" },
+    { key: "Owner", label: "Owner", value: "Jane" },
+  ],
+  "cursor placeholders should be hidden from board property displays"
+);

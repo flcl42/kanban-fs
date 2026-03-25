@@ -1,7 +1,7 @@
-# 
+# {{TITLE}}
 
 Tags:
-Project:
+Project: {{CURSOR}}
 
 # Description
 

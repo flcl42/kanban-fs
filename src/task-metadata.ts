@@ -1,3 +1,5 @@
+import { CURSOR_PLACEHOLDER } from "./new-card";
+
 export type TaskProperty = {
   key: string;
   label: string;
@@ -63,9 +65,13 @@ export function parseTaskMarkdown(
     if (index < metadataEnd) {
       const property = parseTaskPropertyLine(lines[index]);
       if (property) {
-        properties.push(property);
-        if (property.key.toLowerCase() === "tags") {
-          for (const tag of property.value
+        const displayProperty = {
+          ...property,
+          value: sanitizeTaskDisplayValue(property.value),
+        };
+        properties.push(displayProperty);
+        if (displayProperty.key.toLowerCase() === "tags") {
+          for (const tag of displayProperty.value
             .split(",")
             .map((item) => item.trim())
             .filter((item) => item.length > 0)) {
@@ -95,10 +101,10 @@ function findTitle(
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index].trim();
-    if (!line.startsWith("# ")) {
+    if (!/^#{1,6}\s+\S/.test(line)) {
       continue;
     }
-    title = line.replace(/^#\s+/, "").trim() || title;
+    title = line.replace(/^#{1,6}\s+/, "").trim() || title;
     titleIndex = index;
     break;
   }
@@ -152,4 +158,8 @@ function trimBlankEdges(lines: string[]): string[] {
   }
 
   return lines.slice(start, end);
+}
+
+function sanitizeTaskDisplayValue(value: string): string {
+  return value.split(CURSOR_PLACEHOLDER).join("").trim();
 }
