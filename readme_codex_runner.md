@@ -51,6 +51,8 @@ Blank lines and lines starting with `#` are ignored.
 Each task is a Markdown file. `codex_runner` manages `Agent:` and `Repo:`; keep them present even if blank.
 
 ```md
+# Title
+
 Project: nm
 Agent:
 Repo:
