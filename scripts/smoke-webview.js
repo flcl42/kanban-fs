@@ -37,6 +37,16 @@ assert.doesNotMatch(
 );
 assert.match(
   html,
+  /\.board-pane\s*\{[^}]*min-height:\s*0;[^}]*height:\s*calc\(100vh - 32px\);/,
+  "board pane should be viewport-bounded so long columns scroll inside it"
+);
+assert.match(
+  html,
+  /\.board-scroll\s*\{[^}]*flex:\s*1;[^}]*min-height:\s*0;[^}]*overflow:\s*auto;[^}]*padding-bottom:\s*8px;/,
+  "board scrolling should happen inside the board pane so sticky column headers keep working"
+);
+assert.match(
+  html,
   /\.layout\s*\{[^}]*min-height:\s*100vh;/,
   "layout should be able to grow beyond the viewport for tall columns"
 );
@@ -52,8 +62,8 @@ assert.match(
 );
 assert.match(
   html,
-  /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.details\s*\{[^}]*position:\s*static;[^}]*top:\s*auto;[^}]*height:\s*auto;/,
-  "mobile layout should reset the sticky details pane"
+  /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.board-pane\s*\{[^}]*height:\s*auto;[\s\S]*?\.details\s*\{[^}]*position:\s*static;[^}]*top:\s*auto;[^}]*height:\s*auto;/,
+  "mobile layout should reset the fixed-height board pane and sticky details pane"
 );
 
 class FakeElement {

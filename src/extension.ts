@@ -1001,9 +1001,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .board-pane {
       min-width: 0;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       gap: 12px;
+      height: calc(100vh - 32px);
     }
     .board-toolbar {
       display: flex;
@@ -1076,13 +1078,18 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       padding: 16px;
       min-height: 100vh;
     }
+    .board-scroll {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding-bottom: 8px;
+      padding-right: 4px;
+    }
     .board {
       display: grid;
       grid-auto-flow: column;
       grid-auto-columns: minmax(220px, 1fr);
       gap: 16px;
-      overflow-x: auto;
-      padding-bottom: 8px;
     }
     .column {
       background: var(--panel);
@@ -1330,6 +1337,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         grid-template-columns: 1fr;
         height: auto;
       }
+      .board-pane {
+        height: auto;
+      }
+      .board-scroll {
+        flex: none;
+        min-height: 0;
+      }
       .details {
         position: static;
         top: auto;
@@ -1355,7 +1369,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <button class="search-clear" id="search-clear" type="button" hidden>Clear</button>
         <div class="search-meta" id="search-meta"></div>
       </div>
-      <section class="board" id="board"></section>
+      <div class="board-scroll">
+        <section class="board" id="board"></section>
+      </div>
     </section>
     <aside class="details" id="details">
       <div class="empty">Select a card to view details.</div>
