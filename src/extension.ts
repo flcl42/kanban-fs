@@ -1,5 +1,7 @@
 import * as path from "path";
 import * as vscode from "vscode";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import MarkdownIt from "markdown-it";
 import {
   buildFolderConfigMap,
@@ -65,6 +67,7 @@ const md = new MarkdownIt({
   html: false,
   linkify: true,
 });
+const execFileAsync = promisify(execFile);
 
 const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
@@ -318,6 +321,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "resumeAgent" && message?.agentId) {
         await this.resumeAgent(String(message.agentId));
+        return;
+      }
+      if (message?.type === "requestGitStatus" && message?.path) {
+        const status = await this.readGitStatus(String(message.path));
+        webviewPanel.webview.postMessage({
+          type: "gitStatus",
+          cardUri: String(message?.cardUri ?? ""),
+          path: String(message.path),
+          status,
+        });
         return;
       }
       if (message?.type === "openPath" && message?.path) {
@@ -840,6 +853,42 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return cwd;
   }
 
+  private async readGitStatus(rawPath: string): Promise<string | null> {
+    const cwd = await this.resolvePathDirectory(rawPath);
+    if (!cwd) {
+      return null;
+    }
+
+    try {
+      const inside = await execFileAsync(
+        "git",
+        ["-C", cwd, "rev-parse", "--is-inside-work-tree"],
+        {
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+      if (String(inside.stdout || "").trim() !== "true") {
+        return null;
+      }
+
+      const result = await execFileAsync(
+        "git",
+        ["-C", cwd, "status", "--short", "--branch"],
+        {
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+      const output = String(result.stdout || "").trim();
+      return output || null;
+    } catch {
+      return null;
+    }
+  }
+
   private async resolveEditorCursorPlaceholder(
     editor: vscode.TextEditor | undefined
   ): Promise<void> {
@@ -1317,6 +1366,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       border-top: 1px solid var(--line);
       margin: 0 0 16px;
     }
+    .details-section-title {
+      margin: 0 0 10px;
+      font-size: 12px;
+      font-family: var(--mono);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .git-status-text {
+      margin: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.5;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .drop-target {
       outline: 2px dashed var(--accent);
       outline-offset: 4px;
@@ -1387,6 +1458,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let selectedCard = null;
     let lastBoard = null;
     let searchQuery = "";
+    const gitStatusCache = new Map();
     let refreshTimer = null;
     const cardDragType = "application/x-kanban-card";
     const columnDragType = "application/x-kanban-column";
@@ -1451,6 +1523,58 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       detailsEl.innerHTML = \`<div class="empty">\${escapeHtml(message)}</div>\`;
     };
 
+    const getRepoPath = (card) => {
+      const repoProperty = (card?.properties || []).find((property) => {
+        return String(property?.key || "").trim().toLowerCase() === "repo";
+      });
+      const value = String(repoProperty?.value || "").trim();
+      return value || null;
+    };
+
+    const requestGitStatus = (card) => {
+      const repoPath = getRepoPath(card);
+      if (!repoPath) {
+        return;
+      }
+      const cached = gitStatusCache.get(repoPath);
+      if (cached?.state === "loading" || cached?.state === "ready" || cached?.state === "missing") {
+        return;
+      }
+      gitStatusCache.set(repoPath, { state: "loading" });
+      vscode.postMessage({
+        type: "requestGitStatus",
+        cardUri: card.uri,
+        path: repoPath,
+      });
+    };
+
+    const renderGitStatus = (card) => {
+      const repoPath = getRepoPath(card);
+      if (!repoPath) {
+        return "";
+      }
+      const cached = gitStatusCache.get(repoPath);
+      if (!cached) {
+        requestGitStatus(card);
+        return "";
+      }
+      if (cached.state === "loading") {
+        return \`
+          <hr />
+          <h2 class="details-section-title">Git Status</h2>
+          <pre class="git-status-text">Loading...</pre>
+        \`;
+      }
+      if (cached.state !== "ready" || !cached.text) {
+        return "";
+      }
+      return \`
+        <hr />
+        <h2 class="details-section-title">Git Status</h2>
+        <pre class="git-status-text">\${escapeHtml(cached.text)}</pre>
+      \`;
+    };
+
     const renderDetails = (card) => {
       if (!card) {
         renderDetailsPlaceholder("Select a card to view details.");
@@ -1463,6 +1587,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const bodyHtml = card.bodyHtml || '';
       const tagsHtml = renderTags(card.tags || []);
       const propertiesHtml = renderProperties(card.properties || []);
+      const gitStatusHtml = renderGitStatus(card);
       const metaLine = "Created: " + createdLabel + " · " + createdRelative;
       detailsEl.innerHTML = \`
         <h1>\${escapeHtml(card.title)}</h1>
@@ -1472,6 +1597,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <div class="details-body">
           <hr />
           <div>\${bodyHtml || '<div class="empty">No description.</div>'}</div>
+          \${gitStatusHtml}
         </div>
       \`;
     };
@@ -1941,6 +2067,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "boardError") {
         boardEl.innerHTML = \`<div class="error">\${escapeHtml(message.message || "Failed to load board.")}</div>\`;
+      }
+      if (message?.type === "gitStatus") {
+        const repoPath = String(message?.path || "").trim();
+        if (repoPath) {
+          gitStatusCache.set(repoPath, message?.status
+            ? { state: "ready", text: String(message.status) }
+            : { state: "missing" });
+        }
+        if (selectedCard && message?.cardUri === selectedCard.uri) {
+          renderDetails(selectedCard);
+        }
       }
     });
 

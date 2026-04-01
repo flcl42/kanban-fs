@@ -222,6 +222,12 @@ windowListeners.message({
               properties: [
                 { key: "Tags", label: "Tags", value: "ship", action: null },
                 {
+                  key: "Repo",
+                  label: "Repo",
+                  value: "C:\\work\\demo",
+                  action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                },
+                {
                   key: "Path",
                   label: "Path",
                   value: "C:\\work\\demo",
@@ -263,6 +269,9 @@ assert.ok(
 
 boardEl.children[0].children[1].listeners.click();
 
+assert.equal(messages.at(-1)?.type, "requestGitStatus", "details should request git status for Repo properties");
+assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
 assert.doesNotMatch(
   detailsEl.innerHTML,
@@ -284,6 +293,19 @@ assert.match(
   /data-action-type="openPath"/,
   "details should render an open-path action for path properties"
 );
+
+windowListeners.message({
+  data: {
+    type: "gitStatus",
+    cardUri: "file:///task.md",
+    path: "C:\\work\\demo",
+    status: "## main\\n M src/extension.ts",
+  },
+});
+
+assert.match(detailsEl.innerHTML, /Git Status/, "details should render a git status section for Repo properties");
+assert.match(detailsEl.innerHTML, /## main/, "git status output should be displayed in the details pane");
+assert.match(detailsEl.innerHTML, /M src\/extension\.ts/, "git status body should be rendered as text");
 
 const actionButton = new FakeElement("button");
 actionButton.setAttribute("data-action-type", "openPath");
