@@ -222,6 +222,16 @@ windowListeners.message({
               properties: [
                 { key: "Tags", label: "Tags", value: "ship", action: null },
                 {
+                  key: "Agent",
+                  label: "Agent",
+                  value: "019d0095-6102-7fe2-9fc8-5db0155692e9",
+                  action: {
+                    command: "resumeAgent",
+                    title: "Connect",
+                    value: "019d0095-6102-7fe2-9fc8-5db0155692e9",
+                  },
+                },
+                {
                   key: "Repo",
                   label: "Repo",
                   value: "C:\\work\\demo",
@@ -269,8 +279,10 @@ assert.ok(
 
 boardEl.children[0].children[1].listeners.click();
 
-assert.equal(messages.at(-1)?.type, "requestGitStatus", "details should request git status for Repo properties");
-assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+assert.equal(messages.at(-2)?.type, "requestGitStatus", "details should request git status for Repo properties");
+assert.equal(messages.at(-2)?.path, "C:\\work\\demo");
+assert.equal(messages.at(-1)?.type, "requestCodexOutput", "details should request codex output for Agent properties");
+assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
 
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
 assert.doesNotMatch(
@@ -306,6 +318,19 @@ windowListeners.message({
 assert.match(detailsEl.innerHTML, /Git Status/, "details should render a git status section for Repo properties");
 assert.match(detailsEl.innerHTML, /## main/, "git status output should be displayed in the details pane");
 assert.match(detailsEl.innerHTML, /M src\/extension\.ts/, "git status body should be rendered as text");
+
+windowListeners.message({
+  data: {
+    type: "codexOutput",
+    cardUri: "file:///task.md",
+    agentId: "019d0095-6102-7fe2-9fc8-5db0155692e9",
+    output: "Investigating the issue.\\n\\nPatched the validator.",
+  },
+});
+
+assert.match(detailsEl.innerHTML, /Codex Output/, "details should render a codex output section for Agent properties");
+assert.match(detailsEl.innerHTML, /Investigating the issue\./, "codex output should be displayed in the details pane");
+assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest codex output should preserve line breaks");
 
 const actionButton = new FakeElement("button");
 actionButton.setAttribute("data-action-type", "openPath");

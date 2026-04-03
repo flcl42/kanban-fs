@@ -63,11 +63,17 @@ type EditContext = {
   docs: Map<string, vscode.TextDocument>;
 };
 
+type CodexSessionFile = {
+  path: string;
+  lastCheckedAt: number;
+};
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
 });
 const execFileAsync = promisify(execFile);
+const DETAILS_REFRESH_INTERVAL_MS = 10000;
 
 const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
@@ -182,6 +188,7 @@ function isMarkdownDocument(document: vscode.TextDocument): boolean {
 
 class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
+  private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
     new vscode.EventEmitter<vscode.CustomDocumentContentChangeEvent<vscode.CustomDocument>>();
@@ -330,6 +337,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           cardUri: String(message?.cardUri ?? ""),
           path: String(message.path),
           status,
+        });
+        return;
+      }
+      if (message?.type === "requestCodexOutput" && message?.agentId) {
+        const output = await this.readCodexOutput(String(message.agentId));
+        webviewPanel.webview.postMessage({
+          type: "codexOutput",
+          cardUri: String(message?.cardUri ?? ""),
+          agentId: String(message.agentId),
+          output,
         });
         return;
       }
@@ -889,6 +906,144 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readCodexOutput(agentId: string): Promise<string | null> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return null;
+    }
+
+    const sessionFile = await this.findCodexSessionFile(trimmed);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const outputBlocks: string[] = [];
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(lines[index]);
+        } catch {
+          continue;
+        }
+
+        const payload = (entry as { payload?: unknown }).payload;
+        if (!payload || typeof payload !== "object") {
+          continue;
+        }
+
+        const payloadRecord = payload as {
+          type?: string;
+          role?: string;
+          content?: unknown;
+          message?: string;
+        };
+
+        if (payloadRecord.type === "message" && payloadRecord.role === "assistant") {
+          const content = Array.isArray(payloadRecord.content)
+            ? payloadRecord.content
+            : [];
+          const textParts = content
+            .filter((item): item is { type: "output_text"; text: string } => {
+              return !!item
+                && typeof item === "object"
+                && (item as { type?: string }).type === "output_text"
+                && typeof (item as { text?: unknown }).text === "string";
+            })
+            .map((item) => item.text.trim())
+            .filter((item) => item.length > 0);
+          if (textParts.length > 0) {
+            outputBlocks.push(textParts.join("\n\n"));
+          }
+        }
+
+        if (payloadRecord.type === "agent_message" && typeof payloadRecord.message === "string") {
+          const message = payloadRecord.message.trim();
+          if (message) {
+            outputBlocks.push(message);
+          }
+        }
+
+        if (outputBlocks.length >= 3) {
+          break;
+        }
+      }
+
+      if (outputBlocks.length === 0) {
+        return null;
+      }
+
+      const recentLines = outputBlocks
+        .reverse()
+        .join("\n\n")
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.trim().length > 0)
+        .slice(-5);
+
+      return recentLines.length > 0 ? recentLines.join("\n") : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async findCodexSessionFile(agentId: string): Promise<string | null> {
+    const cached = this.codexSessionFiles.get(agentId);
+    const now = Date.now();
+    if (cached && now - cached.lastCheckedAt < DETAILS_REFRESH_INTERVAL_MS) {
+      return cached.path || null;
+    }
+    if (cached === null) {
+      return null;
+    }
+
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home) {
+      this.codexSessionFiles.set(agentId, null);
+      return null;
+    }
+
+    const roots = [
+      path.join(home, ".codex", "sessions"),
+      path.join(home, ".codex", "archived_sessions"),
+    ];
+
+    for (const root of roots) {
+      try {
+        const command = `Get-ChildItem -Path '${escapePowerShellSingleQuotedString(root)}' -Recurse -File -Filter '*${agentId}*.jsonl' | Select-Object -First 1 -ExpandProperty FullName`;
+        const result = await execFileAsync(
+          "powershell",
+          ["-NoProfile", "-Command", command],
+          {
+            windowsHide: true,
+            timeout: 5000,
+            maxBuffer: 1024 * 1024,
+          }
+        );
+        const found = String(result.stdout || "").trim();
+        if (found) {
+          this.codexSessionFiles.set(agentId, {
+            path: found,
+            lastCheckedAt: now,
+          });
+          return found;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    this.codexSessionFiles.set(agentId, {
+      path: "",
+      lastCheckedAt: now,
+    });
+    return null;
+  }
+
   private async resolveEditorCursorPlaceholder(
     editor: vscode.TextEditor | undefined
   ): Promise<void> {
@@ -1388,6 +1543,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .codex-output-text {
+      margin: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      color: var(--ink);
+      font-family: var(--display);
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     .drop-target {
       outline: 2px dashed var(--accent);
       outline-offset: 4px;
@@ -1459,7 +1627,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let lastBoard = null;
     let searchQuery = "";
     const gitStatusCache = new Map();
+    const codexOutputCache = new Map();
     let refreshTimer = null;
+    let detailsRefreshTimer = null;
     const cardDragType = "application/x-kanban-card";
     const columnDragType = "application/x-kanban-column";
     const isMac = navigator.platform.toLowerCase().includes("mac");
@@ -1523,6 +1693,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       detailsEl.innerHTML = \`<div class="empty">\${escapeHtml(message)}</div>\`;
     };
 
+    const getAgentId = (card) => {
+      const agentProperty = (card?.properties || []).find((property) => {
+        return String(property?.key || "").trim().toLowerCase() === "agent";
+      });
+      const value = String(agentProperty?.value || "").trim();
+      return value || null;
+    };
+
     const getRepoPath = (card) => {
       const repoProperty = (card?.properties || []).find((property) => {
         return String(property?.key || "").trim().toLowerCase() === "repo";
@@ -1531,20 +1709,53 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return value || null;
     };
 
+    const shouldRefreshCache = (entry) => {
+      if (!entry) {
+        return true;
+      }
+      const refreshedAt = Number(entry.refreshedAt || 0);
+      return Date.now() - refreshedAt >= 10000;
+    };
+
     const requestGitStatus = (card) => {
       const repoPath = getRepoPath(card);
       if (!repoPath) {
         return;
       }
       const cached = gitStatusCache.get(repoPath);
-      if (cached?.state === "loading" || cached?.state === "ready" || cached?.state === "missing") {
+      if (cached?.state === "loading" || !shouldRefreshCache(cached)) {
         return;
       }
-      gitStatusCache.set(repoPath, { state: "loading" });
+      gitStatusCache.set(repoPath, {
+        state: "loading",
+        text: cached?.text || "",
+        refreshedAt: cached?.refreshedAt || 0,
+      });
       vscode.postMessage({
         type: "requestGitStatus",
         cardUri: card.uri,
         path: repoPath,
+      });
+    };
+
+    const requestCodexOutput = (card) => {
+      const agentId = getAgentId(card);
+      if (!agentId) {
+        return;
+      }
+      const cached = codexOutputCache.get(agentId);
+      if (cached?.state === "loading" || !shouldRefreshCache(cached)) {
+        return;
+      }
+      codexOutputCache.set(agentId, {
+        state: "loading",
+        text: cached?.text || "",
+        refreshedAt: cached?.refreshedAt || 0,
+      });
+      vscode.postMessage({
+        type: "requestCodexOutput",
+        cardUri: card.uri,
+        agentId,
       });
     };
 
@@ -1562,7 +1773,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return \`
           <hr />
           <h2 class="details-section-title">Git Status</h2>
-          <pre class="git-status-text">Loading...</pre>
+          <pre class="git-status-text">\${escapeHtml(cached.text || "Loading...")}</pre>
         \`;
       }
       if (cached.state !== "ready" || !cached.text) {
@@ -1573,6 +1784,53 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <h2 class="details-section-title">Git Status</h2>
         <pre class="git-status-text">\${escapeHtml(cached.text)}</pre>
       \`;
+    };
+
+    const renderCodexOutput = (card) => {
+      const agentId = getAgentId(card);
+      if (!agentId) {
+        return "";
+      }
+      const cached = codexOutputCache.get(agentId);
+      if (!cached) {
+        requestCodexOutput(card);
+        return "";
+      }
+      if (cached.state === "loading") {
+        return \`
+          <hr />
+          <h2 class="details-section-title">Codex Output</h2>
+          <pre class="codex-output-text">\${escapeHtml(cached.text || "Loading...")}</pre>
+        \`;
+      }
+      if (cached.state !== "ready" || !cached.text) {
+        return "";
+      }
+      return \`
+        <hr />
+        <h2 class="details-section-title">Codex Output</h2>
+        <pre class="codex-output-text">\${escapeHtml(cached.text)}</pre>
+      \`;
+    };
+
+    const refreshDetailsData = (card) => {
+      if (!card?.uri) {
+        return;
+      }
+      requestGitStatus(card);
+      requestCodexOutput(card);
+    };
+
+    const startDetailsRefresh = () => {
+      if (detailsRefreshTimer) {
+        return;
+      }
+      detailsRefreshTimer = setInterval(() => {
+        if (!selectedCard) {
+          return;
+        }
+        refreshDetailsData(selectedCard);
+      }, 10000);
     };
 
     const renderDetails = (card) => {
@@ -1588,6 +1846,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const tagsHtml = renderTags(card.tags || []);
       const propertiesHtml = renderProperties(card.properties || []);
       const gitStatusHtml = renderGitStatus(card);
+      const codexOutputHtml = renderCodexOutput(card);
       const metaLine = "Created: " + createdLabel + " · " + createdRelative;
       detailsEl.innerHTML = \`
         <h1>\${escapeHtml(card.title)}</h1>
@@ -1598,8 +1857,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <hr />
           <div>\${bodyHtml || '<div class="empty">No description.</div>'}</div>
           \${gitStatusHtml}
+          \${codexOutputHtml}
         </div>
       \`;
+      refreshDetailsData(card);
+      startDetailsRefresh();
     };
 
     const normalizeSearchQuery = (value) => {
@@ -2072,8 +2334,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         const repoPath = String(message?.path || "").trim();
         if (repoPath) {
           gitStatusCache.set(repoPath, message?.status
-            ? { state: "ready", text: String(message.status) }
-            : { state: "missing" });
+            ? { state: "ready", text: String(message.status), refreshedAt: Date.now() }
+            : { state: "missing", text: "", refreshedAt: Date.now() });
+        }
+        if (selectedCard && message?.cardUri === selectedCard.uri) {
+          renderDetails(selectedCard);
+        }
+      }
+      if (message?.type === "codexOutput") {
+        const agentId = String(message?.agentId || "").trim();
+        if (agentId) {
+          codexOutputCache.set(agentId, message?.output
+            ? { state: "ready", text: String(message.output), refreshedAt: Date.now() }
+            : { state: "missing", text: "", refreshedAt: Date.now() });
         }
         if (selectedCard && message?.cardUri === selectedCard.uri) {
           renderDetails(selectedCard);
@@ -2211,6 +2484,10 @@ function normalizeContentForEol(
 ): string {
   const newLine = eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
   return content.replace(/\r?\n/g, newLine);
+}
+
+function escapePowerShellSingleQuotedString(value: string): string {
+  return value.replace(/'/g, "''");
 }
 
 function getNonce(): string {
