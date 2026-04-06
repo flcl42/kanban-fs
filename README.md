@@ -24,7 +24,7 @@ Legacy `folder.md` files are still read as a fallback, but new boards should kee
 1. Install deps: `npm install`
 2. Build: `npm run compile`
 3. Debug: run the launch config `Run Extension (Example)` in `.vscode/launch.json`
-4. In the Extension Development Host, open a folder containing a `.kanban` file (see `example/`).
+4. In the Extension Development Host, open a folder containing a `.kanban` file.
 
 ## Build a VSIX
 
