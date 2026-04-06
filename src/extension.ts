@@ -4,6 +4,7 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import MarkdownIt from "markdown-it";
 import {
+  buildFolderCardPriorityOverrides,
   buildFolderConfigMap,
   createEmptyBoardConfig,
   normalizeLineEndings,
@@ -440,15 +441,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   private async syncBoardConfig(
     kanbanUri: vscode.Uri,
-    columns: { id: string; name: string }[],
+    columns: { id: string; name: string; cards: { fileName: string }[] }[],
     boardConfig: BoardConfig
   ): Promise<void> {
     const nextData = { ...boardConfig.data };
+    const priorityOverrides = buildFolderCardPriorityOverrides(columns, boardConfig);
 
     if (columns.length === 0) {
       delete nextData.folders;
     } else {
-      nextData.folders = buildFolderConfigMap(columns, boardConfig);
+      nextData.folders = buildFolderConfigMap(
+        columns,
+        boardConfig,
+        priorityOverrides
+      );
     }
 
     const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
@@ -566,7 +572,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const sourceColumnId = path.posix.basename(sourceColumnUri.path);
     const targetCards = await this.readCards(targetColumnUri);
     const targetOrderedUris = targetCards.map((card) => card.uri);
-    targetOrderedUris.push(newUri.toString());
+    targetOrderedUris.unshift(newUri.toString());
     const sourceCards = await this.readCards(sourceColumnUri);
     const sourceOrderedUris = sourceCards
       .filter((card) => card.uri !== cardUriString)
@@ -1937,7 +1943,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const buildOrderedUris = (cards, cardUri, targetUri, position) => {
       const list = (cards || []).map((card) => card.uri).filter((uri) => uri !== cardUri);
       if (!targetUri) {
-        list.push(cardUri);
+        if (position === "start") {
+          list.unshift(cardUri);
+        } else {
+          list.push(cardUri);
+        }
         return list;
       }
       const targetIndex = list.indexOf(targetUri);
@@ -2137,7 +2147,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
                   sourceColumnId = payload.columnId;
                 } catch {}
               }
-              const orderedUris = buildOrderedUris(allCards, cardUri, null, "after");
+              const movePosition = sourceColumnId && sourceColumnId !== columnId ? "start" : "after";
+              const orderedUris = buildOrderedUris(allCards, cardUri, null, movePosition);
               vscode.postMessage({
                 type: "reorderCards",
                 cardUri,

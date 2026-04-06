@@ -1,6 +1,7 @@
 const assert = require("assert/strict");
 
 const {
+  buildFolderCardPriorityOverrides,
   buildFolderConfigMap,
   orderColumnsByConfig,
   parseBoardConfig,
@@ -50,4 +51,43 @@ assert.deepEqual(
   Array.from(nextConfig.folderMap.get("Doing")?.cardPriorities.keys() ?? []),
   ["ship-it.md"],
   "priority overrides should still be applied to the updated folder config"
+);
+
+const moveSourceText = `folders:
+  Doing:
+    priorities:
+      - moved-task.md
+      - existing-doing.md
+  Done:
+    priorities:
+      - done-task.md
+`;
+
+const moveBoardConfig = parseBoardConfig(moveSourceText);
+const movePriorityOverrides = buildFolderCardPriorityOverrides(
+  [
+    {
+      id: "Doing",
+      cards: [{ fileName: "existing-doing.md" }],
+    },
+    {
+      id: "Done",
+      cards: [
+        { fileName: "done-task.md" },
+        { fileName: "moved-task.md" },
+      ],
+    },
+  ],
+  moveBoardConfig
+);
+
+assert.deepEqual(
+  movePriorityOverrides.get("Doing"),
+  ["existing-doing.md"],
+  "priority overrides should remove files that physically left a column"
+);
+assert.deepEqual(
+  movePriorityOverrides.get("Done"),
+  ["moved-task.md", "done-task.md"],
+  "files moved into another column should be prepended ahead of the destination column's existing order"
 );

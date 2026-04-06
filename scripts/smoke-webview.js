@@ -144,6 +144,23 @@ const windowListeners = {};
 const messages = [];
 let activeElement = null;
 
+function createDataTransfer() {
+  const values = new Map();
+  return {
+    types: [],
+    effectAllowed: "move",
+    setData(type, value) {
+      if (!this.types.includes(type)) {
+        this.types.push(type);
+      }
+      values.set(type, String(value));
+    },
+    getData(type) {
+      return values.get(type) ?? "";
+    },
+  };
+}
+
 const context = {
   console,
   navigator: { platform: "Win32" },
@@ -251,15 +268,35 @@ windowListeners.message({
             },
           ],
         },
+        {
+          id: "Backlog",
+          name: "Backlog",
+          order: 2,
+          cards: [
+            {
+              uri: "file:///existing.md",
+              fileName: "existing.md",
+              title: "Existing card",
+              body: "",
+              bodyHtml: "",
+              properties: [],
+              tags: [],
+              priority: 1,
+              createdAt: Date.now(),
+            },
+          ],
+        },
       ],
     },
   },
 });
 
-assert.equal(boardEl.children.length, 1, "expected one rendered column");
+assert.equal(boardEl.children.length, 2, "expected two rendered columns");
 assert.equal(boardEl.children[0].dataset.column, "Doing", "column id should be rendered");
+assert.equal(boardEl.children[1].dataset.column, "Backlog", "second column id should be rendered");
 assert.equal(boardEl.children[0].children.length, 2, "expected header and one card");
-assert.match(searchMetaEl.textContent, /1 card/, "search summary should show card count");
+assert.equal(boardEl.children[1].children.length, 2, "expected second column header and one card");
+assert.match(searchMetaEl.textContent, /2 cards/, "search summary should show card count");
 assert.equal(searchClearEl.hidden, true, "clear button should stay hidden with no filter");
 assert.match(
   boardEl.children[0].children[1].innerHTML,
@@ -275,6 +312,22 @@ assert.ok(
   boardEl.children[0].children[1].innerHTML.indexOf("Owner") <
     boardEl.children[0].children[1].innerHTML.indexOf("Path"),
   "card property badges should be sorted by name"
+);
+
+const crossColumnTransfer = createDataTransfer();
+boardEl.children[0].children[1].listeners.dragstart({ dataTransfer: crossColumnTransfer });
+boardEl.children[1].listeners.drop({
+  dataTransfer: crossColumnTransfer,
+  preventDefault() {},
+});
+
+assert.equal(messages.at(-1)?.type, "reorderCards", "cross-column drops should reorder cards");
+assert.equal(messages.at(-1)?.sourceColumnId, "Doing");
+assert.equal(messages.at(-1)?.targetColumnId, "Backlog");
+assert.deepEqual(
+  messages.at(-1)?.orderedUris,
+  ["file:///task.md", "file:///existing.md"],
+  "cross-column drops should place the moved card at the top of the destination column"
 );
 
 boardEl.children[0].children[1].listeners.click();
@@ -365,13 +418,13 @@ assert.equal(searchInputEl.selected, true, "Ctrl+F should select search text");
 searchInputEl.value = "jane";
 searchInputEl.listeners.input();
 
-assert.equal(boardEl.children.length, 1, "filtering should keep the column visible");
+assert.equal(boardEl.children.length, 2, "filtering should keep columns visible");
 assert.equal(boardEl.children[0].children.length, 2, "matching filter should still render header and card");
 assert.equal(boardEl.children[0].children[0].draggable, false, "column drag should be disabled while filtering");
 assert.equal(boardEl.children[0].children[1].draggable, false, "card drag should be disabled while filtering");
 assert.match(
   searchMetaEl.textContent,
-  /1 of 1 cards shown.*Dragging is disabled while filtering\./,
+  /1 of 2 cards shown.*Dragging is disabled while filtering\./,
   "search summary should explain filtered state"
 );
 assert.equal(searchClearEl.hidden, false, "clear button should appear with an active filter");

@@ -130,6 +130,59 @@ export function buildFolderConfigMap(
   return folders;
 }
 
+export function buildFolderCardPriorityOverrides(
+  columns: { id: string; cards: { fileName: string }[] }[],
+  boardConfig: BoardConfig
+): Map<string, string[]> {
+  const previousColumnsByFileName = new Map<string, Set<string>>();
+
+  for (const folder of boardConfig.folders) {
+    for (const fileName of toPriorityList(folder.cardPriorities) ?? []) {
+      const ids = previousColumnsByFileName.get(fileName) ?? new Set<string>();
+      ids.add(folder.id);
+      previousColumnsByFileName.set(fileName, ids);
+    }
+  }
+
+  const overrides = new Map<string, string[]>();
+
+  for (const column of columns) {
+    const currentFileNames = column.cards.map((card) => card.fileName);
+    const currentFileNameSet = new Set(currentFileNames);
+    const existingPriorityFileNames =
+      toPriorityList(boardConfig.folderMap.get(column.id)?.cardPriorities) ?? [];
+    const keptFileNames = existingPriorityFileNames.filter((fileName) =>
+      currentFileNameSet.has(fileName)
+    );
+    const keptFileNameSet = new Set(keptFileNames);
+    const movedInFileNames: string[] = [];
+    const newFileNames: string[] = [];
+
+    for (const fileName of currentFileNames) {
+      if (keptFileNameSet.has(fileName)) {
+        continue;
+      }
+      const previousColumns = previousColumnsByFileName.get(fileName);
+      const movedFromAnotherColumn =
+        !!previousColumns &&
+        Array.from(previousColumns).some((columnId) => columnId !== column.id);
+      if (movedFromAnotherColumn) {
+        movedInFileNames.push(fileName);
+      } else {
+        newFileNames.push(fileName);
+      }
+    }
+
+    overrides.set(column.id, [
+      ...movedInFileNames,
+      ...keptFileNames,
+      ...newFileNames,
+    ]);
+  }
+
+  return overrides;
+}
+
 export function orderColumnsByConfig<
   T extends { id: string; name: string; order: number | null }
 >(columns: T[], boardConfig: BoardConfig): T[] {
