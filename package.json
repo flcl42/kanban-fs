@@ -2,11 +2,12 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
   "activationEvents": [
+    "onStartupFinished",
     "onLanguage:markdown",
     "onLanguage:kanban"
   ],

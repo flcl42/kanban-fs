@@ -1,6 +1,8 @@
 import * as path from "path";
+import * as net from "net";
 import * as vscode from "vscode";
 import { execFile } from "child_process";
+import { createHash } from "crypto";
 import { promisify } from "util";
 import MarkdownIt from "markdown-it";
 import {
@@ -69,6 +71,19 @@ type CodexSessionFile = {
   lastCheckedAt: number;
 };
 
+type WorkspaceMoveRequest = {
+  version: number;
+  command: "move";
+  boardRoot: string;
+  sourcePath: string;
+  destinationPath: string;
+  entryType: "file" | "directory";
+};
+
+type WorkspaceMoveResponse =
+  | { ok: true }
+  | { ok: false; error: string };
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
@@ -83,7 +98,9 @@ const OPEN_CODE_COMMAND = "kanban.openCode";
 export function activate(context: vscode.ExtensionContext) {
   const provider = new KanbanEditorProvider(context);
   const taskActionProvider = new TaskActionEditorProvider(context);
+  const workspaceMoveServer = new WorkspaceMoveServer();
   context.subscriptions.push(
+    workspaceMoveServer,
     vscode.commands.registerCommand(RESUME_AGENT_COMMAND, async (agentId: string) =>
       provider.resumeAgent(String(agentId))
     ),
@@ -102,6 +119,228 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
+
+class WorkspaceMoveServer implements vscode.Disposable {
+  private readonly servers = new Map<string, net.Server>();
+  private readonly disposables: vscode.Disposable[] = [];
+
+  constructor() {
+    this.disposables.push(
+      vscode.workspace.onDidChangeWorkspaceFolders(() => {
+        void this.syncServers();
+      })
+    );
+    void this.syncServers();
+  }
+
+  dispose(): void {
+    for (const disposable of this.disposables) {
+      disposable.dispose();
+    }
+
+    for (const server of this.servers.values()) {
+      server.close();
+    }
+    this.servers.clear();
+  }
+
+  private async syncServers(): Promise<void> {
+    if (process.platform !== "win32") {
+      return;
+    }
+
+    const roots = new Set<string>(
+      (vscode.workspace.workspaceFolders ?? [])
+        .filter((folder) => folder.uri.scheme === "file")
+        .map((folder) => normalizeMovePath(folder.uri.fsPath))
+    );
+    const boardMarkers = await vscode.workspace.findFiles("**/.kanban");
+    for (const marker of boardMarkers) {
+      if (marker.scheme !== "file") {
+        continue;
+      }
+
+      roots.add(normalizeMovePath(path.resolve(marker.fsPath, "..", "..")));
+    }
+
+    for (const [root, server] of [...this.servers.entries()]) {
+      if (roots.has(root)) {
+        continue;
+      }
+
+      this.servers.delete(root);
+      await closeServer(server);
+    }
+
+    for (const root of roots) {
+      if (this.servers.has(root)) {
+        continue;
+      }
+
+      const server = net.createServer((socket) => {
+        void this.handleConnection(root, socket);
+      });
+
+      try {
+        await listenServer(server, getWorkspaceMovePipePath(root));
+        this.servers.set(root, server);
+      } catch (error) {
+        await closeServer(server);
+        console.error("Failed to start Kanban workspace move server", {
+          root,
+          error,
+        });
+      }
+    }
+  }
+
+  private async handleConnection(root: string, socket: net.Socket): Promise<void> {
+    socket.setEncoding("utf8");
+    let buffer = "";
+    let handled = false;
+
+    socket.on("data", (chunk: string) => {
+      if (handled) {
+        return;
+      }
+
+      buffer += chunk;
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex < 0) {
+        return;
+      }
+
+      handled = true;
+      const requestLine = buffer.slice(0, newlineIndex).trim();
+      void this.respond(socket, this.processRequest(root, requestLine));
+    });
+
+    socket.on("error", () => {
+      socket.destroy();
+    });
+  }
+
+  private async respond(
+    socket: net.Socket,
+    responsePromise: Promise<WorkspaceMoveResponse>
+  ): Promise<void> {
+    try {
+      const response = await responsePromise;
+      socket.write(`${JSON.stringify(response)}\n`);
+    } catch (error) {
+      socket.write(
+        `${JSON.stringify({
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        } satisfies WorkspaceMoveResponse)}\n`
+      );
+    } finally {
+      socket.end();
+    }
+  }
+
+  private async processRequest(
+    root: string,
+    requestLine: string
+  ): Promise<WorkspaceMoveResponse> {
+    if (!requestLine) {
+      return { ok: false, error: "Empty request." };
+    }
+
+    let request: Partial<WorkspaceMoveRequest>;
+    try {
+      request = JSON.parse(requestLine) as Partial<WorkspaceMoveRequest>;
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "Invalid JSON.",
+      };
+    }
+
+    if (request.command !== "move") {
+      return { ok: false, error: "Unsupported command." };
+    }
+
+    const boardRoot = normalizeMovePath(String(request.boardRoot ?? ""));
+    if (boardRoot !== root) {
+      return { ok: false, error: "Workspace root mismatch." };
+    }
+
+    const sourcePath = path.resolve(String(request.sourcePath ?? ""));
+    const destinationPath = path.resolve(String(request.destinationPath ?? ""));
+    if (!isPathInsideRoot(sourcePath, root) || !isPathInsideRoot(destinationPath, root)) {
+      return {
+        ok: false,
+        error: "Move paths must stay inside the workspace root.",
+      };
+    }
+
+    await vscode.workspace.fs.createDirectory(
+      vscode.Uri.file(path.dirname(destinationPath))
+    );
+
+    const edit = new vscode.WorkspaceEdit();
+    edit.renameFile(vscode.Uri.file(sourcePath), vscode.Uri.file(destinationPath), {
+      overwrite: false,
+    });
+
+    const applied = await vscode.workspace.applyEdit(edit);
+    if (!applied) {
+      return { ok: false, error: "VS Code rejected the move edit." };
+    }
+
+    return { ok: true };
+  }
+}
+
+function listenServer(server: net.Server, pipePath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const handleError = (error: Error) => {
+      server.off("listening", handleListening);
+      reject(error);
+    };
+    const handleListening = () => {
+      server.off("error", handleError);
+      resolve();
+    };
+
+    server.once("error", handleError);
+    server.once("listening", handleListening);
+    server.listen(pipePath);
+  });
+}
+
+function closeServer(server: net.Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+  });
+}
+
+function getWorkspaceMovePipePath(root: string): string {
+  return `\\\\.\\pipe\\kanban-fs-mover-${hashWorkspaceMoveRoot(root)}`;
+}
+
+function hashWorkspaceMoveRoot(root: string): string {
+  return createHash("sha256")
+    .update(normalizeMovePath(root), "utf8")
+    .digest("hex")
+    .slice(0, 16);
+}
+
+function normalizeMovePath(inputPath: string): string {
+  const resolved = path.resolve(inputPath).replace(/\\/g, "/");
+  const trimmed = resolved.length > 3 ? resolved.replace(/\/+$/, "") : resolved;
+  return trimmed.toLowerCase();
+}
+
+function isPathInsideRoot(candidatePath: string, root: string): boolean {
+  const normalizedCandidate = normalizeMovePath(candidatePath);
+  const normalizedRoot = normalizeMovePath(root);
+  return (
+    normalizedCandidate === normalizedRoot ||
+    normalizedCandidate.startsWith(`${normalizedRoot}/`)
+  );
+}
 
 class TaskActionEditorProvider implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly onDidChangeCodeLensesEmitter = new vscode.EventEmitter<void>();
