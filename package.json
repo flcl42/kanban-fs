@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -76,7 +76,20 @@
         ],
         "priority": "default"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Kanban",
+      "properties": {
+        "kanban.detailsPaneWidth": {
+          "type": "number",
+          "default": 360,
+          "minimum": 280,
+          "maximum": 720,
+          "scope": "application",
+          "description": "Width in pixels of the Kanban details pane."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run build:release",

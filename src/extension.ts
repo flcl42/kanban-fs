@@ -94,6 +94,11 @@ const DETAILS_REFRESH_INTERVAL_MS = 10000;
 const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
 const OPEN_CODE_COMMAND = "kanban.openCode";
+const KANBAN_CONFIGURATION_SECTION = "kanban";
+const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
+const DEFAULT_DETAILS_PANE_WIDTH = 360;
+const MIN_DETAILS_PANE_WIDTH = 280;
+const MAX_DETAILS_PANE_WIDTH = 720;
 
 export function activate(context: vscode.ExtensionContext) {
   const provider = new KanbanEditorProvider(context);
@@ -473,7 +478,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       localResourceRoots: [this.context.extensionUri],
     };
 
-    webviewPanel.webview.html = this.getHtml(webviewPanel.webview);
+    webviewPanel.webview.html = this.getHtml(
+      webviewPanel.webview,
+      this.getDetailsPaneWidthSetting()
+    );
 
     const sendBoard = async () => {
       try {
@@ -486,6 +494,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         webviewPanel.webview.postMessage({ type: "boardError", message });
       }
     };
+    const sendDetailsPaneWidth = () => {
+      webviewPanel.webview.postMessage({
+        type: "detailsPaneWidth",
+        width: this.getDetailsPaneWidthSetting(),
+      });
+    };
+    const detailsPaneWidthListener = vscode.workspace.onDidChangeConfiguration(
+      (event) => {
+        if (
+          event.affectsConfiguration(
+            `${KANBAN_CONFIGURATION_SECTION}.${DETAILS_PANE_WIDTH_SETTING}`
+          )
+        ) {
+          sendDetailsPaneWidth();
+        }
+      }
+    );
+    webviewPanel.onDidDispose(() => {
+      detailsPaneWidthListener.dispose();
+    });
 
     const key = document.uri.toString();
     const parentFolder = vscode.Uri.joinPath(document.uri, "..");
@@ -499,6 +527,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
       if (message?.type === "ready") {
         await sendBoard();
+        sendDetailsPaneWidth();
         return;
       }
       if (message?.type === "requestNewCard") {
@@ -588,6 +617,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           agentId: String(message.agentId),
           output,
         });
+        return;
+      }
+      if (message?.type === "saveDetailsPaneWidth") {
+        await this.updateDetailsPaneWidthSetting(message?.width);
         return;
       }
       if (message?.type === "openPath" && message?.path) {
@@ -1093,6 +1126,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
   }
 
+  private getDetailsPaneWidthSetting(): number {
+    const configuration = vscode.workspace.getConfiguration(
+      KANBAN_CONFIGURATION_SECTION
+    );
+    const inspected = configuration.inspect<number>(DETAILS_PANE_WIDTH_SETTING);
+    return normalizeDetailsPaneWidth(
+      inspected?.globalValue ?? inspected?.defaultValue
+    );
+  }
+
+  private async updateDetailsPaneWidthSetting(rawWidth: unknown): Promise<void> {
+    const width = normalizeDetailsPaneWidth(rawWidth);
+    await vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .update(
+        DETAILS_PANE_WIDTH_SETTING,
+        width,
+        vscode.ConfigurationTarget.Global
+      );
+  }
+
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
     const targetPath = normalizeTaskPropertyValue(rawPath);
     if (!isTaskAbsoluteLocalPath(targetPath)) {
@@ -1409,7 +1463,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     context.docs.set(fileUri.toString(), document);
   }
 
-  private getHtml(webview: vscode.Webview): string {
+  private getHtml(
+    webview: vscode.Webview,
+    detailsPaneWidth: number
+  ): string {
     const nonce = getNonce();
     const csp = [
       "default-src 'none'",
@@ -1439,6 +1496,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       --shadow: rgba(0, 0, 0, 0.18);
       --mono: var(--vscode-editor-font-family, ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace);
       --display: var(--vscode-font-family, "Segoe UI", system-ui, sans-serif);
+      --details-pane-width: ${detailsPaneWidth}px;
+      --details-pane-min-width: ${MIN_DETAILS_PANE_WIDTH}px;
+      --details-pane-max-width: ${MAX_DETAILS_PANE_WIDTH}px;
+      --details-resizer-width: 10px;
     }
     * { box-sizing: border-box; }
     body {
@@ -1522,10 +1583,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .layout {
       display: grid;
-      grid-template-columns: 2.2fr 1fr;
+      grid-template-columns:
+        minmax(0, 1fr)
+        var(--details-resizer-width)
+        minmax(var(--details-pane-min-width), var(--details-pane-width));
       gap: 16px;
       padding: 16px;
       min-height: 100vh;
+    }
+    .layout.resizing {
+      user-select: none;
     }
     .board-scroll {
       flex: 1;
@@ -1687,6 +1754,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       height: calc(100vh - 32px);
       overflow: auto;
     }
+    .details-resizer {
+      position: relative;
+      cursor: col-resize;
+      user-select: none;
+      touch-action: none;
+    }
+    .details-resizer::before {
+      content: "";
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: calc(50% - 1px);
+      width: 2px;
+      border-radius: 999px;
+      background: var(--line);
+      transition: background 0.12s ease;
+    }
+    .details-resizer:hover::before,
+    .details-resizer.active::before {
+      background: var(--accent);
+    }
     .details h1 {
       margin-top: 0;
       font-size: 22px;
@@ -1821,6 +1909,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         grid-template-columns: 1fr;
         height: auto;
       }
+      .details-resizer {
+        display: none;
+      }
       .board-pane {
         height: auto;
       }
@@ -1837,7 +1928,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   </style>
 </head>
 <body>
-  <div class="layout">
+  <div class="layout" id="layout">
     <section class="board-pane">
       <div class="board-toolbar">
         <label class="board-search" for="board-search-input">
@@ -1857,6 +1948,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <section class="board" id="board"></section>
       </div>
     </section>
+    <div class="details-resizer" id="details-resizer" aria-hidden="true"></div>
     <aside class="details" id="details">
       <div class="empty">Select a card to view details.</div>
     </aside>
@@ -1864,10 +1956,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const boardEl = document.getElementById("board");
+    const layoutEl = document.getElementById("layout");
     const detailsEl = document.getElementById("details");
+    const detailsResizerEl = document.getElementById("details-resizer");
     const searchInputEl = document.getElementById("board-search-input");
     const searchMetaEl = document.getElementById("search-meta");
     const searchClearEl = document.getElementById("search-clear");
+    const rootStyle = document.documentElement?.style || null;
     let selectedCard = null;
     let lastBoard = null;
     let searchQuery = "";
@@ -1879,8 +1974,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const columnDragType = "application/x-kanban-column";
     const isMac = navigator.platform.toLowerCase().includes("mac");
     const searchShortcutLabel = isMac ? "Cmd+F" : "Ctrl+F";
+    const detailsPaneMinWidth = ${MIN_DETAILS_PANE_WIDTH};
+    const detailsPaneMaxWidth = ${MAX_DETAILS_PANE_WIDTH};
     let draggingCard = null;
     let draggingColumn = null;
+    let detailsPaneWidth = ${detailsPaneWidth};
+    let activeDetailsResize = null;
 
     const escapeHtml = (value) => {
       return String(value ?? "")
@@ -1889,6 +1988,73 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+    };
+
+    const clampDetailsPaneWidth = (value) => {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric)) {
+        return detailsPaneWidth;
+      }
+      return Math.max(
+        detailsPaneMinWidth,
+        Math.min(detailsPaneMaxWidth, Math.round(numeric))
+      );
+    };
+
+    const applyDetailsPaneWidth = (value) => {
+      detailsPaneWidth = clampDetailsPaneWidth(value);
+      if (rootStyle && typeof rootStyle.setProperty === "function") {
+        rootStyle.setProperty("--details-pane-width", detailsPaneWidth + "px");
+      } else if (rootStyle) {
+        rootStyle["--details-pane-width"] = detailsPaneWidth + "px";
+      }
+      return detailsPaneWidth;
+    };
+
+    const canResizeDetailsPane = () => {
+      return typeof window.innerWidth !== "number" || window.innerWidth > 900;
+    };
+
+    const beginDetailsResize = (event) => {
+      if (!detailsResizerEl || !canResizeDetailsPane()) {
+        return;
+      }
+      if (event.button !== undefined && event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      const rect = typeof detailsEl.getBoundingClientRect === "function"
+        ? detailsEl.getBoundingClientRect()
+        : null;
+      activeDetailsResize = {
+        startX: Number(event.clientX || 0),
+        startWidth: Number(rect?.width || detailsPaneWidth),
+      };
+      layoutEl?.classList?.add("resizing");
+      detailsResizerEl.classList.add("active");
+    };
+
+    const updateDetailsResize = (event) => {
+      if (!activeDetailsResize) {
+        return;
+      }
+      const nextWidth =
+        activeDetailsResize.startWidth
+        + (activeDetailsResize.startX - Number(event.clientX || 0));
+      applyDetailsPaneWidth(nextWidth);
+    };
+
+    const finishDetailsResize = () => {
+      if (!activeDetailsResize) {
+        return;
+      }
+      activeDetailsResize = null;
+      layoutEl?.classList?.remove("resizing");
+      detailsResizerEl?.classList?.remove("active");
+      vscode.postMessage({
+        type: "saveDetailsPaneWidth",
+        width: detailsPaneWidth,
+      });
     };
 
     const getPropertyAction = (property) => {
@@ -2541,6 +2707,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     }
 
+    applyDetailsPaneWidth(detailsPaneWidth);
+
+    if (detailsResizerEl) {
+      detailsResizerEl.addEventListener("mousedown", beginDetailsResize);
+    }
+
+    window.addEventListener("mousemove", updateDetailsResize);
+    window.addEventListener("mouseup", finishDetailsResize);
+
     detailsEl.addEventListener("click", (event) => {
       const actionButton = event.target instanceof Element
         ? event.target.closest("[data-action-type]")
@@ -2579,6 +2754,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "boardError") {
         boardEl.innerHTML = \`<div class="error">\${escapeHtml(message.message || "Failed to load board.")}</div>\`;
+      }
+      if (message?.type === "detailsPaneWidth") {
+        applyDetailsPaneWidth(message?.width);
       }
       if (message?.type === "gitStatus") {
         const repoPath = String(message?.path || "").trim();
@@ -2726,6 +2904,17 @@ function buildCardPriorityList(orderedUris: string[]): string[] {
   }
 
   return priorities;
+}
+
+function normalizeDetailsPaneWidth(value: unknown): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return DEFAULT_DETAILS_PANE_WIDTH;
+  }
+  return Math.max(
+    MIN_DETAILS_PANE_WIDTH,
+    Math.min(MAX_DETAILS_PANE_WIDTH, Math.round(numeric))
+  );
 }
 
 function normalizeContentForEol(

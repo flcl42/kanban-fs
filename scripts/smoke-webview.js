@@ -20,7 +20,14 @@ const templateLiteral = source.slice(
   end + "</html>`".length
 );
 const html = vm.runInNewContext(
-  `(() => { const csp = "csp"; const nonce = "nonce"; return ${templateLiteral}; })()`,
+  `(() => {
+    const csp = "csp";
+    const nonce = "nonce";
+    const detailsPaneWidth = 360;
+    const MIN_DETAILS_PANE_WIDTH = 280;
+    const MAX_DETAILS_PANE_WIDTH = 720;
+    return ${templateLiteral};
+  })()`,
   {}
 );
 const scriptMatch = html.match(/<script nonce="[^"]*">([\s\S]*)<\/script>/);
@@ -47,8 +54,13 @@ assert.match(
 );
 assert.match(
   html,
-  /\.layout\s*\{[^}]*min-height:\s*100vh;/,
-  "layout should be able to grow beyond the viewport for tall columns"
+  /\.layout\s*\{[^}]*grid-template-columns:[^}]*var\(--details-resizer-width\)[^}]*var\(--details-pane-width\)[^}]*min-height:\s*100vh;/,
+  "layout should reserve a draggable separator and a configurable details pane width"
+);
+assert.match(
+  html,
+  /\.details-resizer\s*\{[^}]*cursor:\s*col-resize;/,
+  "details pane should expose a resize handle"
 );
 assert.match(
   html,
@@ -62,9 +74,27 @@ assert.match(
 );
 assert.match(
   html,
-  /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.board-pane\s*\{[^}]*height:\s*auto;[\s\S]*?\.details\s*\{[^}]*position:\s*static;[^}]*top:\s*auto;[^}]*height:\s*auto;/,
-  "mobile layout should reset the fixed-height board pane and sticky details pane"
+  /@media\s*\(max-width:\s*900px\)\s*\{[\s\S]*?\.details-resizer\s*\{[^}]*display:\s*none;[\s\S]*?\.board-pane\s*\{[^}]*height:\s*auto;[\s\S]*?\.details\s*\{[^}]*position:\s*static;[^}]*top:\s*auto;[^}]*height:\s*auto;/,
+  "mobile layout should hide the resize handle and reset the fixed-height board pane and sticky details pane"
 );
+
+function createStyleDeclaration() {
+  const values = new Map();
+  return {
+    setProperty(name, value) {
+      const stringValue = String(value);
+      values.set(name, stringValue);
+      this[name] = stringValue;
+    },
+    getPropertyValue(name) {
+      if (values.has(name)) {
+        return values.get(name);
+      }
+      const direct = this[name];
+      return typeof direct === "string" ? direct : "";
+    },
+  };
+}
 
 class FakeElement {
   constructor(tagName = "div") {
@@ -72,7 +102,7 @@ class FakeElement {
     this.dataset = {};
     this.className = "";
     this.classList = { add() {}, remove() {} };
-    this.style = {};
+    this.style = createStyleDeclaration();
     this.draggable = false;
     this.textContent = "";
     this.value = "";
@@ -136,13 +166,17 @@ class FakeElement {
 }
 
 const boardEl = new FakeElement("section");
+const layoutEl = new FakeElement("div");
 const detailsEl = new FakeElement("aside");
+const detailsResizerEl = new FakeElement("div");
 const searchInputEl = new FakeElement("input");
 const searchMetaEl = new FakeElement("div");
 const searchClearEl = new FakeElement("button");
 const windowListeners = {};
 const messages = [];
 let activeElement = null;
+
+detailsEl.getBoundingClientRect = () => ({ left: 0, top: 0, width: 360, height: 100 });
 
 function createDataTransfer() {
   const values = new Map();
@@ -180,12 +214,21 @@ const context = {
     },
   }),
   document: {
+    documentElement: {
+      style: createStyleDeclaration(),
+    },
     getElementById(id) {
       if (id === "board") {
         return boardEl;
       }
+      if (id === "layout") {
+        return layoutEl;
+      }
       if (id === "details") {
         return detailsEl;
+      }
+      if (id === "details-resizer") {
+        return detailsResizerEl;
       }
       if (id === "board-search-input") {
         return searchInputEl;
@@ -206,6 +249,7 @@ const context = {
     },
   },
   window: {
+    innerWidth: 1440,
     addEventListener(type, handler) {
       windowListeners[type] = handler;
     },
@@ -218,7 +262,45 @@ vm.runInNewContext(scriptMatch[1], context);
 assert.equal(messages[0]?.type, "ready", "webview should request board data");
 assert.equal(typeof windowListeners.message, "function", "message listener missing");
 assert.equal(typeof windowListeners.keydown, "function", "keydown listener missing");
+assert.equal(typeof windowListeners.mousemove, "function", "mousemove listener missing");
+assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
+assert.equal(
+  context.document.documentElement.style.getPropertyValue("--details-pane-width"),
+  "360px",
+  "details pane should initialize from the configured width"
+);
+
+detailsResizerEl.listeners.mousedown({
+  button: 0,
+  clientX: 800,
+  preventDefault() {},
+});
+windowListeners.mousemove({ clientX: 740 });
+
+assert.equal(
+  context.document.documentElement.style.getPropertyValue("--details-pane-width"),
+  "420px",
+  "dragging the details separator should resize the details pane"
+);
+
+windowListeners.mouseup({});
+
+assert.equal(messages.at(-1)?.type, "saveDetailsPaneWidth", "releasing the separator should persist the width");
+assert.equal(messages.at(-1)?.width, 420);
+
+windowListeners.message({
+  data: {
+    type: "detailsPaneWidth",
+    width: 500,
+  },
+});
+
+assert.equal(
+  context.document.documentElement.style.getPropertyValue("--details-pane-width"),
+  "500px",
+  "details width updates from the extension host should be applied immediately"
+);
 
 windowListeners.message({
   data: {
