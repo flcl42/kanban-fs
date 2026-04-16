@@ -163,6 +163,14 @@ class FakeElement {
   closest() {
     return null;
   }
+
+  querySelector() {
+    return null;
+  }
+
+  remove() {
+    this.removed = true;
+  }
 }
 
 const boardEl = new FakeElement("section");
@@ -316,8 +324,8 @@ windowListeners.message({
               uri: "file:///task.md",
               fileName: "task.md",
               title: "Ship it",
-              body: "",
-              bodyHtml: "",
+              body: Array.from({ length: 55 }, (_, index) => `Description line ${index + 1}`).join("\n"),
+              bodyHtml: Array.from({ length: 55 }, (_, index) => `<p>Description line ${index + 1}</p>`).join(""),
               properties: [
                 { key: "Tags", label: "Tags", value: "ship", action: null },
                 {
@@ -335,6 +343,10 @@ windowListeners.message({
                   label: "Repo",
                   value: "C:\\work\\demo",
                   action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                  actions: [
+                    { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                    { command: "openCode", title: "Code", value: "C:\\work\\demo" },
+                  ],
                 },
                 {
                   key: "Path",
@@ -342,10 +354,30 @@ windowListeners.message({
                   value: "C:\\work\\demo",
                   action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
                 },
+                {
+                  key: "URL",
+                  label: "URL",
+                  value: "https://example.com/task",
+                  action: { command: "openUrl", title: "Open", value: "https://example.com/task" },
+                  actions: [
+                    { command: "openUrl", title: "Open", value: "https://example.com/task" },
+                  ],
+                },
                 { key: "Owner", label: "Owner", value: "Jane", action: null },
               ],
               tags: ["ship"],
               priority: 2,
+              createdAt: Date.now(),
+            },
+            {
+              uri: "file:///second.md",
+              fileName: "second.md",
+              title: "Second card",
+              body: "",
+              bodyHtml: "",
+              properties: [],
+              tags: [],
+              priority: 3,
               createdAt: Date.now(),
             },
           ],
@@ -376,9 +408,11 @@ windowListeners.message({
 assert.equal(boardEl.children.length, 2, "expected two rendered columns");
 assert.equal(boardEl.children[0].dataset.column, "Doing", "column id should be rendered");
 assert.equal(boardEl.children[1].dataset.column, "Backlog", "second column id should be rendered");
-assert.equal(boardEl.children[0].children.length, 2, "expected header and one card");
+assert.equal(boardEl.children[0].children.length, 3, "expected header and two cards");
 assert.equal(boardEl.children[1].children.length, 2, "expected second column header and one card");
-assert.match(searchMetaEl.textContent, /2 cards/, "search summary should show card count");
+assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)");
+assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1)");
+assert.match(searchMetaEl.textContent, /3 cards/, "search summary should show card count");
 assert.equal(searchClearEl.hidden, true, "clear button should stay hidden with no filter");
 assert.match(
   boardEl.children[0].children[1].innerHTML,
@@ -394,6 +428,66 @@ assert.ok(
   boardEl.children[0].children[1].innerHTML.indexOf("Owner") <
     boardEl.children[0].children[1].innerHTML.indexOf("Path"),
   "card property badges should be sorted by name"
+);
+assert.match(
+  boardEl.children[0].children[2].innerHTML,
+  /data-card-action="bump"/,
+  "cards should render a bump-to-top button"
+);
+
+const bumpButton = new FakeElement("button");
+bumpButton.setAttribute("data-card-action", "bump");
+bumpButton.closest = () => bumpButton;
+
+boardEl.children[0].children[2].listeners.click({
+  target: bumpButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "reorderCards", "bump button should reorder cards");
+assert.equal(messages.at(-1)?.sourceColumnId, "Doing");
+assert.equal(messages.at(-1)?.targetColumnId, "Doing");
+assert.deepEqual(
+  messages.at(-1)?.orderedUris,
+  ["file:///second.md", "file:///task.md"],
+  "bump button should move the card to the top of its column"
+);
+
+const sameColumnTransfer = createDataTransfer();
+boardEl.children[0].children[2].listeners.dragstart({ dataTransfer: sameColumnTransfer });
+let sameColumnDragOverPrevented = false;
+let sameColumnDragOverStopped = false;
+boardEl.children[0].children[1].listeners.dragover({
+  dataTransfer: sameColumnTransfer,
+  preventDefault() {
+    sameColumnDragOverPrevented = true;
+  },
+  stopPropagation() {
+    sameColumnDragOverStopped = true;
+  },
+});
+
+assert.equal(sameColumnDragOverPrevented, true, "same-column card dragover should allow dropping");
+assert.equal(
+  sameColumnDragOverStopped,
+  true,
+  "same-column card dragover should not bubble to the column drop highlight"
+);
+boardEl.children[0].children[1].listeners.drop({
+  dataTransfer: sameColumnTransfer,
+  clientY: 0,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "reorderCards", "same-column drops should reorder cards");
+assert.equal(messages.at(-1)?.sourceColumnId, "Doing");
+assert.equal(messages.at(-1)?.targetColumnId, "Doing");
+assert.deepEqual(
+  messages.at(-1)?.orderedUris,
+  ["file:///second.md", "file:///task.md"],
+  "same-column drops should send the complete destination order for persistence"
 );
 
 const crossColumnTransfer = createDataTransfer();
@@ -420,6 +514,11 @@ assert.equal(messages.at(-1)?.type, "requestCodexOutput", "details should reques
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
 
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
+assert.match(
+  detailsEl.innerHTML,
+  /data-action-type="expandDescription"/,
+  "long descriptions should render an expand button"
+);
 assert.doesNotMatch(
   detailsEl.innerHTML,
   /Tags:/,
@@ -440,6 +539,31 @@ assert.match(
   /data-action-type="openPath"/,
   "details should render an open-path action for path properties"
 );
+assert.match(
+  detailsEl.innerHTML,
+  /data-action-type="openCode"/,
+  "details should render a code action when a path property exposes one"
+);
+assert.match(
+  detailsEl.innerHTML,
+  /data-action-type="openUrl"/,
+  "details should render an open-url action for URL properties"
+);
+
+const resumeButton = new FakeElement("button");
+resumeButton.setAttribute("data-action-type", "resumeAgent");
+resumeButton.setAttribute("data-action-value", "019d0095-6102-7fe2-9fc8-5db0155692e9");
+resumeButton.closest = () => resumeButton;
+
+detailsEl.listeners.click({
+  target: resumeButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "resumeAgent");
+assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
+assert.equal(messages.at(-1)?.title, "Ship it");
 
 windowListeners.message({
   data: {
@@ -459,13 +583,44 @@ windowListeners.message({
     type: "codexOutput",
     cardUri: "file:///task.md",
     agentId: "019d0095-6102-7fe2-9fc8-5db0155692e9",
-    output: "Investigating the issue.\\n\\nPatched the validator.",
+    output: "Investigating the issue.\nInvestigating the issue.\nPatched the validator.",
   },
 });
 
 assert.match(detailsEl.innerHTML, /Codex Output/, "details should render a codex output section for Agent properties");
 assert.match(detailsEl.innerHTML, /Investigating the issue\./, "codex output should be displayed in the details pane");
 assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest codex output should preserve line breaks");
+assert.equal(
+  (detailsEl.innerHTML.match(/Investigating the issue\./g) || []).length,
+  1,
+  "duplicate adjacent codex output lines should be hidden in the details pane"
+);
+
+let descriptionExpanded = false;
+const expandButton = new FakeElement("button");
+expandButton.setAttribute("data-action-type", "expandDescription");
+expandButton.closest = () => expandButton;
+detailsEl.querySelector = (selector) => {
+  assert.equal(selector, "[data-description-frame]");
+  return {
+    classList: {
+      remove(className) {
+        if (className === "collapsed") {
+          descriptionExpanded = true;
+        }
+      },
+    },
+  };
+};
+
+detailsEl.listeners.click({
+  target: expandButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(descriptionExpanded, true, "expand description should reveal the full description");
+assert.equal(expandButton.removed, true, "expand description should remove the expand button");
 
 const actionButton = new FakeElement("button");
 actionButton.setAttribute("data-action-type", "openPath");
@@ -480,6 +635,34 @@ detailsEl.listeners.click({
 
 assert.equal(messages.at(-1)?.type, "openPath");
 assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+
+const codeButton = new FakeElement("button");
+codeButton.setAttribute("data-action-type", "openCode");
+codeButton.setAttribute("data-action-value", "C:\\work\\demo");
+codeButton.closest = () => codeButton;
+
+detailsEl.listeners.click({
+  target: codeButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "openCode");
+assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+
+const urlButton = new FakeElement("button");
+urlButton.setAttribute("data-action-type", "openUrl");
+urlButton.setAttribute("data-action-value", "https://example.com/task");
+urlButton.closest = () => urlButton;
+
+detailsEl.listeners.click({
+  target: urlButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "openUrl");
+assert.equal(messages.at(-1)?.url, "https://example.com/task");
 
 let prevented = false;
 windowListeners.keydown({
@@ -502,14 +685,32 @@ searchInputEl.listeners.input();
 
 assert.equal(boardEl.children.length, 2, "filtering should keep columns visible");
 assert.equal(boardEl.children[0].children.length, 2, "matching filter should still render header and card");
+assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (1/2)");
+assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (0/1)");
 assert.equal(boardEl.children[0].children[0].draggable, false, "column drag should be disabled while filtering");
-assert.equal(boardEl.children[0].children[1].draggable, false, "card drag should be disabled while filtering");
+assert.equal(boardEl.children[0].children[1].draggable, true, "matching cards should remain draggable while filtering");
 assert.match(
   searchMetaEl.textContent,
-  /1 of 2 cards shown.*Dragging is disabled while filtering\./,
+  /1 of 3 cards shown.*Cards can be moved to other columns while filtering\./,
   "search summary should explain filtered state"
 );
 assert.equal(searchClearEl.hidden, false, "clear button should appear with an active filter");
+
+const filteredColumnTransfer = createDataTransfer();
+boardEl.children[0].children[1].listeners.dragstart({ dataTransfer: filteredColumnTransfer });
+boardEl.children[1].listeners.drop({
+  dataTransfer: filteredColumnTransfer,
+  preventDefault() {},
+});
+
+assert.equal(messages.at(-1)?.type, "reorderCards", "filtered cross-column drops should move cards");
+assert.equal(messages.at(-1)?.sourceColumnId, "Doing");
+assert.equal(messages.at(-1)?.targetColumnId, "Backlog");
+assert.deepEqual(
+  messages.at(-1)?.orderedUris,
+  ["file:///task.md", "file:///existing.md"],
+  "filtered cross-column drops should place the moved card at the top of the destination column"
+);
 
 searchInputEl.value = "missing";
 searchInputEl.listeners.input();

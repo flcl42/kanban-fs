@@ -1,12 +1,17 @@
 const assert = require("assert/strict");
 const { buildFolderConfigMap, parseBoardConfig } = require("../out/board-config.js");
 const { parseTaskMarkdown } = require("../out/task-metadata.js");
-const { findTaskLinkActions, getTaskPropertyAction } = require("../out/task-links.js");
+const {
+  findTaskLinkActions,
+  getTaskPropertyAction,
+  getTaskPropertyActions,
+} = require("../out/task-links.js");
 
 const task = `# Example task
 
 Agent: 019d00bc-adea-7442-8438-25433de1aa9b
 Project: C:\\work\\demo
+URL: https://example.com/task
 Relative: docs\\readme.md
 
 Body starts here.
@@ -14,7 +19,7 @@ Body starts here.
 
 const actions = findTaskLinkActions(task);
 
-assert.equal(actions.length, 3, "expected three task link actions");
+assert.equal(actions.length, 4, "expected four task link actions");
 assert.deepEqual(
   actions.map((action) => ({
     line: action.line,
@@ -41,6 +46,12 @@ assert.deepEqual(
       command: "openCode",
       value: "C:\\work\\demo",
     },
+    {
+      line: 4,
+      title: "Open",
+      command: "openUrl",
+      value: "https://example.com/task",
+    },
   ]
 );
 
@@ -55,6 +66,23 @@ assert.deepEqual(getTaskPropertyAction("Repo", "C:\\work\\demo"), {
   command: "openPath",
   title: "Open",
   value: "C:\\work\\demo",
+});
+assert.deepEqual(getTaskPropertyActions("Repo", "C:\\work\\demo"), [
+  {
+    command: "openPath",
+    title: "Open",
+    value: "C:\\work\\demo",
+  },
+  {
+    command: "openCode",
+    title: "Code",
+    value: "C:\\work\\demo",
+  },
+]);
+assert.deepEqual(getTaskPropertyAction("Link", "https://example.com/task"), {
+  command: "openUrl",
+  title: "Open",
+  value: "https://example.com/task",
 });
 assert.deepEqual(getTaskPropertyAction("Project", "D:\\"), {
   command: "openPath",

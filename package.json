@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "1.0.11",
+  "version": "1.0.16",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -63,6 +63,10 @@
       {
         "command": "kanban.openCode",
         "title": "Kanban: Open Path in VS Code"
+      },
+      {
+        "command": "kanban.openUrl",
+        "title": "Kanban: Open URL"
       }
     ],
     "customEditors": [

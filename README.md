@@ -44,5 +44,6 @@ If you propose a feature that needs configuration, prefer putting it in the card
 
 Task properties are plain `Key: Value` lines directly under the title block. Special handling:
 
-- `Agent: <guid>` shows a `Connect` action that runs `codex resume <guid>` in a terminal.
-- Absolute local paths show an `Open` action that opens a terminal in that folder (or the file's parent folder).
+- `Agent: <guid>` shows a `Connect` action that resumes Codex in the session directory and focuses the terminal.
+- Absolute local paths show `Open` and `Code` actions in card details.
+- `http://` and `https://` property values show an `Open` action in card details.

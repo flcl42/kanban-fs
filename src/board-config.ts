@@ -13,19 +13,25 @@ export type BoardConfig = {
   folders: BoardFolderConfig[];
   folderMap: Map<string, BoardFolderConfig>;
   sourceText: string;
+  valid: boolean;
 };
 
-export function createEmptyBoardConfig(sourceText: string): BoardConfig {
+export function createEmptyBoardConfig(
+  sourceText: string,
+  valid = true
+): BoardConfig {
   return {
     data: {},
     folders: [],
     folderMap: new Map(),
     sourceText,
+    valid,
   };
 }
 
 export function parseBoardConfig(content: string): BoardConfig {
   let data: Record<string, unknown> = {};
+  let valid = true;
   try {
     const parsed = YAML.parse(content);
     if (isPlainObject(parsed)) {
@@ -33,6 +39,7 @@ export function parseBoardConfig(content: string): BoardConfig {
     }
   } catch {
     data = {};
+    valid = false;
   }
 
   const folders: BoardFolderConfig[] = [];
@@ -97,6 +104,7 @@ export function parseBoardConfig(content: string): BoardConfig {
     folders,
     folderMap: new Map(folders.map((folder) => [folder.id, folder])),
     sourceText: content,
+    valid,
   };
 }
 

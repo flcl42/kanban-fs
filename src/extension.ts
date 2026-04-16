@@ -21,8 +21,9 @@ import {
 } from "./task-metadata";
 import {
   findTaskLinkActions,
-  getTaskPropertyAction,
+  getTaskPropertyActions,
   isAbsoluteLocalPath as isTaskAbsoluteLocalPath,
+  isExternalUrlValue as isTaskExternalUrlValue,
   isGuidValue as isTaskGuidValue,
   normalizePropertyValue as normalizeTaskPropertyValue,
   type TaskPropertyAction,
@@ -36,6 +37,7 @@ import {
 
 type CardProperty = TaskProperty & {
   action: TaskPropertyAction | null;
+  actions: TaskPropertyAction[];
 };
 
 type Card = {
@@ -94,6 +96,7 @@ const DETAILS_REFRESH_INTERVAL_MS = 10000;
 const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
 const OPEN_CODE_COMMAND = "kanban.openCode";
+const OPEN_URL_COMMAND = "kanban.openUrl";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
@@ -114,6 +117,9 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand(OPEN_CODE_COMMAND, async (targetPath: string) =>
       provider.openPathInCode(String(targetPath))
+    ),
+    vscode.commands.registerCommand(OPEN_URL_COMMAND, async (targetUrl: string) =>
+      provider.openUrl(String(targetUrl))
     ),
     vscode.window.registerCustomEditorProvider("kanban.board", provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -410,6 +416,8 @@ function toTaskActionCommand(action: TaskLinkAction): vscode.Command {
     command = RESUME_AGENT_COMMAND;
   } else if (action.command === "openCode") {
     command = OPEN_CODE_COMMAND;
+  } else if (action.command === "openUrl") {
+    command = OPEN_URL_COMMAND;
   }
   return {
     title: action.title,
@@ -424,6 +432,8 @@ function getTaskActionTooltip(action: TaskLinkAction): string {
     ? `Resume agent ${action.value}`
     : action.command === "openCode"
       ? `Open ${action.value} in VS Code`
+      : action.command === "openUrl"
+        ? `Open ${action.value}`
       : `Open ${action.value}`;
 }
 
@@ -433,6 +443,7 @@ function isMarkdownDocument(document: vscode.TextDocument): boolean {
 
 class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
+  private readonly boardConfigCache = new Map<string, BoardConfig>();
   private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
@@ -483,7 +494,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       this.getDetailsPaneWidthSetting()
     );
 
-    const sendBoard = async () => {
+    let scheduledBoardRefresh: NodeJS.Timeout | undefined;
+    let boardRefreshQueue = Promise.resolve();
+    const runBoardRefresh = async () => {
       try {
         const board = await this.buildBoard(document.uri);
         webviewPanel.webview.postMessage({ type: "boardData", board });
@@ -493,6 +506,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         console.error("Failed to build kanban board", error);
         webviewPanel.webview.postMessage({ type: "boardError", message });
       }
+    };
+    const sendBoard = async () => {
+      if (scheduledBoardRefresh) {
+        clearTimeout(scheduledBoardRefresh);
+        scheduledBoardRefresh = undefined;
+      }
+      boardRefreshQueue = boardRefreshQueue
+        .catch(() => undefined)
+        .then(runBoardRefresh);
+      await boardRefreshQueue;
+    };
+    const scheduleBoardRefresh = () => {
+      if (scheduledBoardRefresh) {
+        clearTimeout(scheduledBoardRefresh);
+      }
+      scheduledBoardRefresh = setTimeout(() => {
+        scheduledBoardRefresh = undefined;
+        void sendBoard();
+      }, 150);
     };
     const sendDetailsPaneWidth = () => {
       webviewPanel.webview.postMessage({
@@ -513,6 +545,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
     webviewPanel.onDidDispose(() => {
       detailsPaneWidthListener.dispose();
+      if (scheduledBoardRefresh) {
+        clearTimeout(scheduledBoardRefresh);
+      }
     });
 
     const key = document.uri.toString();
@@ -520,9 +555,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const pattern = new vscode.RelativePattern(parentFolder, "**/*");
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
     this.watchers.set(key, watcher);
-    watcher.onDidCreate(sendBoard);
-    watcher.onDidDelete(sendBoard);
-    watcher.onDidChange(sendBoard);
+    watcher.onDidCreate(scheduleBoardRefresh);
+    watcher.onDidDelete(scheduleBoardRefresh);
+    watcher.onDidChange(scheduleBoardRefresh);
 
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
       if (message?.type === "ready") {
@@ -596,7 +631,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       if (message?.type === "resumeAgent" && message?.agentId) {
-        await this.resumeAgent(String(message.agentId));
+        await this.resumeAgent(String(message.agentId), message?.title);
         return;
       }
       if (message?.type === "requestGitStatus" && message?.path) {
@@ -625,6 +660,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "openPath" && message?.path) {
         await this.openPathInTerminal(String(message.path));
+        return;
+      }
+      if (message?.type === "openCode" && message?.path) {
+        await this.openPathInCode(String(message.path));
+        return;
+      }
+      if (message?.type === "openUrl" && message?.url) {
+        await this.openUrl(String(message.url));
       }
     });
 
@@ -666,7 +709,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   private async buildBoard(kanbanUri: vscode.Uri): Promise<BoardData> {
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
-    const boardConfig = await this.readBoardConfig(kanbanUri);
+    const rawBoardConfig = await this.readBoardConfig(kanbanUri);
+    const cachedBoardConfig = this.boardConfigCache.get(kanbanUri.toString());
+    const useCachedBoardConfig = this.shouldUseCachedBoardConfig(
+      rawBoardConfig,
+      cachedBoardConfig
+    );
+    const boardConfig =
+      useCachedBoardConfig && cachedBoardConfig
+        ? cachedBoardConfig
+        : rawBoardConfig;
     const entries = await vscode.workspace.fs.readDirectory(boardFolder);
     const columns: Column[] = [];
 
@@ -686,10 +738,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const orderedColumns = this.orderColumns(columns, boardConfig);
-    try {
-      await this.syncBoardConfig(kanbanUri, orderedColumns, boardConfig);
-    } catch (error) {
-      console.error("Failed to sync .kanban config", error);
+    if (!this.shouldSkipBoardConfigSync(rawBoardConfig, useCachedBoardConfig)) {
+      try {
+        const syncedConfig = await this.syncBoardConfig(
+          kanbanUri,
+          orderedColumns,
+          rawBoardConfig
+        );
+        this.boardConfigCache.set(kanbanUri.toString(), syncedConfig);
+      } catch (error) {
+        console.error("Failed to sync .kanban config", error);
+      }
     }
     return { columns: orderedColumns };
   }
@@ -707,15 +766,59 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const text = Buffer.from(raw).toString("utf8");
       return parseBoardConfig(text);
     } catch {
-      return createEmptyBoardConfig("");
+      return createEmptyBoardConfig("", false);
     }
+  }
+
+  private async readBoardConfigForWrite(
+    kanbanUri: vscode.Uri
+  ): Promise<BoardConfig | null> {
+    const boardConfig = await this.readBoardConfig(kanbanUri);
+    const cachedBoardConfig = this.boardConfigCache.get(kanbanUri.toString());
+    if (this.shouldUseCachedBoardConfig(boardConfig, cachedBoardConfig)) {
+      return cachedBoardConfig ?? null;
+    }
+    if (this.shouldSkipBoardConfigSync(boardConfig, false)) {
+      return cachedBoardConfig ?? null;
+    }
+    return boardConfig;
+  }
+
+  private shouldUseCachedBoardConfig(
+    boardConfig: BoardConfig,
+    cachedBoardConfig: BoardConfig | undefined
+  ): boolean {
+    if (!cachedBoardConfig || cachedBoardConfig.folders.length === 0) {
+      return false;
+    }
+    if (!boardConfig.valid) {
+      return true;
+    }
+    const sourceText = boardConfig.sourceText.trim();
+    return (
+      boardConfig.folders.length === 0 &&
+      (sourceText.length === 0 || /\bfolders\s*:/i.test(sourceText))
+    );
+  }
+
+  private shouldSkipBoardConfigSync(
+    boardConfig: BoardConfig,
+    useCachedBoardConfig: boolean
+  ): boolean {
+    if (useCachedBoardConfig || !boardConfig.valid) {
+      return true;
+    }
+    return (
+      boardConfig.folders.length === 0 &&
+      /\bfolders\s*:/i.test(boardConfig.sourceText)
+    );
   }
 
   private async syncBoardConfig(
     kanbanUri: vscode.Uri,
     columns: { id: string; name: string; cards: { fileName: string }[] }[],
     boardConfig: BoardConfig
-  ): Promise<void> {
+  ): Promise<BoardConfig> {
     const nextData = { ...boardConfig.data };
     const priorityOverrides = buildFolderCardPriorityOverrides(columns, boardConfig);
 
@@ -730,12 +833,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    const nextConfig = parseBoardConfig(serialized);
     if (
       normalizeLineEndings(serialized) !==
       normalizeLineEndings(boardConfig.sourceText)
     ) {
       await this.applyContentEdit(kanbanUri, serialized);
     }
+    return nextConfig;
   }
 
   private async readCards(
@@ -761,7 +866,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       );
       const propertiesWithActions = properties.map((property) => ({
         ...property,
-        action: getTaskPropertyAction(property.key, property.value),
+        actions: getTaskPropertyActions(property.key, property.value),
+      })).map((property) => ({
+        ...property,
+        action: property.actions[0] ?? null,
       }));
       const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
@@ -898,11 +1006,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       fileName = `${baseName}-${counter}.md`;
     }
 
+    const existingCards = await this.readCards(columnUri);
     const fileUri = vscode.Uri.joinPath(columnUri, fileName);
     const templateContent = await this.readNewCardTemplate(boardFolder);
     const content = buildNewCardContent(safeTitle, templateContent);
     await this.ensureFile(fileUri);
     await this.applyContentEdit(fileUri, content);
+    await this.updateBoardCardPriorities(kanbanUri, [
+      {
+        columnId,
+        orderedUris: [
+          fileUri.toString(),
+          ...existingCards.map((card) => card.uri),
+        ],
+      },
+    ]);
   }
 
   private async readNewCardTemplate(
@@ -991,7 +1109,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
 
-    const boardConfig = await this.readBoardConfig(kanbanUri);
+    const boardConfig = await this.readBoardConfigForWrite(kanbanUri);
+    if (!boardConfig) {
+      return;
+    }
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
     const entries = await vscode.workspace.fs.readDirectory(boardFolder);
     const columns: { id: string; name: string; order: number | null }[] = [];
@@ -1022,12 +1143,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    const nextConfig = parseBoardConfig(serialized);
     if (
       normalizeLineEndings(serialized) !==
       normalizeLineEndings(boardConfig.sourceText)
     ) {
       await this.applyContentEdit(kanbanUri, serialized, context);
     }
+    this.boardConfigCache.set(kanbanUri.toString(), nextConfig);
   }
 
   private async reorderColumns(
@@ -1087,16 +1210,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     await this.applyContentEdit(kanbanUri, serialized);
   }
 
-  public async resumeAgent(agentId: string): Promise<void> {
+  public async resumeAgent(
+    agentId: string,
+    ticketTitle?: unknown
+  ): Promise<void> {
     const trimmed = normalizeTaskPropertyValue(agentId);
     if (!isTaskGuidValue(trimmed)) {
       return;
     }
+    const sessionCwd = await this.readCodexSessionCwd(trimmed);
     const terminal = vscode.window.createTerminal({
-      name: `Kanban Agent ${trimmed.slice(0, 8)}`,
+      name: formatAgentTerminalName(ticketTitle, trimmed),
+      cwd: sessionCwd ?? undefined,
     });
-    terminal.show(true);
-    terminal.sendText(`codex resume ${trimmed}`, true);
+    terminal.show(false);
+    terminal.sendText(
+      sessionCwd ? `codex resume --cd . ${trimmed}` : `codex resume ${trimmed}`,
+      true
+    );
+    await this.focusTerminal();
   }
 
   public async openPathInTerminal(rawPath: string): Promise<void> {
@@ -1109,7 +1241,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       name: `Kanban Path ${path.basename(cwd) || cwd}`,
       cwd,
     });
-    terminal.show(true);
+    terminal.show(false);
+    await this.focusTerminal();
   }
 
   public async openPathInCode(rawPath: string): Promise<void> {
@@ -1124,6 +1257,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         forceNewWindow: true,
       }
     );
+  }
+
+  public async openUrl(rawUrl: string): Promise<void> {
+    const targetUrl = normalizeTaskPropertyValue(rawUrl);
+    if (!isTaskExternalUrlValue(targetUrl)) {
+      return;
+    }
+    await vscode.env.openExternal(vscode.Uri.parse(targetUrl));
+  }
+
+  private async focusTerminal(): Promise<void> {
+    try {
+      await vscode.commands.executeCommand("workbench.action.terminal.focus");
+    } catch {
+      // terminal.show(false) is enough in normal VS Code builds; this is best-effort.
+    }
   }
 
   private getDetailsPaneWidthSetting(): number {
@@ -1282,12 +1431,58 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .split(/\r?\n/)
         .map((line) => line.trimEnd())
         .filter((line) => line.trim().length > 0)
+        .filter((line, index, lines) => {
+          if (index === 0) {
+            return true;
+          }
+          return line.trim() !== lines[index - 1].trim();
+        })
         .slice(-5);
 
       return recentLines.length > 0 ? recentLines.join("\n") : null;
     } catch {
       return null;
     }
+  }
+
+  private async readCodexSessionCwd(agentId: string): Promise<string | null> {
+    const sessionFile = await this.findCodexSessionFile(agentId);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+
+      for (const line of lines) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        const record = entry as { type?: string; payload?: unknown };
+        if (record.type !== "session_meta") {
+          continue;
+        }
+
+        const payload = record.payload as { cwd?: unknown } | undefined;
+        const cwd = typeof payload?.cwd === "string" ? payload.cwd.trim() : "";
+        if (!cwd) {
+          return null;
+        }
+
+        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(cwd));
+        return stat.type === vscode.FileType.Directory ? cwd : null;
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
   }
 
   private async findCodexSessionFile(agentId: string): Promise<string | null> {
@@ -1687,9 +1882,42 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       outline: 2px dashed var(--accent);
       outline-offset: 2px;
     }
+    .card-title-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 8px;
+    }
     .card h3 {
       margin: 0;
       font-size: 15px;
+    }
+    .card-bump {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      color: var(--ink);
+      width: 24px;
+      height: 24px;
+      border-radius: 999px;
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1;
+      padding: 0;
+    }
+    .card-bump:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .card-bump:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .card-bump:disabled {
+      cursor: default;
+      opacity: 0.45;
+      border-color: var(--line);
+      background: var(--panel);
     }
     .meta {
       font-family: var(--mono);
@@ -1827,10 +2055,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       line-height: 1.5;
       word-break: break-word;
     }
+    .property-actions {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 6px;
+    }
     .property-action {
-      border: 1px solid var(--line);
-      background: var(--surface);
-      color: var(--accent);
+      border: 1px solid var(--vscode-button-border, transparent);
+      background: var(--vscode-button-background, var(--accent));
+      color: var(--vscode-button-foreground, #ffffff);
       font-family: var(--mono);
       font-size: 11px;
       padding: 4px 10px;
@@ -1839,8 +2073,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       white-space: nowrap;
     }
     .property-action:hover {
-      border-color: var(--accent);
-      background: var(--accent-soft);
+      background: var(--vscode-button-hoverBackground, var(--accent));
     }
     .property-action:focus {
       outline: 2px solid var(--accent);
@@ -1848,6 +2081,37 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .details-body {
       margin-top: 18px;
+    }
+    .description-frame {
+      position: relative;
+    }
+    .description-frame.collapsed {
+      max-height: 40rem;
+      overflow: hidden;
+    }
+    .description-frame.collapsed::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 4rem;
+      background: linear-gradient(to bottom, transparent, var(--panel));
+      pointer-events: none;
+    }
+    .description-expand {
+      margin-top: 10px;
+      border: 1px solid var(--vscode-button-border, transparent);
+      background: var(--vscode-button-secondaryBackground, var(--surface));
+      color: var(--vscode-button-secondaryForeground, var(--ink));
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+    .description-expand:hover {
+      background: var(--vscode-button-secondaryHoverBackground, var(--accent-soft));
     }
     .details-body hr {
       border: 0;
@@ -2057,18 +2321,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     };
 
-    const getPropertyAction = (property) => {
-      const action = property?.action;
-      const type = String(action?.command || "").trim();
-      const label = String(action?.title || "").trim();
-      const value = String(action?.value || "").trim();
-      if (!type || !label || !value) {
-        return null;
-      }
-      if (type !== "resumeAgent" && type !== "openPath") {
-        return null;
-      }
-      return { type, label, value };
+    const getPropertyActions = (property) => {
+      const rawActions = Array.isArray(property?.actions)
+        ? property.actions
+        : property?.action
+          ? [property.action]
+          : [];
+      return rawActions
+        .map((action) => {
+          const type = String(action?.command || "").trim();
+          const label = String(action?.title || "").trim();
+          const value = String(action?.value || "").trim();
+          if (!type || !label || !value) {
+            return null;
+          }
+          if (type !== "resumeAgent" && type !== "openPath" && type !== "openCode" && type !== "openUrl") {
+            return null;
+          }
+          return { type, label, value };
+        })
+        .filter(Boolean);
     };
 
     const getVisibleProperties = (properties) => {
@@ -2085,15 +2357,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const visibleProperties = getVisibleProperties(properties);
       if (!visibleProperties.length) return "";
       const rows = visibleProperties.map((property) => {
-        const action = getPropertyAction(property);
-        const actionHtml = action
-          ? \`<button class="property-action" type="button" data-action-type="\${escapeHtml(action.type)}" data-action-value="\${escapeHtml(action.value)}">\${escapeHtml(action.label)}</button>\`
-          : "";
+        const actionHtml = getPropertyActions(property)
+          .map((action) => \`<button class="property-action" type="button" data-action-type="\${escapeHtml(action.type)}" data-action-value="\${escapeHtml(action.value)}">\${escapeHtml(action.label)}</button>\`)
+          .join("");
+        const actionsHtml = actionHtml ? \`<div class="property-actions">\${actionHtml}</div>\` : "";
         return \`
           <div class="property-row">
             <div class="property-label">\${escapeHtml(property.label)}:</div>
             <div class="property-value">\${escapeHtml(property.value)}</div>
-            \${actionHtml}
+            \${actionsHtml}
           </div>
         \`;
       }).join("");
@@ -2217,10 +2489,36 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (cached.state !== "ready" || !cached.text) {
         return "";
       }
+      const text = String(cached.text)
+        .split(/\\r?\\n/)
+        .filter((line, index, lines) => {
+          if (index === 0) {
+            return true;
+          }
+          return line.trim() !== lines[index - 1].trim();
+        })
+        .join("\\n");
       return \`
         <hr />
         <h2 class="details-section-title">Codex Output</h2>
-        <pre class="codex-output-text">\${escapeHtml(cached.text)}</pre>
+        <pre class="codex-output-text">\${escapeHtml(text)}</pre>
+      \`;
+    };
+
+    const renderDescription = (card) => {
+      const bodyHtml = card?.bodyHtml || "";
+      if (!bodyHtml) {
+        return '<div class="empty">No description.</div>';
+      }
+      const bodyLines = String(card?.body || "")
+        .split(/\\r?\\n/)
+        .filter((line) => line.trim().length > 0);
+      const collapsed = bodyLines.length > 50;
+      return \`
+        <div class="description-frame\${collapsed ? " collapsed" : ""}" data-description-frame>
+          \${bodyHtml}
+        </div>
+        \${collapsed ? '<button class="description-expand" type="button" data-action-type="expandDescription">Show full description</button>' : ''}
       \`;
     };
 
@@ -2253,7 +2551,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const created = new Date(card.createdAt);
       const createdLabel = created.toLocaleString();
       const createdRelative = formatRelativeTime(created);
-      const bodyHtml = card.bodyHtml || '';
+      const descriptionHtml = renderDescription(card);
       const tagsHtml = renderTags(card.tags || []);
       const propertiesHtml = renderProperties(card.properties || []);
       const gitStatusHtml = renderGitStatus(card);
@@ -2266,7 +2564,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         \${propertiesHtml}
         <div class="details-body">
           <hr />
-          <div>\${bodyHtml || '<div class="empty">No description.</div>'}</div>
+          \${descriptionHtml}
           \${gitStatusHtml}
           \${codexOutputHtml}
         </div>
@@ -2333,7 +2631,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const matchingColumns = (visibleColumns || []).filter((column) => column.cards.length > 0).length;
           const columnLabel = matchingColumns === 1 ? "column" : "columns";
           searchMetaEl.textContent =
-            \`\${visibleCards} of \${totalCards} cards shown in \${matchingColumns} \${columnLabel}. Dragging is disabled while filtering.\`;
+            \`\${visibleCards} of \${totalCards} cards shown in \${matchingColumns} \${columnLabel}. Cards can be moved to other columns while filtering.\`;
         }
       }
       if (searchClearEl) {
@@ -2363,6 +2661,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const insertIndex = position === "after" ? targetIndex + 1 : targetIndex;
       list.splice(insertIndex, 0, cardUri);
       return list;
+    };
+
+    const bumpCardToTop = (card, columnId, cards) => {
+      if (!card?.uri || !columnId) {
+        return;
+      }
+      vscode.postMessage({
+        type: "reorderCards",
+        cardUri: card.uri,
+        sourceColumnId: columnId,
+        targetColumnId: columnId,
+        orderedUris: buildOrderedUris(cards, card.uri, null, "start"),
+      });
     };
 
     const hashString = (value) => {
@@ -2497,7 +2808,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         const titleEl = document.createElement("h2");
         titleEl.textContent = searchActive
           ? \`\${column.name} (\${visibleCards.length}/\${allCards.length})\`
-          : column.name;
+          : \`\${column.name} (\${allCards.length})\`;
         headerEl.appendChild(titleEl);
         if (columnId === firstColumnId) {
           const addButton = document.createElement("button");
@@ -2511,59 +2822,69 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           headerEl.appendChild(addButton);
         }
         columnEl.appendChild(headerEl);
-        if (!searchActive) {
-          columnEl.addEventListener("dragover", (event) => {
-            const types = getDragTypes(event);
-            if (types.includes(columnDragType) || types.includes(cardDragType) || types.includes("text/uri-list")) {
-              event.preventDefault();
-              columnEl.classList.add("drop-target");
-            }
-          });
-          columnEl.addEventListener("dragleave", () => {
-            columnEl.classList.remove("drop-target");
-          });
-          columnEl.addEventListener("drop", (event) => {
-            const types = getDragTypes(event);
-            if (types.includes(columnDragType)) {
-              event.preventDefault();
-              columnEl.classList.remove("drop-target");
-              const sourceColumnId = draggingColumn || event.dataTransfer.getData(columnDragType);
-              if (!sourceColumnId || sourceColumnId === columnId) {
-                return;
-              }
-              const rect = columnEl.getBoundingClientRect();
-              const position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
-              vscode.postMessage({
-                type: "reorderColumns",
-                sourceColumnId,
-                targetColumnId: columnId,
-                position,
-              });
-              return;
-            }
+        columnEl.addEventListener("dragover", (event) => {
+          const types = getDragTypes(event);
+          const acceptsColumn = !searchActive && types.includes(columnDragType);
+          const acceptsCard = types.includes(cardDragType) || types.includes("text/uri-list");
+          if (acceptsColumn || acceptsCard) {
+            event.preventDefault();
+            columnEl.classList.add("drop-target");
+          }
+        });
+        columnEl.addEventListener("dragleave", (event) => {
+          if (
+            event.relatedTarget
+            && typeof columnEl.contains === "function"
+            && columnEl.contains(event.relatedTarget)
+          ) {
+            return;
+          }
+          columnEl.classList.remove("drop-target");
+        });
+        columnEl.addEventListener("drop", (event) => {
+          const types = getDragTypes(event);
+          if (!searchActive && types.includes(columnDragType)) {
             event.preventDefault();
             columnEl.classList.remove("drop-target");
-            const cardUri = event.dataTransfer.getData("text/uri-list");
-            if (cardUri) {
-              let sourceColumnId = draggingCard?.columnId;
-              if (!sourceColumnId) {
-                try {
-                  const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
-                  sourceColumnId = payload.columnId;
-                } catch {}
-              }
-              const movePosition = sourceColumnId && sourceColumnId !== columnId ? "start" : "after";
-              const orderedUris = buildOrderedUris(allCards, cardUri, null, movePosition);
-              vscode.postMessage({
-                type: "reorderCards",
-                cardUri,
-                sourceColumnId,
-                targetColumnId: columnId,
-                orderedUris,
-              });
+            const sourceColumnId = draggingColumn || event.dataTransfer.getData(columnDragType);
+            if (!sourceColumnId || sourceColumnId === columnId) {
+              return;
             }
-          });
-        }
+            const rect = columnEl.getBoundingClientRect();
+            const position = event.clientX < rect.left + rect.width / 2 ? "before" : "after";
+            vscode.postMessage({
+              type: "reorderColumns",
+              sourceColumnId,
+              targetColumnId: columnId,
+              position,
+            });
+            return;
+          }
+          event.preventDefault();
+          columnEl.classList.remove("drop-target");
+          const cardUri = event.dataTransfer.getData("text/uri-list");
+          if (cardUri) {
+            let sourceColumnId = draggingCard?.columnId;
+            if (!sourceColumnId) {
+              try {
+                const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
+                sourceColumnId = payload.columnId;
+              } catch {}
+            }
+            if (searchActive && sourceColumnId === columnId) {
+              return;
+            }
+            const movePosition = sourceColumnId && sourceColumnId !== columnId ? "start" : "after";
+            const orderedUris = buildOrderedUris(allCards, cardUri, null, movePosition);
+            vscode.postMessage({
+              type: "reorderCards",
+              cardUri,
+              sourceColumnId,
+              targetColumnId: columnId,
+              orderedUris,
+            });
+          }
+        });
 
         if (!visibleCards.length) {
           const emptyEl = document.createElement("div");
@@ -2574,8 +2895,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
         for (const card of visibleCards) {
           const cardEl = document.createElement("div");
-          cardEl.className = searchActive ? "card static" : "card";
-          cardEl.draggable = !searchActive;
+          cardEl.className = "card";
+          cardEl.draggable = true;
           cardEl.dataset.uri = card.uri;
           cardEl.dataset.column = columnId;
           const tagsHtml = renderTags(card.tags || []);
@@ -2584,33 +2905,69 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const createdLabel = created.toLocaleDateString();
           const createdRelative = formatRelativeTime(created);
           const metaLine = createdLabel + " · " + createdRelative;
+          const isFirstCard = allCards[0]?.uri === card.uri;
           cardEl.innerHTML = \`
-            <h3>\${escapeHtml(card.title)}</h3>
+            <div class="card-title-row">
+              <h3>\${escapeHtml(card.title)}</h3>
+              <button
+                class="card-bump"
+                type="button"
+                title="Move to top"
+                aria-label="Move \${escapeHtml(card.title)} to top"
+                data-card-action="bump"
+                draggable="false"
+                \${isFirstCard ? "disabled" : ""}
+              >↑</button>
+            </div>
             <div class="meta">\${metaLine}</div>
             \${tagsHtml}
             \${propertyBadgesHtml}
           \`;
-          cardEl.addEventListener("click", () => renderDetails(card));
-          cardEl.addEventListener("dblclick", () => openCard(card));
+          cardEl.addEventListener("click", (event) => {
+            const actionButton = event?.target instanceof Element
+              ? event.target.closest("[data-card-action]")
+              : null;
+            if (actionButton?.getAttribute("data-card-action") === "bump") {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              bumpCardToTop(card, columnId, allCards);
+              return;
+            }
+            renderDetails(card);
+          });
+          cardEl.addEventListener("dblclick", (event) => {
+            const actionButton = event?.target instanceof Element
+              ? event.target.closest("[data-card-action]")
+              : null;
+            if (actionButton) {
+              return;
+            }
+            openCard(card);
+          });
+          cardEl.addEventListener("dragstart", (event) => {
+            draggingCard = { uri: card.uri, columnId };
+            event.dataTransfer.setData("text/uri-list", card.uri);
+            event.dataTransfer.setData(cardDragType, JSON.stringify(draggingCard));
+            event.dataTransfer.effectAllowed = "move";
+          });
+          cardEl.addEventListener("dragend", () => {
+            draggingCard = null;
+          });
           if (!searchActive) {
-            cardEl.addEventListener("dragstart", (event) => {
-              draggingCard = { uri: card.uri, columnId };
-              event.dataTransfer.setData("text/uri-list", card.uri);
-              event.dataTransfer.setData(cardDragType, JSON.stringify(draggingCard));
-              event.dataTransfer.effectAllowed = "move";
-            });
-            cardEl.addEventListener("dragend", () => {
-              draggingCard = null;
-            });
             cardEl.addEventListener("dragover", (event) => {
               const types = getDragTypes(event);
               if (types.includes(columnDragType)) {
                 return;
               }
               event.preventDefault();
+              event.stopPropagation();
               cardEl.classList.add("card-drop-target");
             });
-            cardEl.addEventListener("dragleave", () => {
+            cardEl.addEventListener("dragleave", (event) => {
+              const types = getDragTypes(event);
+              if (!types.includes(columnDragType)) {
+                event.stopPropagation();
+              }
               cardEl.classList.remove("card-drop-target");
             });
             cardEl.addEventListener("drop", (event) => {
@@ -2727,15 +3084,35 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       event.stopPropagation();
       const actionType = actionButton.getAttribute("data-action-type");
       const actionValue = actionButton.getAttribute("data-action-value");
+      if (actionType === "expandDescription") {
+        const frame = detailsEl.querySelector("[data-description-frame]");
+        if (frame) {
+          frame.classList.remove("collapsed");
+        }
+        actionButton.remove();
+        return;
+      }
       if (!actionType || !actionValue) {
         return;
       }
       if (actionType === "resumeAgent") {
-        vscode.postMessage({ type: actionType, agentId: actionValue });
+        vscode.postMessage({
+          type: actionType,
+          agentId: actionValue,
+          title: selectedCard?.title || "",
+        });
         return;
       }
       if (actionType === "openPath") {
         vscode.postMessage({ type: actionType, path: actionValue });
+        return;
+      }
+      if (actionType === "openCode") {
+        vscode.postMessage({ type: actionType, path: actionValue });
+        return;
+      }
+      if (actionType === "openUrl") {
+        vscode.postMessage({ type: actionType, url: actionValue });
       }
     });
     detailsEl.addEventListener("dblclick", () => openCard(selectedCard));
@@ -2915,6 +3292,24 @@ function normalizeDetailsPaneWidth(value: unknown): number {
     MIN_DETAILS_PANE_WIDTH,
     Math.min(MAX_DETAILS_PANE_WIDTH, Math.round(numeric))
   );
+}
+
+function formatAgentTerminalName(
+  ticketTitle: unknown,
+  agentId: string
+): string {
+  const title = String(ticketTitle ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!title) {
+    return `Kanban Agent ${agentId.slice(0, 8)}`;
+  }
+  const maxTitleLength = 48;
+  const trimmedTitle =
+    title.length > maxTitleLength
+      ? `${title.slice(0, maxTitleLength - 1).trimEnd()}…`
+      : title;
+  return `Kanban: ${trimmedTitle}`;
 }
 
 function normalizeContentForEol(

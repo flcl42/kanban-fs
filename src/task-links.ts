@@ -3,7 +3,7 @@ import { findTaskProperties } from "./task-metadata";
 export { parseTaskPropertyLine } from "./task-metadata";
 export type { TaskProperty as ParsedTaskPropertyLine } from "./task-metadata";
 
-export type TaskLinkCommand = "resumeAgent" | "openPath" | "openCode";
+export type TaskLinkCommand = "resumeAgent" | "openPath" | "openCode" | "openUrl";
 export type TaskLinkTitle = "Connect" | "Open" | "Code";
 
 export type TaskLinkAction = {
@@ -67,11 +67,11 @@ export function getTaskPropertyAction(
   key: string,
   value: string
 ): TaskPropertyAction | null {
-  const [primaryAction] = getTaskPropertyLinkActions(key, value);
+  const [primaryAction] = getTaskPropertyActions(key, value);
   return primaryAction ?? null;
 }
 
-function getTaskPropertyLinkActions(
+export function getTaskPropertyActions(
   key: string,
   value: string
 ): TaskPropertyAction[] {
@@ -105,5 +105,34 @@ function getTaskPropertyLinkActions(
       },
     ];
   }
+  if (isExternalUrlValue(normalizedValue)) {
+    return [
+      {
+        command: "openUrl",
+        title: "Open",
+        value: normalizedValue,
+      },
+    ];
+  }
   return [];
+}
+
+function getTaskPropertyLinkActions(
+  key: string,
+  value: string
+): TaskPropertyAction[] {
+  return getTaskPropertyActions(key, value);
+}
+
+export function isExternalUrlValue(value: string): boolean {
+  const normalized = normalizePropertyValue(value);
+  if (!/^https?:\/\//i.test(normalized)) {
+    return false;
+  }
+  try {
+    const parsed = new URL(normalized);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
 }

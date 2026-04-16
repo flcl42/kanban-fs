@@ -16,6 +16,7 @@ const sourceText = `folders:
 `;
 
 const boardConfig = parseBoardConfig(sourceText);
+assert.equal(boardConfig.valid, true, "valid .kanban YAML should be marked valid");
 const columns = [
   { id: "Backlog", name: "Backlog", order: 2 },
   { id: "Archive", name: "Archive", order: null },
@@ -90,4 +91,10 @@ assert.deepEqual(
   movePriorityOverrides.get("Done"),
   ["moved-task.md", "done-task.md"],
   "files moved into another column should be prepended ahead of the destination column's existing order"
+);
+
+assert.equal(
+  parseBoardConfig("folders: [").valid,
+  false,
+  "invalid .kanban YAML should be detectable so refreshes do not persist fallback ordering"
 );
