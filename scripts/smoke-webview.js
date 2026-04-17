@@ -490,6 +490,20 @@ assert.deepEqual(
   "same-column drops should send the complete destination order for persistence"
 );
 
+const sameColumnBackgroundTransfer = createDataTransfer();
+boardEl.children[0].children[2].listeners.dragstart({ dataTransfer: sameColumnBackgroundTransfer });
+const messageCountBeforeSameColumnBackgroundDrop = messages.length;
+boardEl.children[0].listeners.drop({
+  dataTransfer: sameColumnBackgroundTransfer,
+  preventDefault() {},
+});
+
+assert.equal(
+  messages.length,
+  messageCountBeforeSameColumnBackgroundDrop,
+  "dropping a dragged card back on its source column background should keep its original position"
+);
+
 const crossColumnTransfer = createDataTransfer();
 boardEl.children[0].children[1].listeners.dragstart({ dataTransfer: crossColumnTransfer });
 boardEl.children[1].listeners.drop({
@@ -575,6 +589,11 @@ windowListeners.message({
 });
 
 assert.match(detailsEl.innerHTML, /Git Status/, "details should render a git status section for Repo properties");
+assert.doesNotMatch(
+  detailsEl.innerHTML,
+  /<hr\s*\/>\s*<h2 class="details-section-title">Git Status<\/h2>/,
+  "git status should not render a separator line above its title"
+);
 assert.match(detailsEl.innerHTML, /## main/, "git status output should be displayed in the details pane");
 assert.match(detailsEl.innerHTML, /M src\/extension\.ts/, "git status body should be rendered as text");
 

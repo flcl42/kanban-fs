@@ -2454,7 +2454,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (cached.state === "loading") {
         return \`
-          <hr />
           <h2 class="details-section-title">Git Status</h2>
           <pre class="git-status-text">\${escapeHtml(cached.text || "Loading...")}</pre>
         \`;
@@ -2463,7 +2462,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return "";
       }
       return \`
-        <hr />
         <h2 class="details-section-title">Git Status</h2>
         <pre class="git-status-text">\${escapeHtml(cached.text)}</pre>
       \`;
@@ -2872,6 +2870,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               } catch {}
             }
             if (searchActive && sourceColumnId === columnId) {
+              return;
+            }
+            if (sourceColumnId === columnId) {
               return;
             }
             const movePosition = sourceColumnId && sourceColumnId !== columnId ? "start" : "after";
