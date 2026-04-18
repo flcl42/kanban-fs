@@ -532,6 +532,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         width: this.getDetailsPaneWidthSetting(),
       });
     };
+    let boardMutationQueue = Promise.resolve();
+    const runBoardMutation = async (operation: () => Promise<void>) => {
+      const nextMutation = boardMutationQueue
+        .catch(() => undefined)
+        .then(operation);
+      boardMutationQueue = nextMutation.then(
+        () => undefined,
+        () => undefined
+      );
+      await nextMutation;
+    };
     const detailsPaneWidthListener = vscode.workspace.onDidChangeConfiguration(
       (event) => {
         if (
@@ -580,47 +591,57 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         if (title === undefined) {
           return;
         }
-        await this.createCard(document.uri, columnId, title);
+        await runBoardMutation(() => this.createCard(document.uri, columnId, title));
         await sendBoard();
         return;
       }
       if (message?.type === "undo") {
-        await vscode.commands.executeCommand("undo");
+        await runBoardMutation(async () => {
+          await vscode.commands.executeCommand("undo");
+        });
         return;
       }
       if (message?.type === "redo") {
-        await vscode.commands.executeCommand("redo");
+        await runBoardMutation(async () => {
+          await vscode.commands.executeCommand("redo");
+        });
         return;
       }
       if (message?.type === "reorderCards") {
         const orderedUris = Array.isArray(message?.orderedUris)
           ? message.orderedUris
           : [];
-        await this.reorderCards(
-          document.uri,
-          message?.cardUri,
-          message?.sourceColumnId,
-          message?.targetColumnId,
-          orderedUris
+        await runBoardMutation(() =>
+          this.reorderCards(
+            document.uri,
+            message?.cardUri,
+            message?.sourceColumnId,
+            message?.targetColumnId,
+            orderedUris
+          )
         );
         await sendBoard();
         return;
       }
       if (message?.type === "reorderColumns") {
-        await this.reorderColumns(
-          document.uri,
-          message?.sourceColumnId,
-          message?.targetColumnId,
-          message?.position
+        await runBoardMutation(() =>
+          this.reorderColumns(
+            document.uri,
+            message?.sourceColumnId,
+            message?.targetColumnId,
+            message?.position
+          )
         );
         await sendBoard();
         return;
       }
       if (message?.type === "moveCard") {
-        await this.moveCard(
-          document.uri,
-          message.cardUri,
-          message.targetColumnId ?? message.targetColumn
+        await runBoardMutation(() =>
+          this.moveCard(
+            document.uri,
+            message.cardUri,
+            message.targetColumnId ?? message.targetColumn
+          )
         );
         await sendBoard();
         return;
@@ -929,6 +950,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readOrderedCardsForColumn(
+    kanbanUri: vscode.Uri,
+    columnId: string,
+    boardConfig: BoardConfig
+  ): Promise<Card[]> {
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const columnUri = vscode.Uri.joinPath(boardFolder, columnId);
+    const meta = await this.readColumnMeta(columnUri, columnId, boardConfig);
+    return this.readCards(columnUri, meta.cardPriorities);
+  }
+
   private async moveCard(
     kanbanUri: vscode.Uri,
     cardUriString: string,
@@ -950,10 +982,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
     const sourceColumnId = path.posix.basename(sourceColumnUri.path);
-    const targetCards = await this.readCards(targetColumnUri);
+    const boardConfig =
+      (await this.readBoardConfigForWrite(kanbanUri)) ??
+      createEmptyBoardConfig("", false);
+    const targetCards = await this.readOrderedCardsForColumn(
+      kanbanUri,
+      targetColumnId,
+      boardConfig
+    );
     const targetOrderedUris = targetCards.map((card) => card.uri);
     targetOrderedUris.unshift(newUri.toString());
-    const sourceCards = await this.readCards(sourceColumnUri);
+    const sourceCards = await this.readOrderedCardsForColumn(
+      kanbanUri,
+      sourceColumnId,
+      boardConfig
+    );
     const sourceOrderedUris = sourceCards
       .filter((card) => card.uri !== cardUriString)
       .map((card) => card.uri);
@@ -1006,7 +1049,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       fileName = `${baseName}-${counter}.md`;
     }
 
-    const existingCards = await this.readCards(columnUri);
+    const boardConfig =
+      (await this.readBoardConfigForWrite(kanbanUri)) ??
+      createEmptyBoardConfig("", false);
+    const existingCards = await this.readOrderedCardsForColumn(
+      kanbanUri,
+      columnId,
+      boardConfig
+    );
     const fileUri = vscode.Uri.joinPath(columnUri, fileName);
     const templateContent = await this.readNewCardTemplate(boardFolder);
     const content = buildNewCardContent(safeTitle, templateContent);
@@ -1051,6 +1101,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
     const targetColumnUri = vscode.Uri.joinPath(boardFolder, targetColumnId);
+    const boardConfig =
+      (await this.readBoardConfigForWrite(kanbanUri)) ??
+      createEmptyBoardConfig("", false);
     let movedCardUriString = cardUriString;
     const context = this.createEditContext();
 
@@ -1074,8 +1127,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     ];
 
     if (sourceColumnId && sourceColumnId !== targetColumnId && cardUriString) {
-      const sourceColumnUri = vscode.Uri.joinPath(boardFolder, sourceColumnId);
-      const sourceCards = await this.readCards(sourceColumnUri);
+      const sourceCards = await this.readOrderedCardsForColumn(
+        kanbanUri,
+        sourceColumnId,
+        boardConfig
+      );
       const sourceOrderedUris = sourceCards
         .filter((card) => card.uri !== cardUriString)
         .map((card) => card.uri);
