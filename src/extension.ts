@@ -739,8 +739,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "createRunner") {
         try {
-          const runnerPath = await this.createRunnerScript(document.uri);
-          await sendRunnerStatus(`Created runner script: ${runnerPath}`);
+          const result = await this.initializeRunnerForBoard(document.uri);
+          if (result.kanbanUri.toString() !== document.uri.toString()) {
+            await vscode.commands.executeCommand(
+              "vscode.openWith",
+              result.kanbanUri,
+              "kanban.board"
+            );
+            webviewPanel.dispose();
+            return;
+          }
+          await sendRunnerStatus(`Created runner script: ${result.runnerPath}`);
         } catch (error) {
           const errorMessage =
             error instanceof Error ? error.message : String(error ?? "Unknown error");
@@ -755,6 +764,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             },
           });
         }
+        return;
+      }
+      if (message?.type === "hideRunnerPanel") {
+        await this.updateRunnerPanelEnabledSetting(false);
+        webviewPanel.webview.postMessage({
+          type: "runnerStatus",
+          status: { enabled: false, running: false },
+        });
         return;
       }
       if (message?.type === "openFile" && message?.cardUri) {
@@ -1463,6 +1480,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       );
   }
 
+  private async updateRunnerPanelEnabledSetting(enabled: boolean): Promise<void> {
+    await vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .update(
+        RUNNER_PANEL_ENABLED_SETTING,
+        enabled,
+        vscode.ConfigurationTarget.Global
+      );
+  }
+
   private getRunnerPanelEnabledSetting(): boolean {
     return vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION)
@@ -1692,21 +1719,53 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
   }
 
-  private async createRunnerScript(kanbanUri: vscode.Uri): Promise<string> {
+  private async initializeRunnerForBoard(
+    kanbanUri: vscode.Uri
+  ): Promise<{ runnerPath: string; kanbanUri: vscode.Uri }> {
     if (kanbanUri.scheme !== "file") {
       throw new Error("Runner creation is only supported for local file boards.");
     }
 
-    const paths = this.getRunnerTokenPaths(kanbanUri);
+    const preparedKanbanUri = await this.prepareRunnerKanbanLocation(kanbanUri);
+    const paths = this.getRunnerTokenPaths(preparedKanbanUri);
     const destination = path.join(paths.kanbanDir, "codex_runner.csx");
     if (existsSync(destination)) {
-      return destination;
+      return { runnerPath: destination, kanbanUri: preparedKanbanUri };
     }
 
     const source = this.context.asAbsolutePath("codex_runner.csx");
     const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
-    return destination;
+    return { runnerPath: destination, kanbanUri: preparedKanbanUri };
+  }
+
+  private async prepareRunnerKanbanLocation(
+    kanbanUri: vscode.Uri
+  ): Promise<vscode.Uri> {
+    const kanbanDir = path.dirname(kanbanUri.fsPath);
+    if (path.basename(kanbanDir).toLowerCase() === "tasks") {
+      return kanbanUri;
+    }
+
+    const tasksUri = vscode.Uri.file(path.join(kanbanDir, "tasks"));
+    await vscode.workspace.fs.createDirectory(tasksUri);
+    const destinationUri = vscode.Uri.joinPath(
+      tasksUri,
+      path.basename(kanbanUri.fsPath)
+    );
+    if (destinationUri.toString() === kanbanUri.toString()) {
+      return kanbanUri;
+    }
+
+    try {
+      await vscode.workspace.fs.stat(destinationUri);
+      return destinationUri;
+    } catch {
+      await vscode.workspace.fs.rename(kanbanUri, destinationUri, {
+        overwrite: false,
+      });
+      return destinationUri;
+    }
   }
 
   private async probeRunnerStatus(
@@ -2857,23 +2916,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const messageHtml = runnerStatus.message
         ? \`<div class="runner-panel-message">\${escapeHtml(runnerStatus.message)}</div>\`
         : "";
-      const requirementEntries = Object.values(runnerStatus.requirements || {});
-      const missingRequirements = requirementEntries.filter((requirement) => !requirement.installed);
-      const requirementsHtml = requirementEntries.length
+      const missingRequirements = Object.values(runnerStatus.requirements || {})
+        .filter((requirement) => !requirement.installed);
+      const requirementsHtml = missingRequirements.length
         ? \`
           <div class="runner-requirements">
-            \${requirementEntries.map((requirement) => {
-              const status = requirement.installed
-                ? \`OK\${requirement.version ? " " + escapeHtml(requirement.version) : ""}\`
-                : "Missing";
-              const action = requirement.installed
-                ? ""
-                : \`<button type="button" data-action-type="openRunnerLink" data-action-url="\${escapeHtml(requirement.installUrl)}">Install</button>\`;
+            \${missingRequirements.map((requirement) => {
               return \`
-                <div class="runner-requirement \${requirement.installed ? "ok" : "missing"}">
+                <div class="runner-requirement missing">
                   <span>\${escapeHtml(requirement.label)}</span>
-                  <span class="runner-requirement-status">\${status}</span>
-                  \${action}
+                  <span class="runner-requirement-status">Missing</span>
+                  <button type="button" data-action-type="openRunnerLink" data-action-url="\${escapeHtml(requirement.installUrl)}">Install</button>
                 </div>
               \`;
             }).join("")}
@@ -2884,13 +2937,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerPanelEl.innerHTML = \`
           <div>
             <div class="runner-panel-title">No local runner script found</div>
-            <p class="runner-panel-text">Create codex_runner.csx beside this .kanban file, then start it for this board.</p>
+            <p class="runner-panel-text">Initialize runner support: create tasks/, move this .kanban there, and add codex_runner.csx beside it.</p>
             \${messageHtml}
             \${requirementsHtml}
           </div>
           <button type="button" data-action-type="createRunner" \${runnerCreatePending ? "disabled" : ""}>
-            \${runnerCreatePending ? "Creating..." : "Create runner"}
+            \${runnerCreatePending ? "Initializing..." : "Initialize runner"}
           </button>
+          <button type="button" data-action-type="hideRunnerPanel">Hide</button>
         \`;
         return;
       }
@@ -2904,6 +2958,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <button type="button" data-action-type="startRunner" \${runnerStartPending || missingRequirements.length ? "disabled" : ""}>
           \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
         </button>
+        <button type="button" data-action-type="hideRunnerPanel">Hide</button>
       \`;
     };
 
@@ -3727,12 +3782,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         if (
           actionType !== "startRunner" &&
           actionType !== "createRunner" &&
-          actionType !== "openRunnerLink"
+          actionType !== "openRunnerLink" &&
+          actionType !== "hideRunnerPanel"
         ) {
           return;
         }
         event.preventDefault();
         event.stopPropagation();
+        if (actionType === "hideRunnerPanel") {
+          runnerStatus = { enabled: false, running: false };
+          renderRunnerPanel();
+          vscode.postMessage({ type: "hideRunnerPanel" });
+          return;
+        }
         if (actionType === "openRunnerLink") {
           const url = actionButton.getAttribute("data-action-url");
           if (url) {
