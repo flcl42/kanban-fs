@@ -2,7 +2,7 @@
 
 `codex_runner.csx` watches a `kanban-fs`-style board under `tasks/`, starts up to 5 Codex agents for cards in `tasks/backlog/`, and moves cards across `doing`, `blocked`, `done`, and `confirmed`.
 
-The runner bootstraps a missing board root on startup. If needed, it creates `.gitignore`, `tasks/`, `projects/`, `cache/`, `trash/`, `logs/`, `projects.md`, `context.md`, `tasks/.kanban`, and `tasks/template.md`, plus the task folders in this order: `new`, `backlog`, `doing`, `blocked`, `done`, `confirmed`. When `.gitignore`, `context.md`, or `tasks/template.md` already exist in the launch board, their current contents are used as the seed for the new root.
+The runner bootstraps a missing board root on startup. If needed, it creates `.gitignore`, `tasks/`, `projects/`, `cache/`, `trash/`, `logs/`, `projects.md`, `context.md`, `tasks/.kanban`, and `tasks/template.md`, plus the initial task folders in this order: `new`, `backlog`, `doing`, `done`, `confirmed`. The `blocked` folder is created on demand when a task blocks. When `.gitignore`, `context.md`, or `tasks/template.md` already exist in the launch board, their current contents are used as the seed for the new root.
 
 The script now runs on Windows, Linux, and macOS. Windows keeps clickable toast notifications, Linux uses `notify-send` when available, macOS uses `osascript`, and unsupported environments fall back to the log.
 
@@ -28,12 +28,11 @@ The runner expects this root layout:
    ├─ new/
    ├─ backlog/
    ├─ doing/
-   ├─ blocked/
    ├─ done/
    └─ confirmed/
 ```
 
-`new/` is a staging column for cards that are not ready to run yet. `codex_runner` only starts work from `tasks/backlog/`.
+`new/` is a staging column for cards that are not ready to run yet. `codex_runner` only starts work from `tasks/backlog/`. `blocked/` is created automatically the first time a task needs user input.
 
 ## `projects.md`
 
@@ -67,7 +66,7 @@ Short description of the work.
 
 Behavior:
 
-- `Project:` picks the repo alias from `projects.md`.
+- `Project:` picks the repo alias from `projects.md`. Use `Project: blank` or `Project: -` for an empty workspace that is moved to `trash/` when the task is done.
 - `Agent:` stores the Codex session id so a task can resume later.
 - `Repo:` stores the repo working-copy path or cache path.
 - `## Comments` is for open questions, blockers, and missing context.

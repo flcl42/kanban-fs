@@ -237,17 +237,32 @@ sealed class TaskOrchestrator
 
                 if (string.IsNullOrWhiteSpace(card.ProjectAlias))
                 {
-                    await BlockTaskForIssueAsync(card, "Missing `Project:` field.", cancellationToken);
+                    await BlockTaskForIssueAsync(
+                        card,
+                        "Missing `Project:` field. Create the task with `Project:` set to an alias from projects.md, or use `Project: blank` / `Project: -` for an empty workspace.",
+                        cancellationToken);
                     continue;
                 }
 
-                if (!projectMap.TryGetValue(card.ProjectAlias, out var repoUrl))
+                ProjectAssignment assignment;
+                if (ProjectAliases.IsBlank(card.ProjectAlias))
                 {
-                    await BlockTaskForIssueAsync(card, $"Unknown project alias `{card.ProjectAlias}` in projects.md.", cancellationToken);
+                    assignment = ProjectAssignment.Blank;
+                }
+                else if (projectMap.TryGetValue(card.ProjectAlias, out var repoUrl))
+                {
+                    assignment = ProjectAssignment.Repository(card.ProjectAlias, repoUrl);
+                }
+                else
+                {
+                    await BlockTaskForIssueAsync(
+                        card,
+                        $"Unknown project alias `{card.ProjectAlias}` in projects.md. Use an alias from projects.md, or use `Project: blank` / `Project: -` for an empty workspace.",
+                        cancellationToken);
                     continue;
                 }
 
-                await StartOrResumeTaskAsync(card, repoUrl, cancellationToken);
+                await StartOrResumeTaskAsync(card, assignment, cancellationToken);
             }
         }
         finally
@@ -266,6 +281,7 @@ sealed class TaskOrchestrator
 
         _lastRepositorySweepUtc = now;
         await CacheCompletedRepositoriesAsync(cancellationToken);
+        await TrashCompletedBlankWorkspacesAsync(cancellationToken);
         await TrashOrphanRepositoriesAsync(cancellationToken);
     }
 
@@ -296,6 +312,11 @@ sealed class TaskOrchestrator
             }
 
             if (referenceGroup.Any(reference => !reference.IsConfirmed))
+            {
+                continue;
+            }
+
+            if (referenceGroup.Any(reference => ProjectAliases.IsBlank(reference.ProjectAlias)))
             {
                 continue;
             }
@@ -354,6 +375,42 @@ sealed class TaskOrchestrator
         }
     }
 
+    private async Task TrashCompletedBlankWorkspacesAsync(CancellationToken cancellationToken)
+    {
+        foreach (var taskPath in EnumerateStepTasks(TaskStep.Done).Concat(EnumerateStepTasks(TaskStep.Confirmed)))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!TryInferManagedTaskStep(taskPath, out var step) ||
+                !TryLoadTaskCard(taskPath, step, out var card))
+            {
+                continue;
+            }
+
+            await TrashCompletedBlankWorkspaceAsync(card, cancellationToken);
+        }
+    }
+
+    private async Task TrashCompletedBlankWorkspaceAsync(TaskCard card, CancellationToken cancellationToken)
+    {
+        if (!ProjectAliases.IsBlank(card.ProjectAlias) || string.IsNullOrWhiteSpace(card.RepoPath))
+        {
+            return;
+        }
+
+        var repoPath = Path.GetFullPath(card.RepoPath);
+        if (!Directory.Exists(repoPath) || PathStartsWith(repoPath, _paths.TrashRoot))
+        {
+            return;
+        }
+
+        var trashProjectDir = Path.Combine(_paths.TrashRoot, ProjectAliases.BlankWorkspaceAlias);
+        Directory.CreateDirectory(trashProjectDir);
+        var destination = MakeUniqueDirectoryPath(trashProjectDir, Path.GetFileName(repoPath));
+        await _workspaceMover.MoveDirectoryAsync(repoPath, destination, cancellationToken);
+        await card.WithUpdatedRepoPathAsync(destination, cancellationToken);
+        _log.Info($"Moved blank workspace to trash: {destination}");
+    }
+
     private async Task ReactivateDoneCardsAsync(CancellationToken cancellationToken)
     {
         foreach (var taskPath in EnumerateStepTasks(TaskStep.Done))
@@ -391,7 +448,7 @@ sealed class TaskOrchestrator
         }
     }
 
-    private async Task StartOrResumeTaskAsync(TaskCard backlogCard, string repoUrl, CancellationToken cancellationToken)
+    private async Task StartOrResumeTaskAsync(TaskCard backlogCard, ProjectAssignment assignment, CancellationToken cancellationToken)
     {
         var doingPath = await MoveTaskAsync(backlogCard, TaskStep.Doing, cancellationToken);
         var doingCard = TaskCard.Load(doingPath, TaskStep.Doing, _paths);
@@ -399,7 +456,7 @@ sealed class TaskOrchestrator
         string repoPath;
         try
         {
-            repoPath = await EnsureWorkingRepositoryAsync(doingCard, repoUrl, cancellationToken);
+            repoPath = await EnsureWorkingRepositoryAsync(doingCard, assignment, cancellationToken);
             doingCard = await doingCard.WithUpdatedRepoPathAsync(repoPath, cancellationToken);
         }
         catch (Exception ex)
@@ -457,9 +514,9 @@ sealed class TaskOrchestrator
         }, CancellationToken.None);
     }
 
-    private async Task<string> EnsureWorkingRepositoryAsync(TaskCard card, string repoUrl, CancellationToken cancellationToken)
+    private async Task<string> EnsureWorkingRepositoryAsync(TaskCard card, ProjectAssignment assignment, CancellationToken cancellationToken)
     {
-        var repoBaseDir = Path.Combine(_paths.ProjectsRoot, FileName.Sanitize(card.ProjectAlias));
+        var repoBaseDir = Path.Combine(_paths.ProjectsRoot, FileName.Sanitize(assignment.WorkspaceAlias));
         var preferredRepoFolderName = FileName.Sanitize(Path.GetFileNameWithoutExtension(card.FileName));
 
         if (!string.IsNullOrWhiteSpace(card.RepoPath))
@@ -467,6 +524,11 @@ sealed class TaskOrchestrator
             var recordedPath = Path.GetFullPath(card.RepoPath);
             if (Directory.Exists(recordedPath))
             {
+                if (assignment.UsesBlankWorkspace)
+                {
+                    return recordedPath;
+                }
+
                 if (PathStartsWith(recordedPath, _paths.CacheRoot))
                 {
                     var restoredPath = MakeUniqueDirectoryPath(
@@ -480,6 +542,14 @@ sealed class TaskOrchestrator
                 await GitCli.RefreshAsync(recordedPath, _log, cancellationToken);
                 return recordedPath;
             }
+        }
+
+        if (assignment.UsesBlankWorkspace)
+        {
+            Directory.CreateDirectory(repoBaseDir);
+            var workspacePath = MakeUniqueDirectoryPath(repoBaseDir, preferredRepoFolderName);
+            Directory.CreateDirectory(workspacePath);
+            return workspacePath;
         }
 
         var cacheProjectDir = Path.Combine(_paths.CacheRoot, FileName.Sanitize(card.ProjectAlias));
@@ -503,7 +573,7 @@ sealed class TaskOrchestrator
         Directory.CreateDirectory(repoBaseDir);
 
         var repoPath = MakeUniqueDirectoryPath(repoBaseDir, preferredRepoFolderName);
-        await GitCli.CloneAsync(repoUrl, repoPath, _log, cancellationToken);
+        await GitCli.CloneAsync(assignment.RepoUrl!, repoPath, _log, cancellationToken);
         return repoPath;
     }
 
@@ -522,6 +592,9 @@ sealed class TaskOrchestrator
                 var donePath = await MoveTaskAsync(card, TaskStep.Done, cancellationToken);
                 _log.Info($"Task completed: {donePath}");
                 _notifications.Show("Task complete", Path.GetFileName(donePath), donePath);
+                await TrashCompletedBlankWorkspaceAsync(
+                    TaskCard.Load(donePath, TaskStep.Done, _paths),
+                    cancellationToken);
                 break;
 
             case AgentOutcome.Blocked:
@@ -1731,6 +1804,7 @@ Requirements:
 - Read the task file, `{workingDirectoryToken}/README.md`, and `{workingDirectoryToken}/context.md` before doing any work.
 - Follow `{workingDirectoryToken}/context.md` for task-card conventions, question formatting, and report handling.
 - Work only inside the repository path and the task file.
+- If the repository path is not a Git repository, treat it as an empty task workspace.
 - Do not change `Project:`, `Agent:`, or `Repo:` lines.
 - Keep `## Comments` and `### Report` aligned with the current state.
 - Do not move the task file between folders; `codex_runner` does that.
@@ -1897,7 +1971,6 @@ sealed class BoardPaths
             new KanbanFolder("new", newRoot),
             new KanbanFolder("backlog", backlogRoot),
             new KanbanFolder("doing", doingRoot),
-            new KanbanFolder("blocked", blockedRoot),
             new KanbanFolder("done", doneRoot),
             new KanbanFolder("confirmed", confirmedRoot)
         };
@@ -1919,7 +1992,6 @@ sealed class BoardPaths
             newRoot,
             backlogRoot,
             doingRoot,
-            blockedRoot,
             doneRoot,
             confirmedRoot
         };
@@ -2043,6 +2115,27 @@ sealed class OrchestratorSettings
 
 sealed record ActiveAgent(string TaskPath, string RepoPath, string AgentId);
 
+sealed record ProjectAssignment(string WorkspaceAlias, string? RepoUrl, bool UsesBlankWorkspace)
+{
+    public static ProjectAssignment Blank { get; } =
+        new(ProjectAliases.BlankWorkspaceAlias, null, true);
+
+    public static ProjectAssignment Repository(string alias, string repoUrl) =>
+        new(alias, repoUrl, false);
+}
+
+static class ProjectAliases
+{
+    public const string BlankWorkspaceAlias = "blank";
+
+    public static bool IsBlank(string? alias)
+    {
+        var normalized = alias?.Trim();
+        return string.Equals(normalized, BlankWorkspaceAlias, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(normalized, "-", StringComparison.Ordinal);
+    }
+}
+
 sealed record TaskRepositoryReference(
     string TaskPath,
     string? ProjectAlias,
@@ -2129,7 +2222,7 @@ static class BoardTemplates
 
         ## General rules
 
-        - Work only inside the assigned repository path and the task file.
+        - Work only inside the assigned repository/workspace path and the task file.
         - Don't push anything unless explicitly asked.
         - Don't commit unless explicitly asked.
         - If you do commit, use a short informative message without a prefix like `fix` or `chore`.
