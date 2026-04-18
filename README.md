@@ -4,6 +4,10 @@
 
 ai-kanban is a VS Code Kanban board backed by normal folders and Markdown files. It works as a simple local task board by default, and it can optionally run a background Codex runner for AI-assisted task execution.
 
+## Preview
+
+![ai-kanban board with cards, tags, columns, and task details](docs/kanban.png)
+
 ## Install
 
 Install from the Visual Studio Marketplace:
