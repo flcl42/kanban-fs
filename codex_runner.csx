@@ -6,7 +6,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -24,6 +26,7 @@ sealed class TaskOrchestrator
     private readonly BoardPaths _paths;
     private readonly LogSink _log;
     private readonly NotificationService _notifications;
+    private readonly WorkspaceMoveBridge _workspaceMover;
     private readonly ConcurrentDictionary<string, ActiveAgent> _activeAgents = new(PathTraits.Comparer);
     private readonly SemaphoreSlim _reconcileGate = new(1, 1);
     private readonly SemaphoreSlim _scanSignal = new(0, 1);
@@ -39,6 +42,7 @@ sealed class TaskOrchestrator
         _paths = new BoardPaths(settings.RootPath);
         _log = new LogSink(Path.Combine(_paths.LogsRoot, "codex_runner.log"));
         _notifications = new NotificationService(_log);
+        _workspaceMover = new WorkspaceMoveBridge(_paths.Root, _log);
     }
 
     public async Task RunAsync()
@@ -290,7 +294,7 @@ sealed class TaskOrchestrator
             Directory.CreateDirectory(cacheProjectDir);
 
             var destination = MakeUniqueDirectoryPath(cacheProjectDir, Path.GetFileName(repoPath));
-            Directory.Move(repoPath, destination);
+            await _workspaceMover.MoveDirectoryAsync(repoPath, destination, cancellationToken);
             foreach (var reference in referenceGroup)
             {
                 if (reference.ManagedCard is not null)
@@ -330,7 +334,7 @@ sealed class TaskOrchestrator
             Directory.CreateDirectory(trashProjectDir);
 
             var destination = MakeUniqueDirectoryPath(trashProjectDir, Path.GetFileName(repoPath));
-            Directory.Move(repoPath, destination);
+            await _workspaceMover.MoveDirectoryAsync(repoPath, destination, cancellationToken);
             _log.Info($"Moved orphaned repo to trash: {destination}");
         }
     }
@@ -351,7 +355,7 @@ sealed class TaskOrchestrator
                 continue;
             }
 
-            var backlogPath = MoveTask(card, TaskStep.Backlog);
+            var backlogPath = await MoveTaskAsync(card, TaskStep.Backlog, cancellationToken);
             _log.Info($"Requeued done task because Comments is non-empty: {backlogPath}");
             SignalScan();
         }
@@ -374,7 +378,7 @@ sealed class TaskOrchestrator
 
     private async Task StartOrResumeTaskAsync(TaskCard backlogCard, string repoUrl, CancellationToken cancellationToken)
     {
-        var doingPath = MoveTask(backlogCard, TaskStep.Doing);
+        var doingPath = await MoveTaskAsync(backlogCard, TaskStep.Doing, cancellationToken);
         var doingCard = TaskCard.Load(doingPath, TaskStep.Doing, _paths);
 
         string repoPath;
@@ -453,8 +457,7 @@ sealed class TaskOrchestrator
                     var restoredPath = MakeUniqueDirectoryPath(
                         repoBaseDir,
                         preferredRepoFolderName);
-                    Directory.CreateDirectory(Path.GetDirectoryName(restoredPath)!);
-                    Directory.Move(recordedPath, restoredPath);
+                    await _workspaceMover.MoveDirectoryAsync(recordedPath, restoredPath, cancellationToken);
                     await GitCli.RefreshAsync(restoredPath, _log, cancellationToken);
                     return restoredPath;
                 }
@@ -476,8 +479,7 @@ sealed class TaskOrchestrator
                 var restoredPath = MakeUniqueDirectoryPath(
                     repoBaseDir,
                     preferredRepoFolderName);
-                Directory.CreateDirectory(Path.GetDirectoryName(restoredPath)!);
-                Directory.Move(reusableRepo, restoredPath);
+                await _workspaceMover.MoveDirectoryAsync(reusableRepo, restoredPath, cancellationToken);
                 await GitCli.RefreshAsync(restoredPath, _log, cancellationToken);
                 return restoredPath;
             }
@@ -502,13 +504,13 @@ sealed class TaskOrchestrator
         switch (status)
         {
             case AgentOutcome.Done:
-                var donePath = MoveTask(card, TaskStep.Done);
+                var donePath = await MoveTaskAsync(card, TaskStep.Done, cancellationToken);
                 _log.Info($"Task completed: {donePath}");
                 _notifications.Show("Task complete", Path.GetFileName(donePath), donePath);
                 break;
 
             case AgentOutcome.Blocked:
-                var blockedPath = MoveTask(card, TaskStep.Blocked);
+                var blockedPath = await MoveTaskAsync(card, TaskStep.Blocked, cancellationToken);
                 _log.Info($"Task blocked: {blockedPath}");
                 _notifications.Show("Task blocked", Path.GetFileName(blockedPath), blockedPath);
                 break;
@@ -516,7 +518,7 @@ sealed class TaskOrchestrator
             default:
                 if (TaskCard.Load(card.Path, TaskStep.Doing, _paths).HasMeaningfulComments)
                 {
-                    var inferredBlockedPath = MoveTask(card, TaskStep.Blocked);
+                    var inferredBlockedPath = await MoveTaskAsync(card, TaskStep.Blocked, cancellationToken);
                     _log.Warn($"No explicit status; inferred blocked from non-empty Comments: {inferredBlockedPath}");
                     _notifications.Show("Task blocked", Path.GetFileName(inferredBlockedPath), inferredBlockedPath);
                     break;
@@ -530,12 +532,12 @@ sealed class TaskOrchestrator
     private async Task BlockTaskForIssueAsync(TaskCard card, string issue, CancellationToken cancellationToken)
     {
         var updatedCard = await card.AppendCommentTopicAsync($"[codex_runner] {issue}", cancellationToken);
-        var blockedPath = MoveTask(updatedCard, TaskStep.Blocked);
+        var blockedPath = await MoveTaskAsync(updatedCard, TaskStep.Blocked, cancellationToken);
         _log.Warn($"Moved task to blocked: {blockedPath}. Reason: {issue}");
         _notifications.Show("Task blocked", Path.GetFileName(blockedPath), blockedPath);
     }
 
-    private string MoveTask(TaskCard card, TaskStep destinationStep)
+    private async Task<string> MoveTaskAsync(TaskCard card, TaskStep destinationStep, CancellationToken cancellationToken)
     {
         if (card.Step == destinationStep)
         {
@@ -552,7 +554,7 @@ sealed class TaskOrchestrator
             destinationPath = MakeUniqueFilePath(destinationPath);
         }
 
-        File.Move(card.Path, destinationPath);
+        await _workspaceMover.MoveFileAsync(card.Path, destinationPath, cancellationToken);
         _log.Info($"Moved task: {card.Path} -> {destinationPath}");
         return destinationPath;
     }
@@ -745,6 +747,161 @@ sealed class TaskOrchestrator
         return normalizedCandidate.StartsWith(normalizedRoot, PathTraits.Comparison);
     }
 }
+
+sealed class WorkspaceMoveBridge
+{
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromMilliseconds(250);
+    private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMilliseconds(1000);
+    private readonly string _boardRoot;
+    private readonly LogSink _log;
+
+    public WorkspaceMoveBridge(string boardRoot, LogSink log)
+    {
+        _boardRoot = Path.GetFullPath(boardRoot);
+        _log = log;
+    }
+
+    public async Task MoveFileAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
+    {
+        if (PathEquals(sourcePath, destinationPath))
+        {
+            return;
+        }
+
+        if (await TryMoveViaExtensionAsync(sourcePath, destinationPath, "file", cancellationToken))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+        File.Move(sourcePath, destinationPath);
+    }
+
+    public async Task MoveDirectoryAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
+    {
+        if (PathEquals(sourcePath, destinationPath))
+        {
+            return;
+        }
+
+        if (await TryMoveViaExtensionAsync(sourcePath, destinationPath, "directory", cancellationToken))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
+        Directory.Move(sourcePath, destinationPath);
+    }
+
+    private async Task<bool> TryMoveViaExtensionAsync(string sourcePath, string destinationPath, string entryType, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(
+                ".",
+                WorkspaceMoveProtocol.GetPipeName(_boardRoot),
+                PipeDirection.InOut,
+                PipeOptions.Asynchronous);
+            using var connectCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            connectCts.CancelAfter(ConnectTimeout);
+            await client.ConnectAsync(connectCts.Token);
+
+            using var writer = new StreamWriter(client, new UTF8Encoding(false), leaveOpen: true)
+            {
+                AutoFlush = true
+            };
+            using var reader = new StreamReader(client, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
+
+            var request = new WorkspaceMoveRequest(
+                1,
+                "move",
+                _boardRoot,
+                Path.GetFullPath(sourcePath),
+                Path.GetFullPath(destinationPath),
+                entryType);
+            await writer.WriteLineAsync(JsonSerializer.Serialize(request));
+
+            using var responseCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            responseCts.CancelAfter(ResponseTimeout);
+            var responseTask = reader.ReadLineAsync();
+            var completedTask = await Task.WhenAny(responseTask, Task.Delay(Timeout.InfiniteTimeSpan, responseCts.Token));
+            if (completedTask != responseTask)
+            {
+                return false;
+            }
+
+            var responseLine = await responseTask;
+            if (string.IsNullOrWhiteSpace(responseLine))
+            {
+                return false;
+            }
+
+            var response = JsonSerializer.Deserialize<WorkspaceMoveResponse>(responseLine);
+            if (response?.Ok == true)
+            {
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(response?.Error))
+            {
+                _log.Warn($"VS Code move bridge rejected {entryType} move `{sourcePath}` -> `{destinationPath}`: {response.Error}");
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"VS Code move bridge failed for `{sourcePath}` -> `{destinationPath}`: {ex.Message}");
+        }
+
+        return false;
+    }
+
+    private static bool PathEquals(string left, string right) =>
+        string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+}
+
+static class WorkspaceMoveProtocol
+{
+    public static string GetPipeName(string boardRoot) => $"kanban-fs-mover-{HashPath(boardRoot)}";
+
+    public static string NormalizePath(string path)
+    {
+        var normalized = Path.GetFullPath(path).Replace('\\', '/');
+        if (normalized.Length > 3)
+        {
+            normalized = normalized.TrimEnd('/');
+        }
+
+        return normalized.ToLowerInvariant();
+    }
+
+    private static string HashPath(string path)
+    {
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(NormalizePath(path)));
+        return Convert.ToHexString(bytes[..8]).ToLowerInvariant();
+    }
+}
+
+sealed record WorkspaceMoveRequest(
+    int Version,
+    string Command,
+    string BoardRoot,
+    string SourcePath,
+    string DestinationPath,
+    string EntryType);
+
+sealed record WorkspaceMoveResponse(bool Ok, string? Error);
 
 sealed class CodexRunner
 {
@@ -1380,7 +1537,7 @@ static class PromptFactory
             : "Resume the existing session, reread the task file, and continue from the current state.";
         var readmePath = Path.Combine(boardRoot, "README.md");
         var contextPath = Path.Combine(boardRoot, "context.md");
-
+        const string workingDirectoryToken = "{working directory}";
         return $"""
 You are handling a kanban task for a local `codex_runner` board.
 
@@ -1389,10 +1546,10 @@ Task file: {taskPath}
 Repository path: {repoPath}
 Board README: {readmePath}
 Shared context: {contextPath}
-
+`{workingDirectoryToken}` means `{boardRoot}`.
 Requirements:
-- Read the task file, `README.md`, and `context.md` before doing any work.
-- Follow `context.md` for task-card conventions, question formatting, and report handling.
+- Read the task file, `{workingDirectoryToken}/README.md`, and `{workingDirectoryToken}/context.md` before doing any work.
+- Follow `{workingDirectoryToken}/context.md` for task-card conventions, question formatting, and report handling.
 - Work only inside the repository path and the task file.
 - Do not change `Project:`, `Agent:`, or `Repo:` lines.
 - Keep `## Comments` and `### Report` aligned with the current state.
@@ -1788,7 +1945,7 @@ static class BoardTemplates
         """
         # Task Agent Context
 
-        Read this file, the board `README.md`, and the task file before doing any work.
+        Read this file, the `{working directory}/README.md`, and the task file before doing any work.
 
         ## General rules
 
@@ -1797,9 +1954,11 @@ static class BoardTemplates
         - Don't commit unless explicitly asked.
         - If you do commit, use a short informative message without a prefix like `fix` or `chore`.
         - Keep task markdown tidy.
-        - Read `knowledge/README.md` and check whether any linked reference is relevant to the task.
+        - Read `{working directory}/knowledge/README.md` and check whether any linked reference is relevant to the task.
         - Confirm you use up to date branches, pull if needed.
-        - Use default branch like master or main (stash changes if present, checkout the branch, pull), if specific one is not mentioned.
+        - Use default branch like master or main (stash changes if present, nothing should be there, checkout the branch, pull), if specific one is not mentioned.
+        - If a cached repo contains uncommitted changes, stash them all so no changed will interfere with new task! Mention it in the task
+        - When asked to checkout a branch or merge another branch then use most recent state available at remote by default, if not asked to use local branch
 
         ## Task file conventions
 
@@ -1810,25 +1969,26 @@ static class BoardTemplates
         - Separate unrelated comment topics with a line that is exactly `===`.
         - Use `### Report` for completion notes, handoff details, or a concise summary of what changed.
         - Leave `## Comments` empty when the task is not blocked and no user input is needed.
+        - Interpret cited comments (>  ...) as yours, if they don't make sense ignore them
+        - Improve markdown
 
         ## Final message
 
         - End with exactly one status block.
         - If blocked:
-          `ORCHESTRATOR_STATUS: BLOCKED`
-          `ORCHESTRATOR_SUMMARY: <one sentence>`
+        `ORCHESTRATOR_STATUS: BLOCKED`
+        `ORCHESTRATOR_SUMMARY: <one sentence>`
         - If done:
-          `ORCHESTRATOR_STATUS: DONE`
-          `ORCHESTRATOR_SUMMARY: <one sentence>`
-
+        `ORCHESTRATOR_STATUS: DONE`
+        `ORCHESTRATOR_SUMMARY: <one sentence>`
         """;
 
     private static string DefaultTaskTemplate =>
         """
-        # 
+        # {{TITLE}}
 
         Tags: 
-        Project: 
+        Project: {{CURSOR}}
 
         ## Description
 
