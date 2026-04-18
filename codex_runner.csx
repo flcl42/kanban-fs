@@ -8,6 +8,8 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -27,7 +29,7 @@ sealed class TaskOrchestrator
     private readonly LogSink _log;
     private readonly NotificationService _notifications;
     private readonly WorkspaceMoveBridge _workspaceMover;
-    private readonly RunnerHeartbeat _heartbeat;
+    private readonly RunnerStatusServer _statusServer;
     private readonly ConcurrentDictionary<string, ActiveAgent> _activeAgents = new(PathTraits.Comparer);
     private readonly SemaphoreSlim _reconcileGate = new(1, 1);
     private readonly SemaphoreSlim _scanSignal = new(0, 1);
@@ -44,7 +46,7 @@ sealed class TaskOrchestrator
         _log = new LogSink(Path.Combine(_paths.LogsRoot, "codex_runner.log"));
         _notifications = new NotificationService(_log);
         _workspaceMover = new WorkspaceMoveBridge(_paths.Root, _log);
-        _heartbeat = new RunnerHeartbeat(_paths.RunnerHeartbeatPath, _paths.Root, _paths.TasksRoot, _log);
+        _statusServer = new RunnerStatusServer(_paths.Root, _paths.TasksRoot, _log);
     }
 
     public async Task RunAsync()
@@ -65,7 +67,7 @@ sealed class TaskOrchestrator
                 return;
             }
 
-            _heartbeat.Start();
+            _statusServer.Start();
             StartWatchers();
             SignalScan();
             _scanLoopTask = ScanLoopAsync(_cts.Token);
@@ -75,7 +77,7 @@ sealed class TaskOrchestrator
         }
         finally
         {
-            await _heartbeat.StopAsync();
+            await _statusServer.StopAsync();
             Console.CancelKeyPress -= OnCancelKeyPress;
             _tasksWatcher?.Dispose();
             _rootWatcher?.Dispose();
@@ -916,135 +918,170 @@ sealed record WorkspaceMoveRequest(
 
 sealed record WorkspaceMoveResponse(bool Ok, string? Error);
 
-sealed class RunnerHeartbeat
+sealed class RunnerStatusServer
 {
-    private static readonly TimeSpan Interval = TimeSpan.FromSeconds(5);
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
-    private readonly string _heartbeatPath;
     private readonly string _rootPath;
+    private readonly string _normalizedRootPath;
     private readonly string _kanbanPath;
     private readonly LogSink _log;
     private readonly int _processId = Process.GetCurrentProcess().Id;
     private readonly DateTimeOffset _startedAtUtc = DateTimeOffset.UtcNow;
     private readonly CancellationTokenSource _cts = new();
-    private Task? _loopTask;
-    private bool _started;
+    private TcpListener? _listener;
+    private Task? _acceptLoopTask;
+    private int _port;
 
-    public RunnerHeartbeat(string heartbeatPath, string rootPath, string kanbanPath, LogSink log)
+    public RunnerStatusServer(string rootPath, string kanbanPath, LogSink log)
     {
-        _heartbeatPath = heartbeatPath;
         _rootPath = Path.GetFullPath(rootPath);
+        _normalizedRootPath = RunnerStatusProtocol.NormalizePath(_rootPath);
         _kanbanPath = Path.GetFullPath(kanbanPath);
         _log = log;
     }
 
     public void Start()
     {
-        if (_started)
+        if (_listener is not null)
         {
             return;
         }
 
-        _started = true;
-        _loopTask = Task.Run(LoopAsync);
+        foreach (var port in RunnerStatusProtocol.GetCandidatePorts(_rootPath))
+        {
+            try
+            {
+                var listener = new TcpListener(IPAddress.Loopback, port);
+                listener.Start();
+                _listener = listener;
+                _port = port;
+                _acceptLoopTask = Task.Run(AcceptLoopAsync);
+                _log.Info($"Runner status endpoint listening on 127.0.0.1:{port}");
+                return;
+            }
+            catch (SocketException)
+            {
+            }
+        }
+
+        _log.Warn("Failed to start runner status endpoint; all candidate localhost ports are in use.");
     }
 
     public async Task StopAsync()
     {
-        if (!_started)
-        {
-            return;
-        }
-
         _cts.Cancel();
-        if (_loopTask is not null)
+        _listener?.Stop();
+        if (_acceptLoopTask is not null)
         {
             try
             {
-                await _loopTask;
+                await _acceptLoopTask;
             }
             catch (OperationCanceledException)
             {
             }
+            catch (ObjectDisposedException)
+            {
+            }
         }
-
-        TryDeleteHeartbeat();
         _cts.Dispose();
     }
 
-    private async Task LoopAsync()
+    private async Task AcceptLoopAsync()
     {
+        if (_listener is null)
+        {
+            return;
+        }
+
         while (!_cts.IsCancellationRequested)
         {
-            WriteHeartbeat();
+            TcpClient client;
             try
             {
-                await Task.Delay(Interval, _cts.Token);
+                client = await _listener.AcceptTcpClientAsync(_cts.Token);
             }
             catch (OperationCanceledException) when (_cts.IsCancellationRequested)
             {
                 break;
             }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (SocketException) when (_cts.IsCancellationRequested)
+            {
+                break;
+            }
+
+            _ = Task.Run(() => WriteStatusAsync(client));
         }
     }
 
-    private void WriteHeartbeat()
+    private async Task WriteStatusAsync(TcpClient client)
     {
+        using var _ = client;
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(_heartbeatPath)!);
-            var payload = new RunnerHeartbeatPayload(
+            var payload = new RunnerStatusPayload(
                 1,
-                "kanban-runner-heartbeat",
+                "kanban-runner-status",
                 _rootPath,
+                _normalizedRootPath,
                 _kanbanPath,
                 _processId,
                 _startedAtUtc,
-                DateTimeOffset.UtcNow);
-            File.WriteAllText(
-                _heartbeatPath,
-                JsonSerializer.Serialize(payload, JsonOptions),
-                new UTF8Encoding(false));
+                DateTimeOffset.UtcNow,
+                _port);
+            var json = JsonSerializer.Serialize(payload);
+            using var stream = client.GetStream();
+            var bytes = Encoding.UTF8.GetBytes(json + "\n");
+            await stream.WriteAsync(bytes, _cts.Token);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException or SocketException or OperationCanceledException)
         {
-            _log.Warn($"Failed to write runner heartbeat `{_heartbeatPath}`: {ex.Message}");
-        }
-    }
-
-    private void TryDeleteHeartbeat()
-    {
-        try
-        {
-            if (!File.Exists(_heartbeatPath))
-            {
-                return;
-            }
-
-            var payload = JsonSerializer.Deserialize<RunnerHeartbeatPayload>(
-                File.ReadAllText(_heartbeatPath, Encoding.UTF8));
-            if (payload?.ProcessId != _processId)
-            {
-                return;
-            }
-
-            File.Delete(_heartbeatPath);
-        }
-        catch (Exception ex)
-        {
-            _log.Warn($"Failed to delete runner heartbeat `{_heartbeatPath}`: {ex.Message}");
         }
     }
 }
 
-sealed record RunnerHeartbeatPayload(
+static class RunnerStatusProtocol
+{
+    private const int PortBase = 41000;
+    private const int PortRange = 20000;
+    private const int PortStep = 997;
+    private const int CandidateCount = 32;
+
+    public static IEnumerable<int> GetCandidatePorts(string boardRoot)
+    {
+        var hash = SHA256.HashData(Encoding.UTF8.GetBytes(NormalizePath(boardRoot)));
+        var seed = (hash[0] << 8) | hash[1];
+        for (var index = 0; index < CandidateCount; index++)
+        {
+            yield return PortBase + ((seed + index * PortStep) % PortRange);
+        }
+    }
+
+    public static string NormalizePath(string path)
+    {
+        var normalized = Path.GetFullPath(path).Replace('\\', '/');
+        if (normalized.Length > 3)
+        {
+            normalized = normalized.TrimEnd('/');
+        }
+
+        return normalized.ToLowerInvariant();
+    }
+}
+
+sealed record RunnerStatusPayload(
     int Version,
     string Kind,
     string RootPath,
+    string NormalizedRootPath,
     string KanbanPath,
     int ProcessId,
     DateTimeOffset StartedAtUtc,
-    DateTimeOffset UpdatedAtUtc);
+    DateTimeOffset UpdatedAtUtc,
+    int Port);
 
 sealed class CodexRunner
 {
@@ -1848,7 +1885,6 @@ sealed class BoardPaths
         ContextPath = Path.Combine(Root, "context.md");
         ProjectsMapPath = Path.Combine(Root, "projects.md");
         KanbanMarkerPath = Path.Combine(TasksRoot, ".kanban");
-        RunnerHeartbeatPath = Path.Combine(TasksRoot, ".kanban.runner.json");
         TaskTemplatePath = Path.Combine(TasksRoot, "template.md");
         var newRoot = Path.Combine(TasksRoot, "new");
         var backlogRoot = Path.Combine(TasksRoot, "backlog");
@@ -1899,7 +1935,6 @@ sealed class BoardPaths
     public string ContextPath { get; }
     public string ProjectsMapPath { get; }
     public string KanbanMarkerPath { get; }
-    public string RunnerHeartbeatPath { get; }
     public string TaskTemplatePath { get; }
     public IReadOnlyList<KanbanFolder> KanbanFolders { get; }
     public IReadOnlyList<string> RequiredDirectories { get; }
@@ -2084,7 +2119,6 @@ static class BoardTemplates
         cache/
         trash/
         logs/
-        tasks/.kanban.runner.json
         """;
 
     private static string DefaultContextTemplate =>

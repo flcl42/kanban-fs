@@ -122,7 +122,7 @@ Options:
 - `--codex-mode Dangerous|FullAuto`: how Codex runs tasks.
 - `--once`: run one reconciliation pass and exit.
 
-While running continuously, the runner writes `tasks/.kanban.runner.json` every few seconds. The VS Code Kanban view uses that heartbeat, not the runner process name or script location, to decide whether the board already has an active runner.
+While running continuously, the runner exposes a localhost status endpoint on a deterministic port sequence derived from the board root. The VS Code Kanban view probes that endpoint and validates the normalized root path, so it does not depend on the runner process name or script location and can distinguish runners for different board paths.
 
 ## Codex mode
 

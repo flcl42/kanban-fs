@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "Kanban-fs",
   "description": "Kanban board backed by folders and markdown files.",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -98,7 +98,7 @@
           "type": "boolean",
           "default": true,
           "scope": "application",
-          "description": "Show a Kanban board warning panel when no fresh runner heartbeat is detected."
+          "description": "Show a Kanban board warning panel when no runner status endpoint is detected for the board."
         },
         "kanban.runner.command": {
           "type": "string",

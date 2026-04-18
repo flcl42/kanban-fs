@@ -1,6 +1,6 @@
 # Kanban-fs (VS Code Extension)
 
-[![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/flcl42.kanban-vsix)](https://marketplace.visualstudio.com/items?itemName=flcl42.kanban-vsix)
+[![Visual Studio Marketplace Installs](https://badgen.net/vs-marketplace/i/flcl42.kanban-vsix)](https://marketplace.visualstudio.com/items?itemName=flcl42.kanban-vsix)
 
 Kanban-fs is a VS Code extension that turns a `.kanban` file into a live Kanban board. Columns are sibling directories, cards are Markdown files, the first `# H1` becomes the card title, and the details panel renders task metadata plus the Markdown body.
 
@@ -8,7 +8,7 @@ If `template.md` exists beside the board's `.kanban` file, `+ Add ticket` seeds 
 
 Press `Ctrl+F` (or `Cmd+F` on macOS) in the board view to filter cards by title, body text, tags, file name, and task properties.
 
-If no fresh `codex_runner` heartbeat is detected for a board, the view can show a runner panel with a background start action. Disable it with `kanban.runnerPanel.enabled`; customize startup with `kanban.runner.command` and `kanban.runner.args`.
+If no `codex_runner` status endpoint is detected for a board, the view can show a runner panel with a background start action. When the default local script is missing, the panel can create `codex_runner.csx` beside the opened `.kanban` file first. Disable it with `kanban.runnerPanel.enabled`; customize startup with `kanban.runner.command` and `kanban.runner.args`.
 
 `.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
 

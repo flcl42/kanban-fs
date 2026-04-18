@@ -87,6 +87,19 @@ type WorkspaceMoveResponse =
   | { ok: true }
   | { ok: false; error: string };
 
+type RunnerToolStatus = {
+  label: string;
+  command: string;
+  installed: boolean;
+  version: string;
+  installUrl: string;
+};
+
+type RunnerToolStatuses = {
+  dotnet: RunnerToolStatus;
+  codex: RunnerToolStatus;
+};
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
@@ -106,9 +119,16 @@ const RUNNER_ARGS_SETTING = "runner.args";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
-const RUNNER_HEARTBEAT_FILE_NAME = ".kanban.runner.json";
-const RUNNER_HEARTBEAT_MAX_AGE_MS = 30_000;
 const RUNNER_STATUS_REFRESH_MS = 10_000;
+const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
+const RUNNER_LAUNCH_GRACE_MS = 45_000;
+const RUNNER_STATUS_PORT_BASE = 41_000;
+const RUNNER_STATUS_PORT_RANGE = 20_000;
+const RUNNER_STATUS_PORT_STEP = 997;
+const RUNNER_STATUS_PORT_CANDIDATES = 32;
+const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
+const DOTNET_INSTALL_URL = "https://dotnet.microsoft.com/download";
+const CODEX_INSTALL_URL = "https://github.com/openai/codex";
 const DEFAULT_RUNNER_ARGS = [
   "script",
   "${runnerScript}",
@@ -352,6 +372,17 @@ function hashWorkspaceMoveRoot(root: string): string {
     .slice(0, 16);
 }
 
+function getRunnerStatusPorts(root: string): number[] {
+  const digest = createHash("sha256")
+    .update(normalizeMovePath(root), "utf8")
+    .digest();
+  const seed = (digest[0] << 8) | digest[1];
+  return Array.from({ length: RUNNER_STATUS_PORT_CANDIDATES }, (_, index) =>
+    RUNNER_STATUS_PORT_BASE +
+    ((seed + index * RUNNER_STATUS_PORT_STEP) % RUNNER_STATUS_PORT_RANGE)
+  );
+}
+
 function normalizeMovePath(inputPath: string): string {
   const resolved = path.resolve(inputPath).replace(/\\/g, "/");
   const trimmed = resolved.length > 3 ? resolved.replace(/\/+$/, "") : resolved;
@@ -459,6 +490,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
   private readonly boardConfigCache = new Map<string, BoardConfig>();
   private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
+  private readonly runnerLaunches = new Map<string, number>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
     new vscode.EventEmitter<vscode.CustomDocumentContentChangeEvent<vscode.CustomDocument>>();
@@ -601,16 +633,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const pattern = new vscode.RelativePattern(parentFolder, "**/*");
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
     this.watchers.set(key, watcher);
-    const handleBoardFileChange = (uri: vscode.Uri) => {
-      if (path.basename(uri.fsPath) === RUNNER_HEARTBEAT_FILE_NAME) {
-        void sendRunnerStatus();
-        return;
-      }
-      scheduleBoardRefresh();
-    };
-    watcher.onDidCreate(handleBoardFileChange);
-    watcher.onDidDelete(handleBoardFileChange);
-    watcher.onDidChange(handleBoardFileChange);
+    watcher.onDidCreate(scheduleBoardRefresh);
+    watcher.onDidDelete(scheduleBoardRefresh);
+    watcher.onDidChange(scheduleBoardRefresh);
 
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
       if (message?.type === "ready") {
@@ -707,6 +732,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               enabled: this.getRunnerPanelEnabledSetting(),
               running: false,
               message: `Failed to start runner: ${errorMessage}`,
+            },
+          });
+        }
+        return;
+      }
+      if (message?.type === "createRunner") {
+        try {
+          const runnerPath = await this.createRunnerScript(document.uri);
+          await sendRunnerStatus(`Created runner script: ${runnerPath}`);
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error ?? "Unknown error");
+          webviewPanel.webview.postMessage({
+            type: "runnerStatus",
+            status: {
+              enabled: this.getRunnerPanelEnabledSetting(),
+              running: false,
+              runnerScriptRequired: true,
+              runnerScriptExists: false,
+              message: `Failed to create runner: ${errorMessage}`,
             },
           });
         }
@@ -1439,13 +1484,77 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return Array.isArray(args) && args.length > 0 ? args : DEFAULT_RUNNER_ARGS;
   }
 
+  private getRunnerScriptRequiredSetting(): boolean {
+    const command = this.getRunnerCommandSetting();
+    const args = this.getRunnerArgsSetting();
+    return [command, ...args].some((value) => value.includes("${runnerScript}"));
+  }
+
+  private async getRunnerToolStatuses(): Promise<RunnerToolStatuses> {
+    const [dotnet, codex] = await Promise.all([
+      this.detectRunnerTool(
+        ".NET SDK",
+        "dotnet",
+        ["--version"],
+        DOTNET_INSTALL_URL
+      ),
+      this.detectRunnerTool(
+        "Codex CLI",
+        "codex",
+        ["--version"],
+        CODEX_INSTALL_URL
+      ),
+    ]);
+    return { dotnet, codex };
+  }
+
+  private async detectRunnerTool(
+    label: string,
+    command: string,
+    args: string[],
+    installUrl: string
+  ): Promise<RunnerToolStatus> {
+    try {
+      const result = await execFileAsync(command, args, {
+        windowsHide: true,
+        timeout: RUNNER_TOOL_CHECK_TIMEOUT_MS,
+        maxBuffer: 128 * 1024,
+        shell: process.platform === "win32",
+      });
+      const output = String(result.stdout || result.stderr || "")
+        .trim()
+        .split(/\r?\n/)
+        .find((line) => line.trim().length > 0)
+        ?.trim() ?? "";
+      return {
+        label,
+        command,
+        installed: true,
+        version: output,
+        installUrl,
+      };
+    } catch {
+      return {
+        label,
+        command,
+        installed: false,
+        version: "",
+        installUrl,
+      };
+    }
+  }
+
   private async getRunnerStatus(
     kanbanUri: vscode.Uri,
     message?: string
   ): Promise<{
     enabled: boolean;
     running: boolean;
-    heartbeatAgeSeconds?: number;
+    runnerScriptRequired?: boolean;
+    runnerScriptExists?: boolean;
+    runnerScriptPath?: string;
+    port?: number;
+    requirements?: RunnerToolStatuses;
     message?: string;
   }> {
     const enabled = this.getRunnerPanelEnabledSetting();
@@ -1453,23 +1562,62 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return { enabled: false, running: false };
     }
 
-    const heartbeatUri = vscode.Uri.joinPath(
-      kanbanUri,
-      "..",
-      RUNNER_HEARTBEAT_FILE_NAME
-    );
-    try {
-      const stat = await vscode.workspace.fs.stat(heartbeatUri);
-      const ageMs = Math.max(0, Date.now() - stat.mtime);
+    if (kanbanUri.scheme !== "file") {
       return {
         enabled: true,
-        running: ageMs <= RUNNER_HEARTBEAT_MAX_AGE_MS,
-        heartbeatAgeSeconds: Math.round(ageMs / 1000),
+        running: false,
+        message: "Runner status is only available for local file boards.",
+      };
+    }
+
+    const paths = this.getRunnerTokenPaths(kanbanUri);
+    const runnerScriptRequired = this.getRunnerScriptRequiredSetting();
+    const [probe, requirements] = await Promise.all([
+      this.probeRunnerStatus(paths.runnerRoot),
+      this.getRunnerToolStatuses(),
+    ]);
+    if (probe) {
+      this.runnerLaunches.delete(normalizeMovePath(paths.runnerRoot));
+      return {
+        enabled: true,
+        running: true,
+        runnerScriptRequired,
+        runnerScriptExists: Boolean(paths.localRunnerScript),
+        runnerScriptPath: paths.localRunnerScript ?? "",
+        port: probe.port,
+        requirements,
         message,
       };
-    } catch {
-      return { enabled: true, running: false, message };
     }
+
+    const normalizedRoot = normalizeMovePath(paths.runnerRoot);
+    const launchedAt = this.runnerLaunches.get(normalizedRoot);
+    if (launchedAt && Date.now() - launchedAt <= RUNNER_LAUNCH_GRACE_MS) {
+      return {
+        enabled: true,
+        running: true,
+        runnerScriptRequired,
+        runnerScriptExists: Boolean(paths.localRunnerScript),
+        runnerScriptPath: paths.localRunnerScript ?? "",
+        requirements,
+        message:
+          message ??
+          "Runner start requested. Waiting for its local status endpoint.",
+      };
+    }
+
+    if (launchedAt) {
+      this.runnerLaunches.delete(normalizedRoot);
+    }
+    return {
+      enabled: true,
+      running: false,
+      runnerScriptRequired,
+      runnerScriptExists: Boolean(paths.localRunnerScript),
+      runnerScriptPath: paths.localRunnerScript ?? "",
+      requirements,
+      message,
+    };
   }
 
   private async startRunner(kanbanUri: vscode.Uri): Promise<void> {
@@ -1478,6 +1626,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const paths = this.getRunnerTokenPaths(kanbanUri);
+    if (this.getRunnerScriptRequiredSetting() && !paths.localRunnerScript) {
+      throw new Error("Create a local runner script before starting this board.");
+    }
     const command = this.expandRunnerTokens(
       this.getRunnerCommandSetting(),
       paths
@@ -1508,11 +1659,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
       });
     });
+    this.runnerLaunches.set(normalizeMovePath(paths.runnerRoot), Date.now());
   }
 
   private getRunnerTokenPaths(kanbanUri: vscode.Uri): {
     kanbanDir: string;
     runnerRoot: string;
+    localRunnerScript: string | null;
     runnerScript: string;
     workspaceFolder: string;
   } {
@@ -1523,29 +1676,116 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         : kanbanDir;
     const workspaceFolder =
       vscode.workspace.getWorkspaceFolder(kanbanUri)?.uri.fsPath ?? runnerRoot;
-    const runnerScript = this.resolveRunnerScriptPath(
+    const localRunnerScript = this.resolveLocalRunnerScriptPath(
       runnerRoot,
       kanbanDir,
       workspaceFolder
     );
-    return { kanbanDir, runnerRoot, runnerScript, workspaceFolder };
+    const bundledRunnerScript = this.context.asAbsolutePath("codex_runner.csx");
+    const runnerScript = localRunnerScript ?? bundledRunnerScript;
+    return {
+      kanbanDir,
+      runnerRoot,
+      localRunnerScript,
+      runnerScript,
+      workspaceFolder,
+    };
   }
 
-  private resolveRunnerScriptPath(
+  private async createRunnerScript(kanbanUri: vscode.Uri): Promise<string> {
+    if (kanbanUri.scheme !== "file") {
+      throw new Error("Runner creation is only supported for local file boards.");
+    }
+
+    const paths = this.getRunnerTokenPaths(kanbanUri);
+    const destination = path.join(paths.kanbanDir, "codex_runner.csx");
+    if (existsSync(destination)) {
+      return destination;
+    }
+
+    const source = this.context.asAbsolutePath("codex_runner.csx");
+    const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
+    return destination;
+  }
+
+  private async probeRunnerStatus(
+    runnerRoot: string
+  ): Promise<{ port: number } | null> {
+    const normalizedRoot = normalizeMovePath(runnerRoot);
+    for (const port of getRunnerStatusPorts(runnerRoot)) {
+      const found = await this.probeRunnerStatusPort(port, normalizedRoot);
+      if (found) {
+        return { port };
+      }
+    }
+    return null;
+  }
+
+  private async probeRunnerStatusPort(
+    port: number,
+    normalizedRoot: string
+  ): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = net.createConnection({ host: "127.0.0.1", port });
+      let buffer = "";
+      let settled = false;
+      let timer: NodeJS.Timeout | undefined;
+      const finish = (running: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+        }
+        socket.destroy();
+        resolve(running);
+      };
+      const parseStatus = () => {
+        const line = buffer.trim().split(/\r?\n/)[0];
+        if (!line) {
+          return false;
+        }
+        try {
+          const payload = JSON.parse(line);
+          const kind = String(payload.Kind ?? payload.kind ?? "");
+          const payloadRoot = String(
+            payload.NormalizedRootPath ?? payload.normalizedRootPath ?? ""
+          );
+          return (
+            kind === "kanban-runner-status" &&
+            payloadRoot === normalizedRoot
+          );
+        } catch {
+          return false;
+        }
+      };
+      timer = setTimeout(() => finish(false), RUNNER_STATUS_CONNECT_TIMEOUT_MS);
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk) => {
+        buffer += chunk;
+        if (buffer.includes("\n")) {
+          finish(parseStatus());
+        }
+      });
+      socket.on("error", () => finish(false));
+      socket.on("end", () => finish(parseStatus()));
+      socket.on("close", () => finish(parseStatus()));
+    });
+  }
+
+  private resolveLocalRunnerScriptPath(
     runnerRoot: string,
     kanbanDir: string,
     workspaceFolder: string
-  ): string {
+  ): string | null {
     const candidates = [
       path.join(runnerRoot, "codex_runner.csx"),
       path.join(kanbanDir, "codex_runner.csx"),
       path.join(workspaceFolder, "codex_runner.csx"),
-      this.context.asAbsolutePath("codex_runner.csx"),
     ];
-    return (
-      candidates.find((candidate) => existsSync(candidate)) ??
-      candidates[candidates.length - 1]
-    );
+    return candidates.find((candidate) => existsSync(candidate)) ?? null;
   }
 
   private expandRunnerTokens(
@@ -2074,6 +2314,32 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       font-size: 11px;
       color: var(--muted);
     }
+    .runner-requirements {
+      display: grid;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .runner-requirement {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+    .runner-requirement-status {
+      color: var(--muted);
+    }
+    .runner-requirement.missing .runner-requirement-status {
+      color: var(--vscode-inputValidation-errorForeground, var(--ink));
+    }
+    .runner-requirement.ok .runner-requirement-status {
+      color: var(--vscode-testing-iconPassed, var(--accent));
+    }
     .runner-panel button {
       flex: 0 0 auto;
       border: 1px solid var(--vscode-button-border, transparent);
@@ -2551,6 +2817,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let searchQuery = "";
     let runnerStatus = { enabled: false, running: false };
     let runnerStartPending = false;
+    let runnerCreatePending = false;
     const gitStatusCache = new Map();
     const codexOutputCache = new Map();
     let refreshTimer = null;
@@ -2583,20 +2850,59 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerPanelEl.hidden = true;
         runnerPanelEl.innerHTML = "";
         runnerStartPending = false;
+        runnerCreatePending = false;
         return;
       }
       runnerPanelEl.hidden = false;
       const messageHtml = runnerStatus.message
         ? \`<div class="runner-panel-message">\${escapeHtml(runnerStatus.message)}</div>\`
         : "";
+      const requirementEntries = Object.values(runnerStatus.requirements || {});
+      const missingRequirements = requirementEntries.filter((requirement) => !requirement.installed);
+      const requirementsHtml = requirementEntries.length
+        ? \`
+          <div class="runner-requirements">
+            \${requirementEntries.map((requirement) => {
+              const status = requirement.installed
+                ? \`OK\${requirement.version ? " " + escapeHtml(requirement.version) : ""}\`
+                : "Missing";
+              const action = requirement.installed
+                ? ""
+                : \`<button type="button" data-action-type="openRunnerLink" data-action-url="\${escapeHtml(requirement.installUrl)}">Install</button>\`;
+              return \`
+                <div class="runner-requirement \${requirement.installed ? "ok" : "missing"}">
+                  <span>\${escapeHtml(requirement.label)}</span>
+                  <span class="runner-requirement-status">\${status}</span>
+                  \${action}
+                </div>
+              \`;
+            }).join("")}
+          </div>
+        \`
+        : "";
+      if (runnerStatus.runnerScriptRequired && !runnerStatus.runnerScriptExists) {
+        runnerPanelEl.innerHTML = \`
+          <div>
+            <div class="runner-panel-title">No local runner script found</div>
+            <p class="runner-panel-text">Create codex_runner.csx beside this .kanban file, then start it for this board.</p>
+            \${messageHtml}
+            \${requirementsHtml}
+          </div>
+          <button type="button" data-action-type="createRunner" \${runnerCreatePending ? "disabled" : ""}>
+            \${runnerCreatePending ? "Creating..." : "Create runner"}
+          </button>
+        \`;
+        return;
+      }
       runnerPanelEl.innerHTML = \`
         <div>
           <div class="runner-panel-title">No Codex runner detected</div>
           <p class="runner-panel-text">Start a background runner for this board. It keeps working if VS Code closes.</p>
           \${messageHtml}
+          \${requirementsHtml}
         </div>
-        <button type="button" data-action-type="startRunner" \${runnerStartPending ? "disabled" : ""}>
-          \${runnerStartPending ? "Starting..." : "Start runner"}
+        <button type="button" data-action-type="startRunner" \${runnerStartPending || missingRequirements.length ? "disabled" : ""}>
+          \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
         </button>
       \`;
     };
@@ -3417,11 +3723,29 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         const actionButton = event.target instanceof Element
           ? event.target.closest("[data-action-type]")
           : null;
-        if (actionButton?.getAttribute("data-action-type") !== "startRunner") {
+        const actionType = actionButton?.getAttribute("data-action-type");
+        if (
+          actionType !== "startRunner" &&
+          actionType !== "createRunner" &&
+          actionType !== "openRunnerLink"
+        ) {
           return;
         }
         event.preventDefault();
         event.stopPropagation();
+        if (actionType === "openRunnerLink") {
+          const url = actionButton.getAttribute("data-action-url");
+          if (url) {
+            vscode.postMessage({ type: "openUrl", url });
+          }
+          return;
+        }
+        if (actionType === "createRunner") {
+          runnerCreatePending = true;
+          renderRunnerPanel();
+          vscode.postMessage({ type: "createRunner" });
+          return;
+        }
         runnerStartPending = true;
         renderRunnerPanel();
         vscode.postMessage({ type: "startRunner" });
@@ -3502,6 +3826,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (message?.type === "runnerStatus") {
         runnerStatus = message.status || { enabled: false, running: false };
         runnerStartPending = false;
+        runnerCreatePending = false;
         renderRunnerPanel();
       }
       if (message?.type === "gitStatus") {

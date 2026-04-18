@@ -283,12 +283,91 @@ windowListeners.message({
     status: {
       enabled: true,
       running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: false,
+      requirements: {
+        dotnet: {
+          label: ".NET SDK",
+          command: "dotnet",
+          installed: true,
+          version: "8.0.100",
+          installUrl: "https://dotnet.microsoft.com/download",
+        },
+        codex: {
+          label: "Codex CLI",
+          command: "codex",
+          installed: false,
+          version: "",
+          installUrl: "https://github.com/openai/codex",
+        },
+      },
       message: "Runner start requested.",
     },
   },
 });
 assert.equal(runnerPanelEl.hidden, false, "runner panel should be visible when no runner is active");
+assert.match(
+  runnerPanelEl.innerHTML,
+  /No local runner script found/,
+  "runner panel should ask to create a local runner script when the default runner is missing"
+);
+assert.match(runnerPanelEl.innerHTML, /\.NET SDK/, "runner panel should show dotnet status");
+assert.match(runnerPanelEl.innerHTML, /Codex CLI/, "runner panel should show codex status");
+assert.match(runnerPanelEl.innerHTML, /8\.0\.100/, "runner panel should show installed tool versions");
+assert.match(runnerPanelEl.innerHTML, /data-action-type="openRunnerLink"/, "missing runner tools should render install links");
+
+const installCodexButton = new FakeElement("button");
+installCodexButton.setAttribute("data-action-type", "openRunnerLink");
+installCodexButton.setAttribute("data-action-url", "https://github.com/openai/codex");
+installCodexButton.closest = () => installCodexButton;
+runnerPanelEl.listeners.click({
+  target: installCodexButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(messages.at(-1)?.type, "openUrl", "runner install links should open externally");
+assert.equal(messages.at(-1)?.url, "https://github.com/openai/codex");
+
+const createRunnerButton = new FakeElement("button");
+createRunnerButton.setAttribute("data-action-type", "createRunner");
+createRunnerButton.closest = () => createRunnerButton;
+runnerPanelEl.listeners.click({
+  target: createRunnerButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(messages.at(-1)?.type, "createRunner", "runner panel should request local runner creation");
+assert.match(runnerPanelEl.innerHTML, /Creating/, "runner panel should show pending creation state");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      requirements: {
+        dotnet: {
+          label: ".NET SDK",
+          command: "dotnet",
+          installed: true,
+          version: "8.0.100",
+          installUrl: "https://dotnet.microsoft.com/download",
+        },
+        codex: {
+          label: "Codex CLI",
+          command: "codex",
+          installed: true,
+          version: "codex 0.1.0",
+          installUrl: "https://github.com/openai/codex",
+        },
+      },
+    },
+  },
+});
 assert.match(runnerPanelEl.innerHTML, /No Codex runner detected/, "runner panel should warn about a missing runner");
+assert.doesNotMatch(runnerPanelEl.innerHTML, /Install requirements/, "start should be available when runner tools are installed");
 assert.match(
   runnerPanelEl.innerHTML,
   /keeps working if VS Code closes/,
@@ -315,7 +394,7 @@ windowListeners.message({
     },
   },
 });
-assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner heartbeat is fresh");
+assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner status endpoint is detected");
 assert.equal(
   context.document.documentElement.style.getPropertyValue("--details-pane-width"),
   "360px",
