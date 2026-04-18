@@ -43,6 +43,12 @@ const nextData = {
 const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
 const nextConfig = parseBoardConfig(serialized);
 
+assert.equal(
+  serializeBoardConfig({}, ""),
+  "",
+  "empty .kanban YAML should remain empty instead of being serialized as {}"
+);
+
 assert.deepEqual(
   nextConfig.folders.map((folder) => folder.id),
   ["Doing", "Backlog", "Done", "Archive"],

@@ -113,6 +113,9 @@ export function serializeBoardConfig(
   existingText = ""
 ): string {
   const eol = detectLineEnding(existingText);
+  if (Object.keys(data).length === 0) {
+    return "";
+  }
   const serialized = YAML.stringify(data).trim();
   return serialized ? `${serialized}${eol}` : "";
 }

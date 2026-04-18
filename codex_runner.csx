@@ -851,38 +851,55 @@ sealed class WorkspaceMoveBridge
 
     public async Task MoveFileAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
     {
-        if (PathEquals(sourcePath, destinationPath))
-        {
-            return;
-        }
-
-        if (await TryMoveViaExtensionAsync(sourcePath, destinationPath, "file", cancellationToken))
-        {
-            return;
-        }
-
-        Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-        File.Move(sourcePath, destinationPath);
+        await MoveEntryAsync(
+            sourcePath,
+            destinationPath,
+            "file",
+            File.Move,
+            cancellationToken);
     }
 
     public async Task MoveDirectoryAsync(string sourcePath, string destinationPath, CancellationToken cancellationToken)
     {
+        await MoveEntryAsync(
+            sourcePath,
+            destinationPath,
+            "directory",
+            Directory.Move,
+            cancellationToken);
+    }
+
+    private async Task MoveEntryAsync(
+        string sourcePath,
+        string destinationPath,
+        string entryType,
+        Action<string, string> moveDirectly,
+        CancellationToken cancellationToken)
+    {
         if (PathEquals(sourcePath, destinationPath))
         {
             return;
         }
 
-        if (await TryMoveViaExtensionAsync(sourcePath, destinationPath, "directory", cancellationToken))
+        var extensionResult = await TryMoveViaExtensionAsync(sourcePath, destinationPath, entryType, cancellationToken);
+        if (extensionResult == WorkspaceMoveBridgeResult.MovedByExtension)
         {
+            _log.Info($"Moved {entryType} via VS Code extension (extension asked): `{sourcePath}` -> `{destinationPath}`");
             return;
         }
 
         Directory.CreateDirectory(Path.GetDirectoryName(destinationPath)!);
-        Directory.Move(sourcePath, destinationPath);
+        moveDirectly(sourcePath, destinationPath);
+
+        var fallbackReason = extensionResult == WorkspaceMoveBridgeResult.ExtensionAskedNoMove
+            ? "extension asked, no successful response"
+            : "extension not reached";
+        _log.Info($"Moved {entryType} via direct filesystem move ({fallbackReason}): `{sourcePath}` -> `{destinationPath}`");
     }
 
-    private async Task<bool> TryMoveViaExtensionAsync(string sourcePath, string destinationPath, string entryType, CancellationToken cancellationToken)
+    private async Task<WorkspaceMoveBridgeResult> TryMoveViaExtensionAsync(string sourcePath, string destinationPath, string entryType, CancellationToken cancellationToken)
     {
+        var requestSent = false;
         try
         {
             using var client = new NamedPipeClientStream(
@@ -908,6 +925,7 @@ sealed class WorkspaceMoveBridge
                 Path.GetFullPath(destinationPath),
                 entryType);
             await writer.WriteLineAsync(JsonSerializer.Serialize(request));
+            requestSent = true;
 
             using var responseCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             responseCts.CancelAfter(ResponseTimeout);
@@ -915,19 +933,19 @@ sealed class WorkspaceMoveBridge
             var completedTask = await Task.WhenAny(responseTask, Task.Delay(Timeout.InfiniteTimeSpan, responseCts.Token));
             if (completedTask != responseTask)
             {
-                return false;
+                return WorkspaceMoveBridgeResult.ExtensionAskedNoMove;
             }
 
             var responseLine = await responseTask;
             if (string.IsNullOrWhiteSpace(responseLine))
             {
-                return false;
+                return WorkspaceMoveBridgeResult.ExtensionAskedNoMove;
             }
 
             var response = JsonSerializer.Deserialize<WorkspaceMoveResponse>(responseLine);
             if (response?.Ok == true)
             {
-                return true;
+                return WorkspaceMoveBridgeResult.MovedByExtension;
             }
 
             if (!string.IsNullOrWhiteSpace(response?.Error))
@@ -937,26 +955,42 @@ sealed class WorkspaceMoveBridge
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
-            return false;
+            return requestSent
+                ? WorkspaceMoveBridgeResult.ExtensionAskedNoMove
+                : WorkspaceMoveBridgeResult.ExtensionUnavailable;
         }
         catch (IOException)
         {
-            return false;
+            return requestSent
+                ? WorkspaceMoveBridgeResult.ExtensionAskedNoMove
+                : WorkspaceMoveBridgeResult.ExtensionUnavailable;
         }
         catch (UnauthorizedAccessException)
         {
-            return false;
+            return requestSent
+                ? WorkspaceMoveBridgeResult.ExtensionAskedNoMove
+                : WorkspaceMoveBridgeResult.ExtensionUnavailable;
         }
         catch (Exception ex)
         {
             _log.Warn($"VS Code move bridge failed for `{sourcePath}` -> `{destinationPath}`: {ex.Message}");
+            return requestSent
+                ? WorkspaceMoveBridgeResult.ExtensionAskedNoMove
+                : WorkspaceMoveBridgeResult.ExtensionUnavailable;
         }
 
-        return false;
+        return WorkspaceMoveBridgeResult.ExtensionAskedNoMove;
     }
 
     private static bool PathEquals(string left, string right) =>
         string.Equals(Path.GetFullPath(left), Path.GetFullPath(right), StringComparison.OrdinalIgnoreCase);
+}
+
+enum WorkspaceMoveBridgeResult
+{
+    ExtensionUnavailable,
+    ExtensionAskedNoMove,
+    MovedByExtension
 }
 
 static class WorkspaceMoveProtocol
