@@ -122,6 +122,8 @@ Options:
 - `--codex-mode Dangerous|FullAuto`: how Codex runs tasks.
 - `--once`: run one reconciliation pass and exit.
 
+While running continuously, the runner writes `tasks/.kanban.runner.json` every few seconds. The VS Code Kanban view uses that heartbeat, not the runner process name or script location, to decide whether the board already has an active runner.
+
 ## Codex mode
 
 `Dangerous` is the default because autonomous task agents usually need to edit files and run repo commands without stopping for approval. That maps to:

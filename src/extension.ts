@@ -1,8 +1,9 @@
 import * as path from "path";
 import * as net from "net";
 import * as vscode from "vscode";
-import { execFile } from "child_process";
+import { execFile, spawn } from "child_process";
 import { createHash } from "crypto";
+import { existsSync } from "fs";
 import { promisify } from "util";
 import MarkdownIt from "markdown-it";
 import {
@@ -99,9 +100,22 @@ const OPEN_CODE_COMMAND = "kanban.openCode";
 const OPEN_URL_COMMAND = "kanban.openUrl";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
+const RUNNER_PANEL_ENABLED_SETTING = "runnerPanel.enabled";
+const RUNNER_COMMAND_SETTING = "runner.command";
+const RUNNER_ARGS_SETTING = "runner.args";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
+const RUNNER_HEARTBEAT_FILE_NAME = ".kanban.runner.json";
+const RUNNER_HEARTBEAT_MAX_AGE_MS = 30_000;
+const RUNNER_STATUS_REFRESH_MS = 10_000;
+const DEFAULT_RUNNER_ARGS = [
+  "script",
+  "${runnerScript}",
+  "--",
+  "--root",
+  "${runnerRoot}",
+];
 
 export function activate(context: vscode.ExtensionContext) {
   const provider = new KanbanEditorProvider(context);
@@ -532,6 +546,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         width: this.getDetailsPaneWidthSetting(),
       });
     };
+    const sendRunnerStatus = async (message?: string) => {
+      const status = await this.getRunnerStatus(document.uri, message);
+      webviewPanel.webview.postMessage({ type: "runnerStatus", status });
+    };
     let boardMutationQueue = Promise.resolve();
     const runBoardMutation = async (operation: () => Promise<void>) => {
       const nextMutation = boardMutationQueue
@@ -552,10 +570,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ) {
           sendDetailsPaneWidth();
         }
+        if (
+          event.affectsConfiguration(
+            `${KANBAN_CONFIGURATION_SECTION}.${RUNNER_PANEL_ENABLED_SETTING}`
+          ) ||
+          event.affectsConfiguration(
+            `${KANBAN_CONFIGURATION_SECTION}.${RUNNER_COMMAND_SETTING}`
+          ) ||
+          event.affectsConfiguration(
+            `${KANBAN_CONFIGURATION_SECTION}.${RUNNER_ARGS_SETTING}`
+          )
+        ) {
+          void sendRunnerStatus();
+        }
       }
     );
+    const runnerStatusTimer = setInterval(() => {
+      void sendRunnerStatus();
+    }, RUNNER_STATUS_REFRESH_MS);
     webviewPanel.onDidDispose(() => {
       detailsPaneWidthListener.dispose();
+      clearInterval(runnerStatusTimer);
       if (scheduledBoardRefresh) {
         clearTimeout(scheduledBoardRefresh);
       }
@@ -566,14 +601,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const pattern = new vscode.RelativePattern(parentFolder, "**/*");
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
     this.watchers.set(key, watcher);
-    watcher.onDidCreate(scheduleBoardRefresh);
-    watcher.onDidDelete(scheduleBoardRefresh);
-    watcher.onDidChange(scheduleBoardRefresh);
+    const handleBoardFileChange = (uri: vscode.Uri) => {
+      if (path.basename(uri.fsPath) === RUNNER_HEARTBEAT_FILE_NAME) {
+        void sendRunnerStatus();
+        return;
+      }
+      scheduleBoardRefresh();
+    };
+    watcher.onDidCreate(handleBoardFileChange);
+    watcher.onDidDelete(handleBoardFileChange);
+    watcher.onDidChange(handleBoardFileChange);
 
     webviewPanel.webview.onDidReceiveMessage(async (message) => {
       if (message?.type === "ready") {
         await sendBoard();
         sendDetailsPaneWidth();
+        await sendRunnerStatus();
         return;
       }
       if (message?.type === "requestNewCard") {
@@ -644,6 +687,29 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           )
         );
         await sendBoard();
+        return;
+      }
+      if (message?.type === "startRunner") {
+        try {
+          await this.startRunner(document.uri);
+          await sendRunnerStatus(
+            "Runner start requested. It runs in the background and is not tied to VS Code."
+          );
+          setTimeout(() => {
+            void sendRunnerStatus();
+          }, 2000);
+        } catch (error) {
+          const errorMessage =
+            error instanceof Error ? error.message : String(error ?? "Unknown error");
+          webviewPanel.webview.postMessage({
+            type: "runnerStatus",
+            status: {
+              enabled: this.getRunnerPanelEnabledSetting(),
+              running: false,
+              message: `Failed to start runner: ${errorMessage}`,
+            },
+          });
+        }
         return;
       }
       if (message?.type === "openFile" && message?.cardUri) {
@@ -1352,6 +1418,152 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       );
   }
 
+  private getRunnerPanelEnabledSetting(): boolean {
+    return vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<boolean>(RUNNER_PANEL_ENABLED_SETTING, true);
+  }
+
+  private getRunnerCommandSetting(): string {
+    const command = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(RUNNER_COMMAND_SETTING, "dotnet")
+      .trim();
+    return command || "dotnet";
+  }
+
+  private getRunnerArgsSetting(): string[] {
+    const args = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string[]>(RUNNER_ARGS_SETTING, DEFAULT_RUNNER_ARGS);
+    return Array.isArray(args) && args.length > 0 ? args : DEFAULT_RUNNER_ARGS;
+  }
+
+  private async getRunnerStatus(
+    kanbanUri: vscode.Uri,
+    message?: string
+  ): Promise<{
+    enabled: boolean;
+    running: boolean;
+    heartbeatAgeSeconds?: number;
+    message?: string;
+  }> {
+    const enabled = this.getRunnerPanelEnabledSetting();
+    if (!enabled) {
+      return { enabled: false, running: false };
+    }
+
+    const heartbeatUri = vscode.Uri.joinPath(
+      kanbanUri,
+      "..",
+      RUNNER_HEARTBEAT_FILE_NAME
+    );
+    try {
+      const stat = await vscode.workspace.fs.stat(heartbeatUri);
+      const ageMs = Math.max(0, Date.now() - stat.mtime);
+      return {
+        enabled: true,
+        running: ageMs <= RUNNER_HEARTBEAT_MAX_AGE_MS,
+        heartbeatAgeSeconds: Math.round(ageMs / 1000),
+        message,
+      };
+    } catch {
+      return { enabled: true, running: false, message };
+    }
+  }
+
+  private async startRunner(kanbanUri: vscode.Uri): Promise<void> {
+    if (kanbanUri.scheme !== "file") {
+      throw new Error("Runner startup is only supported for local file boards.");
+    }
+
+    const paths = this.getRunnerTokenPaths(kanbanUri);
+    const command = this.expandRunnerTokens(
+      this.getRunnerCommandSetting(),
+      paths
+    );
+    const args = this.getRunnerArgsSetting().map((arg) =>
+      this.expandRunnerTokens(arg, paths)
+    );
+
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn(command, args, {
+        cwd: paths.runnerRoot,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      let settled = false;
+      child.once("error", (error) => {
+        if (!settled) {
+          settled = true;
+          reject(error);
+        }
+      });
+      child.once("spawn", () => {
+        if (!settled) {
+          settled = true;
+          child.unref();
+          resolve();
+        }
+      });
+    });
+  }
+
+  private getRunnerTokenPaths(kanbanUri: vscode.Uri): {
+    kanbanDir: string;
+    runnerRoot: string;
+    runnerScript: string;
+    workspaceFolder: string;
+  } {
+    const kanbanDir = path.dirname(kanbanUri.fsPath);
+    const runnerRoot =
+      path.basename(kanbanDir).toLowerCase() === "tasks"
+        ? path.dirname(kanbanDir)
+        : kanbanDir;
+    const workspaceFolder =
+      vscode.workspace.getWorkspaceFolder(kanbanUri)?.uri.fsPath ?? runnerRoot;
+    const runnerScript = this.resolveRunnerScriptPath(
+      runnerRoot,
+      kanbanDir,
+      workspaceFolder
+    );
+    return { kanbanDir, runnerRoot, runnerScript, workspaceFolder };
+  }
+
+  private resolveRunnerScriptPath(
+    runnerRoot: string,
+    kanbanDir: string,
+    workspaceFolder: string
+  ): string {
+    const candidates = [
+      path.join(runnerRoot, "codex_runner.csx"),
+      path.join(kanbanDir, "codex_runner.csx"),
+      path.join(workspaceFolder, "codex_runner.csx"),
+      this.context.asAbsolutePath("codex_runner.csx"),
+    ];
+    return (
+      candidates.find((candidate) => existsSync(candidate)) ??
+      candidates[candidates.length - 1]
+    );
+  }
+
+  private expandRunnerTokens(
+    value: string,
+    paths: {
+      kanbanDir: string;
+      runnerRoot: string;
+      runnerScript: string;
+      workspaceFolder: string;
+    }
+  ): string {
+    return value
+      .replace(/\$\{kanbanDir\}/g, paths.kanbanDir)
+      .replace(/\$\{runnerRoot\}/g, paths.runnerRoot)
+      .replace(/\$\{runnerScript\}/g, paths.runnerScript)
+      .replace(/\$\{workspaceFolder\}/g, paths.workspaceFolder);
+  }
+
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
     const targetPath = normalizeTaskPropertyValue(rawPath);
     if (!isTaskAbsoluteLocalPath(targetPath)) {
@@ -1832,6 +2044,55 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
+    .runner-panel {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border: 1px solid var(--vscode-inputValidation-warningBorder, var(--line));
+      border-radius: 14px;
+      background: var(--vscode-inputValidation-warningBackground, var(--panel));
+      color: var(--vscode-inputValidation-warningForeground, var(--ink));
+      box-shadow: 0 10px 22px -18px var(--shadow);
+    }
+    .runner-panel[hidden] {
+      display: none;
+    }
+    .runner-panel-title {
+      margin: 0 0 3px;
+      font-weight: 700;
+    }
+    .runner-panel-text {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.4;
+    }
+    .runner-panel-message {
+      margin-top: 4px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .runner-panel button {
+      flex: 0 0 auto;
+      border: 1px solid var(--vscode-button-border, transparent);
+      border-radius: 999px;
+      background: var(--vscode-button-background, var(--accent));
+      color: var(--vscode-button-foreground, var(--ink));
+      cursor: pointer;
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 7px 12px;
+      white-space: nowrap;
+    }
+    .runner-panel button:hover {
+      background: var(--vscode-button-hoverBackground, var(--accent));
+    }
+    .runner-panel button:disabled {
+      cursor: wait;
+      opacity: 0.72;
+    }
     .layout {
       display: grid;
       grid-template-columns:
@@ -2264,6 +2525,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <button class="search-clear" id="search-clear" type="button" hidden>Clear</button>
         <div class="search-meta" id="search-meta"></div>
       </div>
+      <div class="runner-panel" id="runner-panel" hidden></div>
       <div class="board-scroll">
         <section class="board" id="board"></section>
       </div>
@@ -2282,10 +2544,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const searchInputEl = document.getElementById("board-search-input");
     const searchMetaEl = document.getElementById("search-meta");
     const searchClearEl = document.getElementById("search-clear");
+    const runnerPanelEl = document.getElementById("runner-panel");
     const rootStyle = document.documentElement?.style || null;
     let selectedCard = null;
     let lastBoard = null;
     let searchQuery = "";
+    let runnerStatus = { enabled: false, running: false };
+    let runnerStartPending = false;
     const gitStatusCache = new Map();
     const codexOutputCache = new Map();
     let refreshTimer = null;
@@ -2308,6 +2573,32 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+    };
+
+    const renderRunnerPanel = () => {
+      if (!runnerPanelEl) {
+        return;
+      }
+      if (!runnerStatus?.enabled || runnerStatus.running) {
+        runnerPanelEl.hidden = true;
+        runnerPanelEl.innerHTML = "";
+        runnerStartPending = false;
+        return;
+      }
+      runnerPanelEl.hidden = false;
+      const messageHtml = runnerStatus.message
+        ? \`<div class="runner-panel-message">\${escapeHtml(runnerStatus.message)}</div>\`
+        : "";
+      runnerPanelEl.innerHTML = \`
+        <div>
+          <div class="runner-panel-title">No Codex runner detected</div>
+          <p class="runner-panel-text">Start a background runner for this board. It keeps working if VS Code closes.</p>
+          \${messageHtml}
+        </div>
+        <button type="button" data-action-type="startRunner" \${runnerStartPending ? "disabled" : ""}>
+          \${runnerStartPending ? "Starting..." : "Start runner"}
+        </button>
+      \`;
     };
 
     const clampDetailsPaneWidth = (value) => {
@@ -3121,6 +3412,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     }
 
+    if (runnerPanelEl) {
+      runnerPanelEl.addEventListener("click", (event) => {
+        const actionButton = event.target instanceof Element
+          ? event.target.closest("[data-action-type]")
+          : null;
+        if (actionButton?.getAttribute("data-action-type") !== "startRunner") {
+          return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        runnerStartPending = true;
+        renderRunnerPanel();
+        vscode.postMessage({ type: "startRunner" });
+      });
+    }
+
     applyDetailsPaneWidth(detailsPaneWidth);
 
     if (detailsResizerEl) {
@@ -3191,6 +3498,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "detailsPaneWidth") {
         applyDetailsPaneWidth(message?.width);
+      }
+      if (message?.type === "runnerStatus") {
+        runnerStatus = message.status || { enabled: false, running: false };
+        runnerStartPending = false;
+        renderRunnerPanel();
       }
       if (message?.type === "gitStatus") {
         const repoPath = String(message?.path || "").trim();

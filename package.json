@@ -21,6 +21,8 @@
   "main": "./out/extension.js",
   "files": [
     "out/extension.js",
+    "codex_runner.csx",
+    "readme_codex_runner.md",
     "LICENSE",
     "icon.png",
     "language-configuration.json",
@@ -91,6 +93,33 @@
           "maximum": 720,
           "scope": "application",
           "description": "Width in pixels of the Kanban details pane."
+        },
+        "kanban.runnerPanel.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "application",
+          "description": "Show a Kanban board warning panel when no fresh runner heartbeat is detected."
+        },
+        "kanban.runner.command": {
+          "type": "string",
+          "default": "dotnet",
+          "scope": "application",
+          "description": "Command used to start the Kanban runner from the warning panel."
+        },
+        "kanban.runner.args": {
+          "type": "array",
+          "default": [
+            "script",
+            "${runnerScript}",
+            "--",
+            "--root",
+            "${runnerRoot}"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "scope": "application",
+          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, and ${workspaceFolder}."
         }
       }
     }

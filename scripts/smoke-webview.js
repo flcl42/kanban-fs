@@ -180,6 +180,7 @@ const detailsResizerEl = new FakeElement("div");
 const searchInputEl = new FakeElement("input");
 const searchMetaEl = new FakeElement("div");
 const searchClearEl = new FakeElement("button");
+const runnerPanelEl = new FakeElement("div");
 const windowListeners = {};
 const messages = [];
 let activeElement = null;
@@ -247,6 +248,9 @@ const context = {
       if (id === "search-clear") {
         return searchClearEl;
       }
+      if (id === "runner-panel") {
+        return runnerPanelEl;
+      }
       return new FakeElement();
     },
     get activeElement() {
@@ -273,6 +277,45 @@ assert.equal(typeof windowListeners.keydown, "function", "keydown listener missi
 assert.equal(typeof windowListeners.mousemove, "function", "mousemove listener missing");
 assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      message: "Runner start requested.",
+    },
+  },
+});
+assert.equal(runnerPanelEl.hidden, false, "runner panel should be visible when no runner is active");
+assert.match(runnerPanelEl.innerHTML, /No Codex runner detected/, "runner panel should warn about a missing runner");
+assert.match(
+  runnerPanelEl.innerHTML,
+  /keeps working if VS Code closes/,
+  "runner panel should explain that the runner is detached from VS Code"
+);
+
+const startRunnerButton = new FakeElement("button");
+startRunnerButton.setAttribute("data-action-type", "startRunner");
+startRunnerButton.closest = () => startRunnerButton;
+runnerPanelEl.listeners.click({
+  target: startRunnerButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(messages.at(-1)?.type, "startRunner", "runner panel should request runner startup");
+assert.match(runnerPanelEl.innerHTML, /Starting/, "runner panel should show pending startup state");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: true,
+    },
+  },
+});
+assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner heartbeat is fresh");
 assert.equal(
   context.document.documentElement.style.getPropertyValue("--details-pane-width"),
   "360px",

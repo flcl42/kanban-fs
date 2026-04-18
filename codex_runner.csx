@@ -27,6 +27,7 @@ sealed class TaskOrchestrator
     private readonly LogSink _log;
     private readonly NotificationService _notifications;
     private readonly WorkspaceMoveBridge _workspaceMover;
+    private readonly RunnerHeartbeat _heartbeat;
     private readonly ConcurrentDictionary<string, ActiveAgent> _activeAgents = new(PathTraits.Comparer);
     private readonly SemaphoreSlim _reconcileGate = new(1, 1);
     private readonly SemaphoreSlim _scanSignal = new(0, 1);
@@ -43,30 +44,42 @@ sealed class TaskOrchestrator
         _log = new LogSink(Path.Combine(_paths.LogsRoot, "codex_runner.log"));
         _notifications = new NotificationService(_log);
         _workspaceMover = new WorkspaceMoveBridge(_paths.Root, _log);
+        _heartbeat = new RunnerHeartbeat(_paths.RunnerHeartbeatPath, _paths.Root, _paths.TasksRoot, _log);
     }
 
     public async Task RunAsync()
     {
         Console.CancelKeyPress += OnCancelKeyPress;
 
-        EnsureBoardScaffold();
-        _notifications.Initialize();
-        _log.Info($"Board root: {_paths.Root}");
-        _log.Info($"Codex mode: {_settings.CodexMode}");
-        _log.Info($"Max agents: {_settings.MaxAgents}");
-
-        if (_settings.RunOnce)
+        try
         {
-            await ReconcileAsync(_cts.Token);
-            return;
+            EnsureBoardScaffold();
+            _notifications.Initialize();
+            _log.Info($"Board root: {_paths.Root}");
+            _log.Info($"Codex mode: {_settings.CodexMode}");
+            _log.Info($"Max agents: {_settings.MaxAgents}");
+
+            if (_settings.RunOnce)
+            {
+                await ReconcileAsync(_cts.Token);
+                return;
+            }
+
+            _heartbeat.Start();
+            StartWatchers();
+            SignalScan();
+            _scanLoopTask = ScanLoopAsync(_cts.Token);
+
+            _log.Info("Watching for task and project map changes. Press Ctrl+C to stop.");
+            await _scanLoopTask;
         }
-
-        StartWatchers();
-        SignalScan();
-        _scanLoopTask = ScanLoopAsync(_cts.Token);
-
-        _log.Info("Watching for task and project map changes. Press Ctrl+C to stop.");
-        await _scanLoopTask;
+        finally
+        {
+            await _heartbeat.StopAsync();
+            Console.CancelKeyPress -= OnCancelKeyPress;
+            _tasksWatcher?.Dispose();
+            _rootWatcher?.Dispose();
+        }
     }
 
     private void OnCancelKeyPress(object? sender, ConsoleCancelEventArgs e)
@@ -903,6 +916,136 @@ sealed record WorkspaceMoveRequest(
 
 sealed record WorkspaceMoveResponse(bool Ok, string? Error);
 
+sealed class RunnerHeartbeat
+{
+    private static readonly TimeSpan Interval = TimeSpan.FromSeconds(5);
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    private readonly string _heartbeatPath;
+    private readonly string _rootPath;
+    private readonly string _kanbanPath;
+    private readonly LogSink _log;
+    private readonly int _processId = Process.GetCurrentProcess().Id;
+    private readonly DateTimeOffset _startedAtUtc = DateTimeOffset.UtcNow;
+    private readonly CancellationTokenSource _cts = new();
+    private Task? _loopTask;
+    private bool _started;
+
+    public RunnerHeartbeat(string heartbeatPath, string rootPath, string kanbanPath, LogSink log)
+    {
+        _heartbeatPath = heartbeatPath;
+        _rootPath = Path.GetFullPath(rootPath);
+        _kanbanPath = Path.GetFullPath(kanbanPath);
+        _log = log;
+    }
+
+    public void Start()
+    {
+        if (_started)
+        {
+            return;
+        }
+
+        _started = true;
+        _loopTask = Task.Run(LoopAsync);
+    }
+
+    public async Task StopAsync()
+    {
+        if (!_started)
+        {
+            return;
+        }
+
+        _cts.Cancel();
+        if (_loopTask is not null)
+        {
+            try
+            {
+                await _loopTask;
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+
+        TryDeleteHeartbeat();
+        _cts.Dispose();
+    }
+
+    private async Task LoopAsync()
+    {
+        while (!_cts.IsCancellationRequested)
+        {
+            WriteHeartbeat();
+            try
+            {
+                await Task.Delay(Interval, _cts.Token);
+            }
+            catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+
+    private void WriteHeartbeat()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_heartbeatPath)!);
+            var payload = new RunnerHeartbeatPayload(
+                1,
+                "kanban-runner-heartbeat",
+                _rootPath,
+                _kanbanPath,
+                _processId,
+                _startedAtUtc,
+                DateTimeOffset.UtcNow);
+            File.WriteAllText(
+                _heartbeatPath,
+                JsonSerializer.Serialize(payload, JsonOptions),
+                new UTF8Encoding(false));
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to write runner heartbeat `{_heartbeatPath}`: {ex.Message}");
+        }
+    }
+
+    private void TryDeleteHeartbeat()
+    {
+        try
+        {
+            if (!File.Exists(_heartbeatPath))
+            {
+                return;
+            }
+
+            var payload = JsonSerializer.Deserialize<RunnerHeartbeatPayload>(
+                File.ReadAllText(_heartbeatPath, Encoding.UTF8));
+            if (payload?.ProcessId != _processId)
+            {
+                return;
+            }
+
+            File.Delete(_heartbeatPath);
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Failed to delete runner heartbeat `{_heartbeatPath}`: {ex.Message}");
+        }
+    }
+}
+
+sealed record RunnerHeartbeatPayload(
+    int Version,
+    string Kind,
+    string RootPath,
+    string KanbanPath,
+    int ProcessId,
+    DateTimeOffset StartedAtUtc,
+    DateTimeOffset UpdatedAtUtc);
+
 sealed class CodexRunner
 {
     private readonly OrchestratorSettings _settings;
@@ -1705,6 +1848,7 @@ sealed class BoardPaths
         ContextPath = Path.Combine(Root, "context.md");
         ProjectsMapPath = Path.Combine(Root, "projects.md");
         KanbanMarkerPath = Path.Combine(TasksRoot, ".kanban");
+        RunnerHeartbeatPath = Path.Combine(TasksRoot, ".kanban.runner.json");
         TaskTemplatePath = Path.Combine(TasksRoot, "template.md");
         var newRoot = Path.Combine(TasksRoot, "new");
         var backlogRoot = Path.Combine(TasksRoot, "backlog");
@@ -1755,6 +1899,7 @@ sealed class BoardPaths
     public string ContextPath { get; }
     public string ProjectsMapPath { get; }
     public string KanbanMarkerPath { get; }
+    public string RunnerHeartbeatPath { get; }
     public string TaskTemplatePath { get; }
     public IReadOnlyList<KanbanFolder> KanbanFolders { get; }
     public IReadOnlyList<string> RequiredDirectories { get; }
@@ -1939,6 +2084,7 @@ static class BoardTemplates
         cache/
         trash/
         logs/
+        tasks/.kanban.runner.json
         """;
 
     private static string DefaultContextTemplate =>

@@ -8,6 +8,8 @@ If `template.md` exists beside the board's `.kanban` file, `+ Add ticket` seeds 
 
 Press `Ctrl+F` (or `Cmd+F` on macOS) in the board view to filter cards by title, body text, tags, file name, and task properties.
 
+If no fresh `codex_runner` heartbeat is detected for a board, the view can show a runner panel with a background start action. Disable it with `kanban.runnerPanel.enabled`; customize startup with `kanban.runner.command` and `kanban.runner.args`.
+
 `.kanban` is a YAML file. The optional `folders` section controls column titles and column order:
 
 ```yaml
