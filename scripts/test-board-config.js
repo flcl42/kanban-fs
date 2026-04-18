@@ -50,6 +50,22 @@ assert.equal(
 );
 
 assert.deepEqual(
+  orderColumnsByConfig(
+    [
+      { id: "done", name: "done", order: null },
+      { id: "backlog", name: "backlog", order: null },
+      { id: "confirmed", name: "confirmed", order: null },
+      { id: "new", name: "new", order: null },
+      { id: "doing", name: "doing", order: null },
+      { id: "blocked", name: "blocked", order: null },
+    ],
+    parseBoardConfig("")
+  ).map((column) => column.id),
+  ["new", "backlog", "doing", "blocked", "done", "confirmed"],
+  "empty .kanban boards should use workflow order for runner-style columns"
+);
+
+assert.deepEqual(
   nextConfig.folders.map((folder) => folder.id),
   ["Doing", "Backlog", "Done", "Archive"],
   "serializing updated card priorities should preserve configured folder order"

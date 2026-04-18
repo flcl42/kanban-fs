@@ -97,16 +97,41 @@ sealed class TaskOrchestrator
     private void EnsureBoardScaffold()
     {
         Directory.CreateDirectory(_paths.Root);
+        var shouldSeedKanbanConfig = ShouldSeedKanbanConfig(_paths.KanbanMarkerPath);
         foreach (var directory in _paths.RequiredDirectories)
         {
             Directory.CreateDirectory(directory);
         }
 
-        EnsureFileExists(_paths.KanbanMarkerPath, BoardTemplates.CreateKanbanConfig(_paths.KanbanFolders));
+        EnsureKanbanConfig(
+            _paths.KanbanMarkerPath,
+            BoardTemplates.CreateKanbanConfig(_paths.KanbanFolders),
+            shouldSeedKanbanConfig);
         EnsureFileExists(_paths.GitIgnorePath, BoardTemplates.ResolveGitIgnoreTemplate(_settings.InvocationDirectory));
         EnsureFileExists(_paths.ProjectsMapPath, BoardTemplates.ProjectsTemplate);
         EnsureFileExists(_paths.ContextPath, BoardTemplates.ResolveContextTemplate(_settings.InvocationDirectory));
         EnsureFileExists(_paths.TaskTemplatePath, BoardTemplates.ResolveTaskTemplate(_settings.InvocationDirectory));
+    }
+
+    private static bool ShouldSeedKanbanConfig(string path)
+    {
+        if (!File.Exists(path))
+        {
+            return true;
+        }
+
+        var existing = File.ReadAllText(path, Encoding.UTF8).Trim('\uFEFF');
+        return string.IsNullOrWhiteSpace(existing);
+    }
+
+    private static void EnsureKanbanConfig(string path, string content, bool shouldSeed)
+    {
+        if (!shouldSeed && File.Exists(path))
+        {
+            return;
+        }
+
+        File.WriteAllText(path, content, new UTF8Encoding(false));
     }
 
     private static void EnsureFileExists(string path, string content)

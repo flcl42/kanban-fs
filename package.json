@@ -1,11 +1,21 @@
 {
   "name": "kanban-vsix",
-  "displayName": "Kanban-fs",
-  "description": "Kanban board backed by folders and markdown files.",
+  "displayName": "ai-kanban",
+  "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional Codex runner.",
   "version": "1.0.20",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
+  "keywords": [
+    "ai",
+    "kanban",
+    "tasks",
+    "markdown",
+    "codex",
+    "agent",
+    "workflow",
+    "project-management"
+  ],
   "activationEvents": [
     "onStartupFinished",
     "onLanguage:markdown",
@@ -55,26 +65,45 @@
     ],
     "commands": [
       {
+        "command": "kanban.createEmptyBoard",
+        "title": "Create Empty Board",
+        "category": "AI Kanban"
+      },
+      {
+        "command": "kanban.createBoardWithColumns",
+        "title": "Create Board with Columns",
+        "category": "AI Kanban"
+      },
+      {
+        "command": "kanban.createBoardWithRunner",
+        "title": "Create Board with Initialized Runner",
+        "category": "AI Kanban"
+      },
+      {
         "command": "kanban.resumeAgent",
-        "title": "Kanban: Connect Agent"
+        "title": "Connect Agent",
+        "category": "AI Kanban"
       },
       {
         "command": "kanban.openPath",
-        "title": "Kanban: Open Path"
+        "title": "Open Path",
+        "category": "AI Kanban"
       },
       {
         "command": "kanban.openCode",
-        "title": "Kanban: Open Path in VS Code"
+        "title": "Open Path in VS Code",
+        "category": "AI Kanban"
       },
       {
         "command": "kanban.openUrl",
-        "title": "Kanban: Open URL"
+        "title": "Open URL",
+        "category": "AI Kanban"
       }
     ],
     "customEditors": [
       {
         "viewType": "kanban.board",
-        "displayName": "Kanban Board",
+        "displayName": "AI Kanban Board",
         "selector": [
           {
             "filenamePattern": "*.kanban"
@@ -84,7 +113,7 @@
       }
     ],
     "configuration": {
-      "title": "Kanban",
+      "title": "AI Kanban",
       "properties": {
         "kanban.detailsPaneWidth": {
           "type": "number",

@@ -1,5 +1,14 @@
 import YAML from "yaml";
 
+const defaultWorkflowColumnOrder = new Map<string, number>([
+  ["new", 1],
+  ["backlog", 2],
+  ["doing", 3],
+  ["blocked", 4],
+  ["done", 5],
+  ["confirmed", 6],
+]);
+
 export type BoardFolderConfig = {
   id: string;
   title: string | null;
@@ -211,13 +220,18 @@ export function orderColumnsByConfig<
 }
 
 export function compareColumns(
-  a: { name: string; order: number | null },
-  b: { name: string; order: number | null }
+  a: { id?: string; name: string; order: number | null },
+  b: { id?: string; name: string; order: number | null }
 ): number {
   const orderA = a.order ?? Number.POSITIVE_INFINITY;
   const orderB = b.order ?? Number.POSITIVE_INFINITY;
   if (orderA !== orderB) {
     return orderA - orderB;
+  }
+  const workflowOrderA = readDefaultWorkflowColumnOrder(a);
+  const workflowOrderB = readDefaultWorkflowColumnOrder(b);
+  if (workflowOrderA !== workflowOrderB) {
+    return workflowOrderA - workflowOrderB;
   }
   return a.name.localeCompare(b.name);
 }
@@ -324,6 +338,22 @@ function toPriorityList(
     (a, b) => a[1] - b[1] || a[0].localeCompare(b[0])
     )
     .map(([fileName]) => fileName);
+}
+
+function readDefaultWorkflowColumnOrder(column: {
+  id?: string;
+  name: string;
+}): number {
+  const idOrder = column.id
+    ? defaultWorkflowColumnOrder.get(column.id.trim().toLowerCase())
+    : undefined;
+  if (idOrder !== undefined) {
+    return idOrder;
+  }
+  return (
+    defaultWorkflowColumnOrder.get(column.name.trim().toLowerCase()) ??
+    Number.POSITIVE_INFINITY
+  );
 }
 
 function coerceString(value: unknown): string | null {

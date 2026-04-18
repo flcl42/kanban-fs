@@ -111,6 +111,9 @@ const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
 const OPEN_CODE_COMMAND = "kanban.openCode";
 const OPEN_URL_COMMAND = "kanban.openUrl";
+const CREATE_EMPTY_BOARD_COMMAND = "kanban.createEmptyBoard";
+const CREATE_BOARD_WITH_COLUMNS_COMMAND = "kanban.createBoardWithColumns";
+const CREATE_BOARD_WITH_RUNNER_COMMAND = "kanban.createBoardWithRunner";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
 const RUNNER_PANEL_ENABLED_SETTING = "runnerPanel.enabled";
@@ -129,6 +132,14 @@ const RUNNER_STATUS_PORT_CANDIDATES = 32;
 const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
 const DOTNET_INSTALL_URL = "https://dotnet.microsoft.com/download";
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
+const KANBAN_FILE_NAME = ".kanban";
+const DEFAULT_BOARD_COLUMNS = [
+  { id: "new", name: "new" },
+  { id: "backlog", name: "backlog" },
+  { id: "doing", name: "doing" },
+  { id: "done", name: "done" },
+  { id: "confirmed", name: "confirmed" },
+];
 const DEFAULT_RUNNER_ARGS = [
   "script",
   "${runnerScript}",
@@ -154,6 +165,15 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand(OPEN_URL_COMMAND, async (targetUrl: string) =>
       provider.openUrl(String(targetUrl))
+    ),
+    vscode.commands.registerCommand(CREATE_EMPTY_BOARD_COMMAND, async () =>
+      provider.createEmptyBoard()
+    ),
+    vscode.commands.registerCommand(CREATE_BOARD_WITH_COLUMNS_COMMAND, async () =>
+      provider.createBoardWithColumns()
+    ),
+    vscode.commands.registerCommand(CREATE_BOARD_WITH_RUNNER_COMMAND, async () =>
+      provider.createBoardWithRunner()
     ),
     vscode.window.registerCustomEditorProvider("kanban.board", provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -486,6 +506,14 @@ function isMarkdownDocument(document: vscode.TextDocument): boolean {
   return document.languageId === "markdown";
 }
 
+function createDefaultBoardConfigText(): string {
+  return serializeBoardConfig({
+    folders: Object.fromEntries(
+      DEFAULT_BOARD_COLUMNS.map((column) => [column.id, column.name])
+    ),
+  });
+}
+
 class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
   private readonly boardConfigCache = new Map<string, BoardConfig>();
@@ -505,6 +533,74 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       })
     );
     void this.resolveEditorCursorPlaceholder(vscode.window.activeTextEditor);
+  }
+
+  async createEmptyBoard(): Promise<void> {
+    const boardFolder = await this.pickBoardFolder(
+      "Select a folder for the empty AI Kanban board"
+    );
+    if (!boardFolder) {
+      return;
+    }
+
+    const kanbanUri = vscode.Uri.joinPath(boardFolder, KANBAN_FILE_NAME);
+    if (!(await this.writeBoardFileIfSafe(kanbanUri, "", false))) {
+      return;
+    }
+
+    await this.openBoard(kanbanUri);
+  }
+
+  async createBoardWithColumns(): Promise<void> {
+    const boardFolder = await this.pickBoardFolder(
+      "Select a folder for the AI Kanban board"
+    );
+    if (!boardFolder) {
+      return;
+    }
+
+    const kanbanUri = vscode.Uri.joinPath(boardFolder, KANBAN_FILE_NAME);
+    if (
+      !(await this.writeBoardFileIfSafe(
+        kanbanUri,
+        createDefaultBoardConfigText(),
+        true
+      ))
+    ) {
+      return;
+    }
+
+    await this.createDefaultColumnDirectories(boardFolder);
+    await this.openBoard(kanbanUri);
+  }
+
+  async createBoardWithRunner(): Promise<void> {
+    const rootFolder = await this.pickBoardFolder(
+      "Select a root folder for the AI Kanban runner"
+    );
+    if (!rootFolder) {
+      return;
+    }
+
+    const tasksUri = vscode.Uri.joinPath(rootFolder, "tasks");
+    await vscode.workspace.fs.createDirectory(tasksUri);
+    const kanbanUri = vscode.Uri.joinPath(tasksUri, KANBAN_FILE_NAME);
+    if (
+      !(await this.writeBoardFileIfSafe(
+        kanbanUri,
+        createDefaultBoardConfigText(),
+        true
+      ))
+    ) {
+      return;
+    }
+
+    await this.createDefaultColumnDirectories(tasksUri);
+    const result = await this.initializeRunnerForBoard(kanbanUri);
+    await this.openBoard(result.kanbanUri);
+    vscode.window.showInformationMessage(
+      `AI Kanban runner initialized: ${result.runnerPath}`
+    );
   }
 
   async openCustomDocument(
@@ -1687,6 +1783,71 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     });
     this.runnerLaunches.set(normalizeMovePath(paths.runnerRoot), Date.now());
+  }
+
+  private async pickBoardFolder(title: string): Promise<vscode.Uri | null> {
+    const defaultUri = vscode.workspace.workspaceFolders?.[0]?.uri;
+    const folders = await vscode.window.showOpenDialog({
+      title,
+      openLabel: "Use Folder",
+      defaultUri,
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: false,
+    });
+    return folders?.[0] ?? null;
+  }
+
+  private async writeBoardFileIfSafe(
+    kanbanUri: vscode.Uri,
+    content: string,
+    allowEmptyOverwrite: boolean
+  ): Promise<boolean> {
+    const existing = await this.readExistingText(kanbanUri);
+    if (existing !== null) {
+      if (allowEmptyOverwrite && existing.trim().length === 0) {
+        await this.writeTextFile(kanbanUri, content);
+        return true;
+      }
+
+      const choice = await vscode.window.showWarningMessage(
+        `${kanbanUri.fsPath} already exists.`,
+        "Open Existing",
+        "Cancel"
+      );
+      if (choice === "Open Existing") {
+        await this.openBoard(kanbanUri);
+      }
+      return false;
+    }
+
+    await this.writeTextFile(kanbanUri, content);
+    return true;
+  }
+
+  private async readExistingText(uri: vscode.Uri): Promise<string | null> {
+    try {
+      const content = await vscode.workspace.fs.readFile(uri);
+      return Buffer.from(content).toString("utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  private async writeTextFile(uri: vscode.Uri, content: string): Promise<void> {
+    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
+  }
+
+  private async createDefaultColumnDirectories(boardFolder: vscode.Uri): Promise<void> {
+    for (const column of DEFAULT_BOARD_COLUMNS) {
+      await vscode.workspace.fs.createDirectory(
+        vscode.Uri.joinPath(boardFolder, column.id)
+      );
+    }
+  }
+
+  private async openBoard(kanbanUri: vscode.Uri): Promise<void> {
+    await vscode.commands.executeCommand("vscode.openWith", kanbanUri, "kanban.board");
   }
 
   private getRunnerTokenPaths(kanbanUri: vscode.Uri): {
