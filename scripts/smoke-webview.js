@@ -178,6 +178,7 @@ const layoutEl = new FakeElement("div");
 const detailsEl = new FakeElement("aside");
 const detailsResizerEl = new FakeElement("div");
 const searchInputEl = new FakeElement("input");
+const tagFilterEl = new FakeElement("select");
 const searchMetaEl = new FakeElement("div");
 const searchClearEl = new FakeElement("button");
 const runnerPanelEl = new FakeElement("div");
@@ -242,6 +243,9 @@ const context = {
       if (id === "board-search-input") {
         return searchInputEl;
       }
+      if (id === "board-tag-filter") {
+        return tagFilterEl;
+      }
       if (id === "search-meta") {
         return searchMetaEl;
       }
@@ -277,6 +281,7 @@ assert.equal(typeof windowListeners.keydown, "function", "keydown listener missi
 assert.equal(typeof windowListeners.mousemove, "function", "mousemove listener missing");
 assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
+assert.match(html, /id="board-tag-filter"/, "tag filter selector should render next to search");
 windowListeners.message({
   data: {
     type: "runnerStatus",
@@ -292,6 +297,13 @@ windowListeners.message({
           installed: true,
           version: "8.0.100",
           installUrl: "https://dotnet.microsoft.com/download",
+        },
+        dotnetScript: {
+          label: "dotnet-script",
+          command: "dotnet",
+          installed: false,
+          version: "",
+          installUrl: "https://github.com/dotnet-script/dotnet-script",
         },
         codex: {
           label: "Codex CLI",
@@ -312,9 +324,11 @@ assert.match(
   "runner panel should ask to create a local runner script when the default runner is missing"
 );
 assert.doesNotMatch(runnerPanelEl.innerHTML, /\.NET SDK/, "runner panel should hide installed tool rows");
+assert.match(runnerPanelEl.innerHTML, /dotnet-script/, "runner panel should show missing dotnet-script status");
 assert.match(runnerPanelEl.innerHTML, /Codex CLI/, "runner panel should show codex status");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="openRunnerLink"/, "missing runner tools should render install links");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="hideRunnerPanel"/, "runner panel should expose a hide action");
+assert.match(runnerPanelEl.innerHTML, /by default/, "runner panel hide should expose a persistent setting checkbox");
 
 const installCodexButton = new FakeElement("button");
 installCodexButton.setAttribute("data-action-type", "openRunnerLink");
@@ -327,17 +341,6 @@ runnerPanelEl.listeners.click({
 });
 assert.equal(messages.at(-1)?.type, "openUrl", "runner install links should open externally");
 assert.equal(messages.at(-1)?.url, "https://github.com/openai/codex");
-
-const hideRunnerPanelButton = new FakeElement("button");
-hideRunnerPanelButton.setAttribute("data-action-type", "hideRunnerPanel");
-hideRunnerPanelButton.closest = () => hideRunnerPanelButton;
-runnerPanelEl.listeners.click({
-  target: hideRunnerPanelButton,
-  preventDefault() {},
-  stopPropagation() {},
-});
-assert.equal(messages.at(-1)?.type, "hideRunnerPanel", "runner panel hide should persist the disabled setting");
-assert.equal(runnerPanelEl.hidden, true, "runner panel should hide immediately after requesting hide");
 
 windowListeners.message({
   data: {
@@ -354,6 +357,13 @@ windowListeners.message({
           installed: true,
           version: "8.0.100",
           installUrl: "https://dotnet.microsoft.com/download",
+        },
+        dotnetScript: {
+          label: "dotnet-script",
+          command: "dotnet",
+          installed: false,
+          version: "",
+          installUrl: "https://github.com/dotnet-script/dotnet-script",
         },
         codex: {
           label: "Codex CLI",
@@ -393,6 +403,13 @@ windowListeners.message({
           installed: true,
           version: "8.0.100",
           installUrl: "https://dotnet.microsoft.com/download",
+        },
+        dotnetScript: {
+          label: "dotnet-script",
+          command: "dotnet",
+          installed: true,
+          version: "2.0.0",
+          installUrl: "https://github.com/dotnet-script/dotnet-script",
         },
         codex: {
           label: "Codex CLI",
@@ -434,6 +451,53 @@ windowListeners.message({
   },
 });
 assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner status endpoint is detected");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      requirements: {
+        dotnet: {
+          label: ".NET SDK",
+          command: "dotnet",
+          installed: true,
+          version: "8.0.100",
+          installUrl: "https://dotnet.microsoft.com/download",
+        },
+        dotnetScript: {
+          label: "dotnet-script",
+          command: "dotnet",
+          installed: true,
+          version: "2.0.0",
+          installUrl: "https://github.com/dotnet-script/dotnet-script",
+        },
+        codex: {
+          label: "Codex CLI",
+          command: "codex",
+          installed: true,
+          version: "codex 0.1.0",
+          installUrl: "https://github.com/openai/codex",
+        },
+      },
+    },
+  },
+});
+const messageCountBeforeSessionHide = messages.length;
+const hideRunnerPanelButton = new FakeElement("button");
+hideRunnerPanelButton.setAttribute("data-action-type", "hideRunnerPanel");
+hideRunnerPanelButton.closest = () => hideRunnerPanelButton;
+runnerPanelEl.querySelector = () => ({ checked: false });
+runnerPanelEl.listeners.click({
+  target: hideRunnerPanelButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(runnerPanelEl.hidden, true, "runner panel should hide for the current session");
+assert.equal(messages.length, messageCountBeforeSessionHide, "session-only hide should not update user settings");
 assert.equal(
   context.document.documentElement.style.getPropertyValue("--details-pane-width"),
   "360px",
@@ -500,12 +564,18 @@ windowListeners.message({
                   },
                 },
                 {
+                  key: "Project",
+                  label: "Project",
+                  value: "kanban",
+                  action: null,
+                },
+                {
                   key: "Repo",
                   label: "Repo",
                   value: "C:\\work\\demo",
-                  action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                  action: { command: "openPath", title: "Terminal", value: "C:\\work\\demo" },
                   actions: [
-                    { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                    { command: "openPath", title: "Terminal", value: "C:\\work\\demo" },
                     { command: "openCode", title: "Code", value: "C:\\work\\demo" },
                   ],
                 },
@@ -513,7 +583,11 @@ windowListeners.message({
                   key: "Path",
                   label: "Path",
                   value: "C:\\work\\demo",
-                  action: { command: "openPath", title: "Open", value: "C:\\work\\demo" },
+                  action: { command: "openPath", title: "Terminal", value: "C:\\work\\demo" },
+                  actions: [
+                    { command: "openPath", title: "Terminal", value: "C:\\work\\demo" },
+                    { command: "openLocalPath", title: "Open", value: "C:\\work\\demo" },
+                  ],
                 },
                 {
                   key: "URL",
@@ -575,6 +649,40 @@ assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)
 assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1)");
 assert.match(searchMetaEl.textContent, /3 cards/, "search summary should show card count");
 assert.equal(searchClearEl.hidden, true, "clear button should stay hidden with no filter");
+assert.deepEqual(
+  tagFilterEl.children.map((option) => option.textContent),
+  ["All tags", "(no-tag)", "ship"],
+  "tag filter should include all tags plus the no-tag option first"
+);
+
+tagFilterEl.value = "ship";
+tagFilterEl.listeners.change();
+
+assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (1/2)");
+assert.equal(boardEl.children[0].children[1].dataset.uri, "file:///task.md");
+assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (0/1)");
+assert.equal(searchClearEl.hidden, false, "clear button should appear with an active tag filter");
+assert.match(
+  searchMetaEl.textContent,
+  /1 of 3 cards shown/,
+  "tag filter should update the search summary"
+);
+
+const noTagValue = tagFilterEl.children[1].value;
+tagFilterEl.value = noTagValue;
+tagFilterEl.listeners.change();
+
+assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (1/2)");
+assert.equal(boardEl.children[0].children[1].dataset.uri, "file:///second.md");
+assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1/1)");
+assert.equal(boardEl.children[1].children[1].dataset.uri, "file:///existing.md");
+
+searchClearEl.listeners.click();
+
+assert.equal(searchInputEl.value, "", "clear action should reset the query after tag filtering");
+assert.equal(tagFilterEl.value, "", "clear action should reset the selected tag");
+assert.equal(searchClearEl.hidden, true, "clear button should hide after clearing tag filtering");
+assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)");
 assert.match(
   boardEl.children[0].children[1].innerHTML,
   /property-badge/,
@@ -589,6 +697,16 @@ assert.ok(
   boardEl.children[0].children[1].innerHTML.indexOf("Owner") <
     boardEl.children[0].children[1].innerHTML.indexOf("Path"),
   "card property badges should be sorted by name"
+);
+assert.equal(
+  boardEl.children[0].children[1].style.getPropertyValue("--card-accent"),
+  "rgb(87, 128, 148)",
+  "card left border should use a muted color from the Project property"
+);
+assert.equal(
+  boardEl.children[0].children[2].style.getPropertyValue("--card-accent"),
+  "",
+  "cards without a Project property should use the default accent"
 );
 assert.match(
   boardEl.children[0].children[2].innerHTML,
@@ -617,6 +735,20 @@ assert.deepEqual(
 
 const sameColumnTransfer = createDataTransfer();
 boardEl.children[0].children[2].listeners.dragstart({ dataTransfer: sameColumnTransfer });
+const messageCountBeforeSelfDrop = messages.length;
+boardEl.children[0].children[2].listeners.drop({
+  dataTransfer: sameColumnTransfer,
+  clientY: 0,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(
+  messages.length,
+  messageCountBeforeSelfDrop,
+  "dropping a dragged card onto itself should keep its original position"
+);
+
 let sameColumnDragOverPrevented = false;
 let sameColumnDragOverStopped = false;
 boardEl.children[0].children[1].listeners.dragover({
@@ -663,6 +795,20 @@ assert.equal(
   messages.length,
   messageCountBeforeSameColumnBackgroundDrop,
   "dropping a dragged card back on its source column background should keep its original position"
+);
+
+const sameColumnUnknownSourceTransfer = createDataTransfer();
+sameColumnUnknownSourceTransfer.setData("text/uri-list", "file:///second.md");
+const messageCountBeforeUnknownSourceDrop = messages.length;
+boardEl.children[0].listeners.drop({
+  dataTransfer: sameColumnUnknownSourceTransfer,
+  preventDefault() {},
+});
+
+assert.equal(
+  messages.length,
+  messageCountBeforeUnknownSourceDrop,
+  "source-column fallback should prevent same-column background drops from appending to the bottom"
 );
 
 const crossColumnTransfer = createDataTransfer();
@@ -716,13 +862,38 @@ assert.match(
 );
 assert.match(
   detailsEl.innerHTML,
+  />Terminal<\/button>/,
+  "details should label terminal-opening path actions as Terminal"
+);
+assert.match(
+  detailsEl.innerHTML,
   /data-action-type="openCode"/,
   "details should render a code action when a path property exposes one"
 );
 assert.match(
   detailsEl.innerHTML,
+  /data-action-type="openLocalPath"/,
+  "details should render an open action when a local path property exposes one"
+);
+assert.match(
+  detailsEl.innerHTML,
   /data-action-type="openUrl"/,
   "details should render an open-url action for URL properties"
+);
+assert.match(
+  detailsEl.innerHTML,
+  /class="details-delete"/,
+  "details should render a delete ticket button"
+);
+assert.match(
+  detailsEl.innerHTML,
+  /data-action-type="deleteCard"/,
+  "details delete button should post a delete card action"
+);
+assert.doesNotMatch(
+  boardEl.children[0].children[2].innerHTML,
+  /deleteCard|details-delete/,
+  "card tiles should not render the delete action"
 );
 
 const resumeButton = new FakeElement("button");
@@ -768,6 +939,16 @@ windowListeners.message({
 });
 
 assert.match(detailsEl.innerHTML, /Codex Output/, "details should render a codex output section for Agent properties");
+assert.doesNotMatch(
+  detailsEl.innerHTML,
+  /<hr\s*\/>\s*<h2 class="details-section-title">Codex Output<\/h2>/,
+  "codex output should not render a separator line above its title"
+);
+assert.match(
+  html,
+  /\.git-status-text\s*\+\s*\.details-section-title\s*\{[^}]*margin-top:\s*18px;/,
+  "codex output title should have breathing room when it follows the git status block"
+);
 assert.match(detailsEl.innerHTML, /Investigating the issue\./, "codex output should be displayed in the details pane");
 assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest codex output should preserve line breaks");
 assert.equal(
@@ -830,6 +1011,20 @@ detailsEl.listeners.click({
 assert.equal(messages.at(-1)?.type, "openCode");
 assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
 
+const localPathButton = new FakeElement("button");
+localPathButton.setAttribute("data-action-type", "openLocalPath");
+localPathButton.setAttribute("data-action-value", "C:\\work\\demo");
+localPathButton.closest = () => localPathButton;
+
+detailsEl.listeners.click({
+  target: localPathButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "openLocalPath");
+assert.equal(messages.at(-1)?.path, "C:\\work\\demo");
+
 const urlButton = new FakeElement("button");
 urlButton.setAttribute("data-action-type", "openUrl");
 urlButton.setAttribute("data-action-value", "https://example.com/task");
@@ -843,6 +1038,21 @@ detailsEl.listeners.click({
 
 assert.equal(messages.at(-1)?.type, "openUrl");
 assert.equal(messages.at(-1)?.url, "https://example.com/task");
+
+const deleteButton = new FakeElement("button");
+deleteButton.setAttribute("data-action-type", "deleteCard");
+deleteButton.setAttribute("data-action-value", "file:///task.md");
+deleteButton.closest = () => deleteButton;
+
+detailsEl.listeners.click({
+  target: deleteButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "deleteCard");
+assert.equal(messages.at(-1)?.cardUri, "file:///task.md");
+assert.equal(messages.at(-1)?.title, "Ship it");
 
 let prevented = false;
 windowListeners.keydown({

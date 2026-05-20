@@ -73,7 +73,8 @@ To use it:
 
 Runner prerequisites:
 
-- .NET SDK with `dotnet script` support.
+- .NET SDK.
+- `dotnet-script` global tool, installable with `dotnet tool install -g dotnet-script`.
 - Codex CLI available as `codex`.
 
 You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.

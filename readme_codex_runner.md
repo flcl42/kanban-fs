@@ -89,6 +89,12 @@ Behavior:
 
 ## Running
 
+Install `dotnet-script` if needed:
+
+```powershell
+dotnet tool install -g dotnet-script
+```
+
 With `dotnet-script` installed, the portable command is:
 
 ```powershell

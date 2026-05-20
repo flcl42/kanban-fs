@@ -36,7 +36,7 @@ assert.deepEqual(
     },
     {
       line: 3,
-      title: "Open",
+      title: "Terminal",
       command: "openPath",
       value: "C:\\work\\demo",
     },
@@ -64,13 +64,13 @@ still body text
 assert.equal(noActions.length, 0, "body text should not be treated as task metadata");
 assert.deepEqual(getTaskPropertyAction("Repo", "C:\\work\\demo"), {
   command: "openPath",
-  title: "Open",
+  title: "Terminal",
   value: "C:\\work\\demo",
 });
 assert.deepEqual(getTaskPropertyActions("Repo", "C:\\work\\demo"), [
   {
     command: "openPath",
-    title: "Open",
+    title: "Terminal",
     value: "C:\\work\\demo",
   },
   {
@@ -86,7 +86,7 @@ assert.deepEqual(getTaskPropertyAction("Link", "https://example.com/task"), {
 });
 assert.deepEqual(getTaskPropertyAction("Project", "D:\\"), {
   command: "openPath",
-  title: "Open",
+  title: "Terminal",
   value: "D:\\",
 });
 assert.equal(

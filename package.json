@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
   "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional Codex runner.",
-  "version": "1.0.20",
+  "version": "1.0.23",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -87,7 +87,7 @@
       },
       {
         "command": "kanban.openPath",
-        "title": "Open Path",
+        "title": "Open Path in Terminal",
         "category": "AI Kanban"
       },
       {
@@ -98,6 +98,11 @@
       {
         "command": "kanban.openUrl",
         "title": "Open URL",
+        "category": "AI Kanban"
+      },
+      {
+        "command": "kanban.openLocalPath",
+        "title": "Open Path",
         "category": "AI Kanban"
       }
     ],
@@ -162,11 +167,12 @@
     "watch": "tsc -watch -p ./",
     "package:vsix": "npm test && vsce package",
     "publish:marketplace": "npm test && vsce publish",
-    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card",
+    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card && npm run test:fast-move-path",
     "test:board-config": "node scripts/test-board-config.js",
     "test:new-card": "node scripts/test-new-card.js",
     "test:webview": "node scripts/smoke-webview.js",
-    "test:task-links": "node scripts/test-task-links.js"
+    "test:task-links": "node scripts/test-task-links.js",
+    "test:fast-move-path": "node scripts/test-fast-move-path.js"
   },
   "devDependencies": {
     "@types/markdown-it": "^13.0.7",

@@ -97,6 +97,8 @@ sealed class TaskOrchestrator
     private void EnsureBoardScaffold()
     {
         Directory.CreateDirectory(_paths.Root);
+        Directory.CreateDirectory(_paths.TasksRoot);
+        MoveRootKanbanMarkerIntoTasks();
         var shouldSeedKanbanConfig = ShouldSeedKanbanConfig(_paths.KanbanMarkerPath);
         foreach (var directory in _paths.RequiredDirectories)
         {
@@ -111,6 +113,41 @@ sealed class TaskOrchestrator
         EnsureFileExists(_paths.ProjectsMapPath, BoardTemplates.ProjectsTemplate);
         EnsureFileExists(_paths.ContextPath, BoardTemplates.ResolveContextTemplate(_settings.InvocationDirectory));
         EnsureFileExists(_paths.TaskTemplatePath, BoardTemplates.ResolveTaskTemplate(_settings.InvocationDirectory));
+    }
+
+    private void MoveRootKanbanMarkerIntoTasks()
+    {
+        var rootMarkerPath = Path.Combine(_paths.Root, ".kanban");
+        if (!File.Exists(rootMarkerPath) || PathEquals(rootMarkerPath, _paths.KanbanMarkerPath))
+        {
+            return;
+        }
+
+        if (!File.Exists(_paths.KanbanMarkerPath))
+        {
+            File.Move(rootMarkerPath, _paths.KanbanMarkerPath);
+            _log.Info($"Moved root .kanban marker into tasks: {_paths.KanbanMarkerPath}");
+            return;
+        }
+
+        var rootText = File.ReadAllText(rootMarkerPath, Encoding.UTF8);
+        var taskText = File.ReadAllText(_paths.KanbanMarkerPath, Encoding.UTF8);
+        if (string.IsNullOrWhiteSpace(taskText) && !string.IsNullOrWhiteSpace(rootText))
+        {
+            File.WriteAllText(_paths.KanbanMarkerPath, rootText, new UTF8Encoding(false));
+            File.Delete(rootMarkerPath);
+            _log.Info($"Moved root .kanban marker content into tasks: {_paths.KanbanMarkerPath}");
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(rootText))
+        {
+            File.Delete(rootMarkerPath);
+            _log.Info("Removed empty root .kanban marker after runner initialization.");
+            return;
+        }
+
+        _log.Warn($"Root .kanban marker was left in place because tasks/.kanban already exists: {rootMarkerPath}");
     }
 
     private static bool ShouldSeedKanbanConfig(string path)
@@ -865,6 +902,11 @@ sealed class WorkspaceMoveBridge
 {
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ResponseTimeout = TimeSpan.FromMilliseconds(1000);
+    private static readonly JsonSerializerOptions ProtocolJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        PropertyNameCaseInsensitive = true
+    };
     private readonly string _boardRoot;
     private readonly LogSink _log;
 
@@ -880,6 +922,7 @@ sealed class WorkspaceMoveBridge
             sourcePath,
             destinationPath,
             "file",
+            File.Exists,
             File.Move,
             cancellationToken);
     }
@@ -890,6 +933,7 @@ sealed class WorkspaceMoveBridge
             sourcePath,
             destinationPath,
             "directory",
+            Directory.Exists,
             Directory.Move,
             cancellationToken);
     }
@@ -898,6 +942,7 @@ sealed class WorkspaceMoveBridge
         string sourcePath,
         string destinationPath,
         string entryType,
+        Func<string, bool> exists,
         Action<string, string> moveDirectly,
         CancellationToken cancellationToken)
     {
@@ -910,6 +955,15 @@ sealed class WorkspaceMoveBridge
         if (extensionResult == WorkspaceMoveBridgeResult.MovedByExtension)
         {
             _log.Info($"Moved {entryType} via VS Code extension (extension asked): `{sourcePath}` -> `{destinationPath}`");
+            return;
+        }
+
+        if (
+            extensionResult == WorkspaceMoveBridgeResult.ExtensionAskedNoMove &&
+            !exists(sourcePath) &&
+            exists(destinationPath))
+        {
+            _log.Info($"Moved {entryType} via VS Code extension (verified after missing response): `{sourcePath}` -> `{destinationPath}`");
             return;
         }
 
@@ -949,7 +1003,7 @@ sealed class WorkspaceMoveBridge
                 Path.GetFullPath(sourcePath),
                 Path.GetFullPath(destinationPath),
                 entryType);
-            await writer.WriteLineAsync(JsonSerializer.Serialize(request));
+            await writer.WriteLineAsync(JsonSerializer.Serialize(request, ProtocolJsonOptions));
             requestSent = true;
 
             using var responseCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -967,7 +1021,7 @@ sealed class WorkspaceMoveBridge
                 return WorkspaceMoveBridgeResult.ExtensionAskedNoMove;
             }
 
-            var response = JsonSerializer.Deserialize<WorkspaceMoveResponse>(responseLine);
+            var response = JsonSerializer.Deserialize<WorkspaceMoveResponse>(responseLine, ProtocolJsonOptions);
             if (response?.Ok == true)
             {
                 return WorkspaceMoveBridgeResult.MovedByExtension;

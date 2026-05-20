@@ -17,6 +17,7 @@ import {
   type BoardConfig,
 } from "./board-config";
 import {
+  findTaskProperties,
   parseTaskMarkdown,
   type TaskProperty,
 } from "./task-metadata";
@@ -95,10 +96,7 @@ type RunnerToolStatus = {
   installUrl: string;
 };
 
-type RunnerToolStatuses = {
-  dotnet: RunnerToolStatus;
-  codex: RunnerToolStatus;
-};
+type RunnerToolStatuses = Record<string, RunnerToolStatus>;
 
 const md = new MarkdownIt({
   html: false,
@@ -111,6 +109,7 @@ const RESUME_AGENT_COMMAND = "kanban.resumeAgent";
 const OPEN_PATH_COMMAND = "kanban.openPath";
 const OPEN_CODE_COMMAND = "kanban.openCode";
 const OPEN_URL_COMMAND = "kanban.openUrl";
+const OPEN_LOCAL_PATH_COMMAND = "kanban.openLocalPath";
 const CREATE_EMPTY_BOARD_COMMAND = "kanban.createEmptyBoard";
 const CREATE_BOARD_WITH_COLUMNS_COMMAND = "kanban.createBoardWithColumns";
 const CREATE_BOARD_WITH_RUNNER_COMMAND = "kanban.createBoardWithRunner";
@@ -131,6 +130,7 @@ const RUNNER_STATUS_PORT_STEP = 997;
 const RUNNER_STATUS_PORT_CANDIDATES = 32;
 const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
 const DOTNET_INSTALL_URL = "https://dotnet.microsoft.com/download";
+const DOTNET_SCRIPT_INSTALL_URL = "https://github.com/dotnet-script/dotnet-script";
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
 const KANBAN_FILE_NAME = ".kanban";
 const DEFAULT_BOARD_COLUMNS = [
@@ -165,6 +165,9 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand(OPEN_URL_COMMAND, async (targetUrl: string) =>
       provider.openUrl(String(targetUrl))
+    ),
+    vscode.commands.registerCommand(OPEN_LOCAL_PATH_COMMAND, async (targetPath: string) =>
+      provider.openLocalPath(String(targetPath))
     ),
     vscode.commands.registerCommand(CREATE_EMPTY_BOARD_COMMAND, async () =>
       provider.createEmptyBoard()
@@ -322,17 +325,25 @@ class WorkspaceMoveServer implements vscode.Disposable {
       };
     }
 
-    if (request.command !== "move") {
+    const requestRecord = request as Record<string, unknown>;
+    const readRequestString = (name: string): string =>
+      String(
+        requestRecord[name] ??
+          requestRecord[`${name.charAt(0).toUpperCase()}${name.slice(1)}`] ??
+          ""
+      );
+
+    if (readRequestString("command") !== "move") {
       return { ok: false, error: "Unsupported command." };
     }
 
-    const boardRoot = normalizeMovePath(String(request.boardRoot ?? ""));
+    const boardRoot = normalizeMovePath(readRequestString("boardRoot"));
     if (boardRoot !== root) {
       return { ok: false, error: "Workspace root mismatch." };
     }
 
-    const sourcePath = path.resolve(String(request.sourcePath ?? ""));
-    const destinationPath = path.resolve(String(request.destinationPath ?? ""));
+    const sourcePath = path.resolve(readRequestString("sourcePath"));
+    const destinationPath = path.resolve(readRequestString("destinationPath"));
     if (!isPathInsideRoot(sourcePath, root) || !isPathInsideRoot(destinationPath, root)) {
       return {
         ok: false,
@@ -344,14 +355,17 @@ class WorkspaceMoveServer implements vscode.Disposable {
       vscode.Uri.file(path.dirname(destinationPath))
     );
 
-    const edit = new vscode.WorkspaceEdit();
-    edit.renameFile(vscode.Uri.file(sourcePath), vscode.Uri.file(destinationPath), {
-      overwrite: false,
-    });
-
-    const applied = await vscode.workspace.applyEdit(edit);
-    if (!applied) {
-      return { ok: false, error: "VS Code rejected the move edit." };
+    try {
+      await vscode.workspace.fs.rename(
+        vscode.Uri.file(sourcePath),
+        vscode.Uri.file(destinationPath),
+        { overwrite: false }
+      );
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Error ? error.message : "VS Code rejected the move.",
+      };
     }
 
     return { ok: true };
@@ -418,6 +432,154 @@ function isPathInsideRoot(candidatePath: string, root: string): boolean {
   );
 }
 
+function getPathResolutionBases(
+  fileUri: vscode.Uri,
+  boardFolderUri?: vscode.Uri
+): string[] {
+  const bases: string[] = [];
+  const addBase = (candidate: string | undefined) => {
+    if (!candidate) {
+      return;
+    }
+    const resolved = path.resolve(candidate);
+    if (!bases.some((base) => normalizeMovePath(base) === normalizeMovePath(resolved))) {
+      bases.push(resolved);
+    }
+  };
+
+  if (fileUri.scheme === "file") {
+    const fileDirectory = path.dirname(fileUri.fsPath);
+    addBase(fileDirectory);
+    const parent = path.dirname(fileDirectory);
+    addBase(parent);
+    if (path.basename(parent).toLowerCase() === "tasks") {
+      addBase(path.dirname(parent));
+    }
+  }
+
+  if (boardFolderUri?.scheme === "file") {
+    addBase(boardFolderUri.fsPath);
+    if (path.basename(boardFolderUri.fsPath).toLowerCase() === "tasks") {
+      addBase(path.dirname(boardFolderUri.fsPath));
+    }
+  }
+
+  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+    if (folder.uri.scheme === "file") {
+      addBase(folder.uri.fsPath);
+    }
+  }
+
+  return bases;
+}
+
+function shouldProbeExistingLocalPath(key: string, value: string): boolean {
+  const normalizedValue = normalizeTaskPropertyValue(value);
+  if (
+    !normalizedValue ||
+    /[\r\n\0]/.test(normalizedValue) ||
+    isTaskGuidValue(normalizedValue) ||
+    isTaskExternalUrlValue(normalizedValue)
+  ) {
+    return false;
+  }
+  if (isTaskAbsoluteLocalPath(normalizedValue)) {
+    return true;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(normalizedValue)) {
+    return false;
+  }
+  if (/^\.{1,2}([\\/]|$)/.test(normalizedValue) || /[\\/]/.test(normalizedValue)) {
+    return true;
+  }
+  if (/\.[a-z0-9]{1,16}$/i.test(path.basename(normalizedValue))) {
+    return true;
+  }
+
+  return key.trim().length > 0;
+}
+
+async function resolveExistingLocalPath(
+  key: string,
+  value: string,
+  bases: string[]
+): Promise<string | null> {
+  const normalizedValue = normalizeTaskPropertyValue(value);
+  if (!shouldProbeExistingLocalPath(key, normalizedValue)) {
+    return null;
+  }
+
+  const candidates = isTaskAbsoluteLocalPath(normalizedValue)
+    ? [normalizedValue]
+    : bases.map((base) => path.resolve(base, normalizedValue));
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const normalizedCandidate = normalizeMovePath(candidate);
+    if (seen.has(normalizedCandidate)) {
+      continue;
+    }
+    seen.add(normalizedCandidate);
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.file(candidate));
+      return candidate;
+    } catch {
+      // Only existing paths should get an Open action.
+    }
+  }
+
+  return null;
+}
+
+async function getTaskPropertyActionsWithExistingLocalPath(
+  key: string,
+  value: string,
+  bases: string[]
+): Promise<TaskPropertyAction[]> {
+  const actions = getTaskPropertyActions(key, value);
+  const existingPath = await resolveExistingLocalPath(key, value, bases);
+  if (
+    existingPath &&
+    !actions.some(
+      (action) => action.command === "openLocalPath" && action.value === existingPath
+    )
+  ) {
+    actions.push({
+      command: "openLocalPath",
+      title: "Open",
+      value: existingPath,
+    });
+  }
+  return actions;
+}
+
+async function findTaskLinkActionsWithExistingLocalPaths(
+  content: string,
+  bases: string[]
+): Promise<TaskLinkAction[]> {
+  const actions = findTaskLinkActions(content);
+  const localPathActions: TaskLinkAction[] = [];
+  for (const property of findTaskProperties(content)) {
+    const existingPath = await resolveExistingLocalPath(
+      property.key,
+      property.value,
+      bases
+    );
+    if (!existingPath) {
+      continue;
+    }
+    localPathActions.push({
+      line: property.line,
+      key: property.key,
+      label: property.label,
+      command: "openLocalPath",
+      title: "Open",
+      value: existingPath,
+    });
+  }
+
+  return [...actions, ...localPathActions].sort((left, right) => left.line - right.line);
+}
+
 class TaskActionEditorProvider implements vscode.CodeLensProvider, vscode.Disposable {
   private readonly onDidChangeCodeLensesEmitter = new vscode.EventEmitter<void>();
   public readonly onDidChangeCodeLenses =
@@ -454,14 +616,17 @@ class TaskActionEditorProvider implements vscode.CodeLensProvider, vscode.Dispos
   provideCodeLenses(
     document: vscode.TextDocument
   ): vscode.ProviderResult<vscode.CodeLens[]> {
-    return this.getActions(document).map((action) => {
+    return this.getActions(document).then((actions) => actions.map((action) => {
       const line = document.lineAt(action.line);
       return new vscode.CodeLens(line.range, toTaskActionCommand(action));
-    });
+    }));
   }
 
-  private getActions(document: vscode.TextDocument) {
-    return findTaskLinkActions(document.getText());
+  private getActions(document: vscode.TextDocument): Promise<TaskLinkAction[]> {
+    return findTaskLinkActionsWithExistingLocalPaths(
+      document.getText(),
+      getPathResolutionBases(document.uri)
+    );
   }
 
   private refresh(): void {
@@ -483,6 +648,8 @@ function toTaskActionCommand(action: TaskLinkAction): vscode.Command {
     command = OPEN_CODE_COMMAND;
   } else if (action.command === "openUrl") {
     command = OPEN_URL_COMMAND;
+  } else if (action.command === "openLocalPath") {
+    command = OPEN_LOCAL_PATH_COMMAND;
   }
   return {
     title: action.title,
@@ -499,7 +666,9 @@ function getTaskActionTooltip(action: TaskLinkAction): string {
       ? `Open ${action.value} in VS Code`
       : action.command === "openUrl"
         ? `Open ${action.value}`
-      : `Open ${action.value}`;
+        : action.command === "openLocalPath"
+          ? `Open ${action.value}`
+          : `Open terminal at ${action.value}`;
 }
 
 function isMarkdownDocument(document: vscode.TextDocument): boolean {
@@ -810,6 +979,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await sendBoard();
         return;
       }
+      if (message?.type === "deleteCard" && message?.cardUri) {
+        const title = String(message?.title ?? "this ticket").trim() || "this ticket";
+        const confirmed = await vscode.window.showWarningMessage(
+          `Delete ticket "${title}"? This deletes the Markdown file.`,
+          { modal: true },
+          "Delete"
+        );
+        if (confirmed !== "Delete") {
+          return;
+        }
+        await runBoardMutation(() => this.deleteCard(document.uri, message.cardUri));
+        await sendBoard();
+        return;
+      }
       if (message?.type === "startRunner") {
         try {
           await this.startRunner(document.uri);
@@ -909,6 +1092,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "openCode" && message?.path) {
         await this.openPathInCode(String(message.path));
+        return;
+      }
+      if (message?.type === "openLocalPath" && message?.path) {
+        await this.openLocalPath(String(message.path));
         return;
       }
       if (message?.type === "openUrl" && message?.url) {
@@ -1109,13 +1296,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         text,
         name
       );
-      const propertiesWithActions = properties.map((property) => ({
-        ...property,
-        actions: getTaskPropertyActions(property.key, property.value),
-      })).map((property) => ({
-        ...property,
-        action: property.actions[0] ?? null,
-      }));
+      const actionBases = getPathResolutionBases(
+        fileUri,
+        vscode.Uri.joinPath(columnUri, "..")
+      );
+      const propertiesWithActions = await Promise.all(
+        properties.map(async (property) => {
+          const actions = await getTaskPropertyActionsWithExistingLocalPath(
+            property.key,
+            property.value,
+            actionBases
+          );
+          return {
+            ...property,
+            actions,
+            action: actions[0] ?? null,
+          };
+        })
+      );
       const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
       cards.push({
@@ -1234,6 +1432,49 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       ],
       context
     );
+    await this.applyEditContext(context);
+  }
+
+  private async deleteCard(
+    kanbanUri: vscode.Uri,
+    cardUriString: string
+  ): Promise<void> {
+    if (!cardUriString) {
+      return;
+    }
+    const cardUri = vscode.Uri.parse(cardUriString);
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
+    const sourceColumnParentUri = vscode.Uri.joinPath(sourceColumnUri, "..");
+    const fileName = path.posix.basename(cardUri.path).toLowerCase();
+    if (
+      sourceColumnParentUri.toString() !== boardFolder.toString() ||
+      !fileName.endsWith(".md") ||
+      fileName === "folder.md" ||
+      fileName === CARD_TEMPLATE_FILE_NAME.toLowerCase()
+    ) {
+      return;
+    }
+    const sourceColumnId = path.posix.basename(sourceColumnUri.path);
+    const boardConfig =
+      (await this.readBoardConfigForWrite(kanbanUri)) ??
+      createEmptyBoardConfig("", false);
+    const sourceCards = sourceColumnId
+      ? await this.readOrderedCardsForColumn(kanbanUri, sourceColumnId, boardConfig)
+      : [];
+    const sourceOrderedUris = sourceCards
+      .filter((card) => card.uri !== cardUriString)
+      .map((card) => card.uri);
+
+    const context = this.createEditContext();
+    await this.deleteFile(cardUri, context);
+    if (sourceColumnId) {
+      await this.updateBoardCardPriorities(
+        kanbanUri,
+        [{ columnId: sourceColumnId, orderedUris: sourceOrderedUris }],
+        context
+      );
+    }
     await this.applyEditContext(context);
   }
 
@@ -1539,6 +1780,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
   }
 
+  public async openLocalPath(rawPath: string): Promise<void> {
+    const targetPath = normalizeTaskPropertyValue(rawPath);
+    if (!isTaskAbsoluteLocalPath(targetPath)) {
+      return;
+    }
+
+    let stat: vscode.FileStat;
+    try {
+      stat = await vscode.workspace.fs.stat(vscode.Uri.file(targetPath));
+    } catch {
+      return;
+    }
+
+    const uri = vscode.Uri.file(targetPath);
+    if (stat.type === vscode.FileType.Directory) {
+      await vscode.env.openExternal(uri);
+      return;
+    }
+
+    await vscode.commands.executeCommand("vscode.open", uri);
+  }
+
   public async openUrl(rawUrl: string): Promise<void> {
     const targetUrl = normalizeTaskPropertyValue(rawUrl);
     if (!isTaskExternalUrlValue(targetUrl)) {
@@ -1614,21 +1877,72 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   }
 
   private async getRunnerToolStatuses(): Promise<RunnerToolStatuses> {
-    const [dotnet, codex] = await Promise.all([
-      this.detectRunnerTool(
-        ".NET SDK",
-        "dotnet",
-        ["--version"],
-        DOTNET_INSTALL_URL
-      ),
-      this.detectRunnerTool(
-        "Codex CLI",
+    const checks: Array<[string, Promise<RunnerToolStatus>]> = [
+      [
         "codex",
-        ["--version"],
-        CODEX_INSTALL_URL
-      ),
-    ]);
-    return { dotnet, codex };
+        this.detectRunnerTool(
+          "Codex CLI",
+          "codex",
+          ["--version"],
+          CODEX_INSTALL_URL
+        ),
+      ],
+    ];
+
+    if (this.runnerCommandUsesDotnet()) {
+      checks.push([
+        "dotnet",
+        this.detectRunnerTool(
+          ".NET SDK",
+          "dotnet",
+          ["--version"],
+          DOTNET_INSTALL_URL
+        ),
+      ]);
+    }
+
+    if (this.runnerCommandUsesDotnetScript()) {
+      checks.push([
+        "dotnetScript",
+        this.detectRunnerTool(
+          "dotnet-script",
+          "dotnet",
+          ["script", "--version"],
+          DOTNET_SCRIPT_INSTALL_URL
+        ),
+      ]);
+    }
+
+    const results = await Promise.all(
+      checks.map(async ([key, status]) => [key, await status] as const)
+    );
+    return Object.fromEntries(results);
+  }
+
+  private runnerCommandUsesDotnet(): boolean {
+    const commandParts = this.getRunnerCommandSetting()
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    const commandName = commandParts[0]
+      ? path.basename(commandParts[0]).replace(/\.exe$/i, "")
+      : "";
+    return commandName === "dotnet";
+  }
+
+  private runnerCommandUsesDotnetScript(): boolean {
+    if (!this.runnerCommandUsesDotnet()) {
+      return false;
+    }
+
+    const commandParts = this.getRunnerCommandSetting()
+      .trim()
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean);
+    const args = this.getRunnerArgsSetting().map((arg) => arg.toLowerCase());
+    return commandParts.includes("script") || args.includes("script");
   }
 
   private async detectRunnerTool(
@@ -2319,18 +2633,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private async renameFile(
     oldUri: vscode.Uri,
     newUri: vscode.Uri,
-    context?: EditContext
+    _context?: EditContext
   ): Promise<void> {
     if (oldUri.toString() === newUri.toString()) {
       return;
     }
-    if (context) {
-      context.edit.renameFile(oldUri, newUri, { overwrite: false });
-      return;
-    }
-    const edit = new vscode.WorkspaceEdit();
-    edit.renameFile(oldUri, newUri, { overwrite: false });
-    await vscode.workspace.applyEdit(edit);
+    await vscode.workspace.fs.rename(oldUri, newUri, { overwrite: false });
   }
 
   private async ensureFile(
@@ -2343,6 +2651,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     const edit = new vscode.WorkspaceEdit();
     edit.createFile(fileUri, { ignoreIfExists: true });
+    await vscode.workspace.applyEdit(edit);
+  }
+
+  private async deleteFile(
+    fileUri: vscode.Uri,
+    context?: EditContext
+  ): Promise<void> {
+    if (context) {
+      context.edit.deleteFile(fileUri, { ignoreIfNotExists: true });
+      return;
+    }
+    const edit = new vscode.WorkspaceEdit();
+    edit.deleteFile(fileUri, { ignoreIfNotExists: true });
     await vscode.workspace.applyEdit(edit);
   }
 
@@ -2480,6 +2801,34 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .board-search-input::placeholder {
       color: var(--muted);
     }
+    .board-tag-filter {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel);
+      box-shadow: 0 10px 22px -18px var(--shadow);
+    }
+    .board-tag-filter-label {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .board-tag-filter-select {
+      min-width: 150px;
+      border: 0;
+      outline: none;
+      background: transparent;
+      color: var(--ink);
+      font: inherit;
+      padding: 0;
+    }
     .search-meta {
       font-family: var(--mono);
       font-size: 12px;
@@ -2578,6 +2927,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .runner-panel button:disabled {
       cursor: wait;
       opacity: 0.72;
+    }
+    .runner-panel-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+    .runner-hide-default {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .runner-hide-default input {
+      margin: 0;
     }
     .layout {
       display: grid;
@@ -2806,9 +3173,49 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .details-resizer.active::before {
       background: var(--accent);
     }
+    .details-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .details-title {
+      min-width: 0;
+      flex: 1;
+    }
     .details h1 {
-      margin-top: 0;
+      margin: 0;
       font-size: 22px;
+    }
+    .details-delete {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--vscode-errorForeground, #f14c4c);
+      cursor: pointer;
+      padding: 0;
+    }
+    .details-delete:hover {
+      border-color: var(--vscode-errorForeground, #f14c4c);
+      background: var(--vscode-inputValidation-errorBackground, var(--surface));
+    }
+    .details-delete:focus {
+      outline: 2px solid var(--vscode-errorForeground, #f14c4c);
+      outline-offset: 2px;
+    }
+    .details-delete svg {
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
     }
     .details .empty {
       color: var(--muted);
@@ -2943,6 +3350,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .git-status-text + .details-section-title {
+      margin-top: 18px;
+    }
     .codex-output-text {
       margin: 0;
       padding: 12px;
@@ -3008,6 +3418,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             spellcheck="false"
           />
         </label>
+        <label class="board-tag-filter" for="board-tag-filter">
+          <span class="board-tag-filter-label">Tag</span>
+          <select class="board-tag-filter-select" id="board-tag-filter">
+            <option value="">All tags</option>
+          </select>
+        </label>
         <button class="search-clear" id="search-clear" type="button" hidden>Clear</button>
         <div class="search-meta" id="search-meta"></div>
       </div>
@@ -3028,6 +3444,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const detailsEl = document.getElementById("details");
     const detailsResizerEl = document.getElementById("details-resizer");
     const searchInputEl = document.getElementById("board-search-input");
+    const tagFilterEl = document.getElementById("board-tag-filter");
     const searchMetaEl = document.getElementById("search-meta");
     const searchClearEl = document.getElementById("search-clear");
     const runnerPanelEl = document.getElementById("runner-panel");
@@ -3035,9 +3452,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let selectedCard = null;
     let lastBoard = null;
     let searchQuery = "";
+    let selectedTagFilter = "";
     let runnerStatus = { enabled: false, running: false };
     let runnerStartPending = false;
     let runnerCreatePending = false;
+    let runnerPanelHiddenForSession = false;
     const gitStatusCache = new Map();
     const codexOutputCache = new Map();
     let refreshTimer = null;
@@ -3066,7 +3485,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (!runnerPanelEl) {
         return;
       }
-      if (!runnerStatus?.enabled || runnerStatus.running) {
+      if (runnerPanelHiddenForSession || !runnerStatus?.enabled || runnerStatus.running) {
         runnerPanelEl.hidden = true;
         runnerPanelEl.innerHTML = "";
         runnerStartPending = false;
@@ -3094,6 +3513,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           </div>
         \`
         : "";
+      const hideActionHtml = \`
+        <div class="runner-panel-actions">
+          <button type="button" data-action-type="hideRunnerPanel">Hide</button>
+          <label class="runner-hide-default">[ <input type="checkbox" data-runner-hide-default /> by default ]</label>
+        </div>
+      \`;
       if (runnerStatus.runnerScriptRequired && !runnerStatus.runnerScriptExists) {
         runnerPanelEl.innerHTML = \`
           <div>
@@ -3105,7 +3530,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <button type="button" data-action-type="createRunner" \${runnerCreatePending ? "disabled" : ""}>
             \${runnerCreatePending ? "Initializing..." : "Initialize runner"}
           </button>
-          <button type="button" data-action-type="hideRunnerPanel">Hide</button>
+          \${hideActionHtml}
         \`;
         return;
       }
@@ -3119,7 +3544,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <button type="button" data-action-type="startRunner" \${runnerStartPending || missingRequirements.length ? "disabled" : ""}>
           \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
         </button>
-        <button type="button" data-action-type="hideRunnerPanel">Hide</button>
+        \${hideActionHtml}
       \`;
     };
 
@@ -3204,7 +3629,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           if (!type || !label || !value) {
             return null;
           }
-          if (type !== "resumeAgent" && type !== "openPath" && type !== "openCode" && type !== "openUrl") {
+          if (
+            type !== "resumeAgent" &&
+            type !== "openPath" &&
+            type !== "openCode" &&
+            type !== "openUrl" &&
+            type !== "openLocalPath"
+          ) {
             return null;
           }
           return { type, label, value };
@@ -3348,7 +3779,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (cached.state === "loading") {
         return \`
-          <hr />
           <h2 class="details-section-title">Codex Output</h2>
           <pre class="codex-output-text">\${escapeHtml(cached.text || "Loading...")}</pre>
         \`;
@@ -3366,7 +3796,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         })
         .join("\\n");
       return \`
-        <hr />
         <h2 class="details-section-title">Codex Output</h2>
         <pre class="codex-output-text">\${escapeHtml(text)}</pre>
       \`;
@@ -3425,8 +3854,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const codexOutputHtml = renderCodexOutput(card);
       const metaLine = "Created: " + createdLabel + " · " + createdRelative;
       detailsEl.innerHTML = \`
-        <h1>\${escapeHtml(card.title)}</h1>
-        <div class="meta">\${metaLine}</div>
+        <div class="details-header">
+          <div class="details-title">
+            <h1>\${escapeHtml(card.title)}</h1>
+            <div class="meta">\${metaLine}</div>
+          </div>
+          <button
+            class="details-delete"
+            type="button"
+            title="Delete ticket"
+            aria-label="Delete \${escapeHtml(card.title)}"
+            data-action-type="deleteCard"
+            data-action-value="\${escapeHtml(card.uri)}"
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+              <path d="M4 7h16" />
+              <path d="M10 11v6" />
+              <path d="M14 11v6" />
+              <path d="M6 7l1 14h10l1-14" />
+              <path d="M9 7V4h6v3" />
+            </svg>
+          </button>
+        </div>
         \${tagsHtml}
         \${propertiesHtml}
         <div class="details-body">
@@ -3467,6 +3916,69 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return !query || buildCardSearchText(card).includes(query);
     };
 
+    const NO_TAG_FILTER = "__kanban_no_tag__";
+
+    const normalizeTagValue = (value) => {
+      return String(value ?? "").trim();
+    };
+
+    const getCardTags = (card) => {
+      return (card?.tags || []).map(normalizeTagValue).filter(Boolean);
+    };
+
+    const matchesTagFilter = (card, tagFilter) => {
+      if (!tagFilter) {
+        return true;
+      }
+      const tags = getCardTags(card);
+      if (tagFilter === NO_TAG_FILTER) {
+        return tags.length === 0;
+      }
+      return tags.includes(tagFilter);
+    };
+
+    const matchesActiveFilters = (card, query, tagFilter) => {
+      return matchesSearch(card, query) && matchesTagFilter(card, tagFilter);
+    };
+
+    const collectTags = (board) => {
+      const tags = new Set();
+      for (const column of board?.columns || []) {
+        for (const card of column?.cards || []) {
+          for (const tag of getCardTags(card)) {
+            tags.add(tag);
+          }
+        }
+      }
+      return Array.from(tags).sort((left, right) =>
+        left.localeCompare(right, undefined, { sensitivity: "base" })
+      );
+    };
+
+    const updateTagFilterOptions = (board) => {
+      if (!tagFilterEl) {
+        return;
+      }
+      const tags = collectTags(board);
+      if (selectedTagFilter && selectedTagFilter !== NO_TAG_FILTER && !tags.includes(selectedTagFilter)) {
+        selectedTagFilter = "";
+      }
+
+      tagFilterEl.innerHTML = "";
+      const addOption = (value, label) => {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        tagFilterEl.appendChild(option);
+      };
+      addOption("", "All tags");
+      addOption(NO_TAG_FILTER, "(no-tag)");
+      for (const tag of tags) {
+        addOption(tag, tag);
+      }
+      tagFilterEl.value = selectedTagFilter;
+    };
+
     const countCards = (columns) => {
       return (columns || []).reduce((sum, column) => {
         return sum + (Array.isArray(column?.cards) ? column.cards.length : 0);
@@ -3487,13 +3999,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const updateSearchUi = (boardColumns, visibleColumns) => {
       const activeQuery = normalizeSearchQuery(searchQuery);
+      const activeTagFilter = selectedTagFilter;
+      const activeFilter = Boolean(activeQuery || activeTagFilter);
       const totalCards = countCards(boardColumns);
       const visibleCards = countCards(visibleColumns);
       if (searchMetaEl) {
-        if (!activeQuery) {
+        if (!activeFilter) {
           searchMetaEl.textContent = totalCards === 1 ? "1 card" : \`\${totalCards} cards\`;
-        } else if (!visibleCards) {
+        } else if (!visibleCards && activeQuery && !activeTagFilter) {
           searchMetaEl.textContent = \`No cards match "\${searchQuery.trim()}".\`;
+        } else if (!visibleCards && activeTagFilter === NO_TAG_FILTER && !activeQuery) {
+          searchMetaEl.textContent = "No cards without tags.";
+        } else if (!visibleCards && activeTagFilter && !activeQuery) {
+          searchMetaEl.textContent = \`No cards match tag "\${activeTagFilter}".\`;
+        } else if (!visibleCards) {
+          searchMetaEl.textContent = "No cards match the current filters.";
         } else {
           const matchingColumns = (visibleColumns || []).filter((column) => column.cards.length > 0).length;
           const columnLabel = matchingColumns === 1 ? "column" : "columns";
@@ -3502,7 +4022,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
       }
       if (searchClearEl) {
-        searchClearEl.hidden = !activeQuery;
+        searchClearEl.hidden = !activeFilter;
       }
     };
 
@@ -3510,8 +4030,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return Array.from(event?.dataTransfer?.types || []);
     };
 
+    const getCardUris = (cards) => {
+      return (cards || []).map((card) => card.uri).filter(Boolean);
+    };
+
+    const hasSameOrder = (cards, orderedUris) => {
+      const currentUris = getCardUris(cards);
+      return currentUris.length === orderedUris.length
+        && currentUris.every((uri, index) => uri === orderedUris[index]);
+    };
+
     const buildOrderedUris = (cards, cardUri, targetUri, position) => {
-      const list = (cards || []).map((card) => card.uri).filter((uri) => uri !== cardUri);
+      const currentUris = getCardUris(cards);
+      if (cardUri && targetUri && cardUri === targetUri) {
+        return currentUris;
+      }
+      const list = currentUris.filter((uri) => uri !== cardUri);
       if (!targetUri) {
         if (position === "start") {
           list.unshift(cardUri);
@@ -3572,15 +4106,23 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return luminance > 0.5 ? "#1f1b14" : "#fff";
     };
 
-    const tagStyle = (tag) => {
-      const hash = hashString(tag.toLowerCase());
+    const colorStyle = (value, saturation, lightness) => {
+      const hash = hashString(value.toLowerCase());
       const hue = hash % 360;
-      const saturation = 0.55;
-      const lightness = 0.5;
       const [r, g, b] = hslToRgb(hue, saturation, lightness);
       const text = readableTextColor(r, g, b);
       const rgb = \`rgb(\${Math.round(r * 255)}, \${Math.round(g * 255)}, \${Math.round(b * 255)})\`;
       return { background: rgb, color: text };
+    };
+
+    const tagStyle = (tag) => colorStyle(tag, 0.55, 0.5);
+    const projectBorderStyle = (project) => colorStyle(project, 0.26, 0.46);
+
+    const getProjectValue = (card) => {
+      const projectProperty = (card?.properties || []).find((property) => {
+        return String(property?.key || "").trim().toLowerCase() === "project";
+      });
+      return String(projectProperty?.value || "").trim();
     };
 
     const renderTags = (tags) => {
@@ -3619,6 +4161,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return null;
     };
 
+    const findCardColumnId = (board, uri) => {
+      for (const column of board?.columns || []) {
+        for (const card of column.cards || []) {
+          if (card.uri === uri) return column.id ?? column.name;
+        }
+      }
+      return null;
+    };
+
     const syncDetails = () => {
       if (!selectedCard) {
         renderDetailsPlaceholder("Select a card to view details.");
@@ -3631,8 +4182,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       selectedCard = updated;
-      if (!matchesSearch(updated, normalizeSearchQuery(searchQuery))) {
-        renderDetailsPlaceholder("Selected card is hidden by the current search.");
+      const activeQuery = normalizeSearchQuery(searchQuery);
+      const activeTagFilter = selectedTagFilter;
+      if (!matchesActiveFilters(updated, activeQuery, activeTagFilter)) {
+        const filterLabel = activeQuery && !activeTagFilter
+          ? "current search"
+          : activeTagFilter && !activeQuery
+            ? "current tag filter"
+            : "current filters";
+        renderDetailsPlaceholder(\`Selected card is hidden by the \${filterLabel}.\`);
         return;
       }
       renderDetails(updated);
@@ -3640,20 +4198,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const renderBoard = (board) => {
       boardEl.innerHTML = "";
+      updateTagFilterOptions(board);
       if (!board?.columns?.length) {
         boardEl.innerHTML = '<div class="card">No columns found. Create folders next to the .kanban file.</div>';
         updateSearchUi([], []);
         return;
       }
       const activeQuery = normalizeSearchQuery(searchQuery);
-      const searchActive = Boolean(activeQuery);
+      const activeTagFilter = selectedTagFilter;
+      const searchActive = Boolean(activeQuery || activeTagFilter);
       const visibleColumns = [];
       const firstColumnId = board.columns[0]?.id ?? board.columns[0]?.name;
       for (const column of board.columns) {
         const columnId = column.id ?? column.name;
         const allCards = Array.isArray(column.cards) ? column.cards : [];
         const visibleCards = searchActive
-          ? allCards.filter((card) => matchesSearch(card, activeQuery))
+          ? allCards.filter((card) => matchesActiveFilters(card, activeQuery, activeTagFilter))
           : allCards;
         visibleColumns.push({ id: columnId, cards: visibleCards });
         const columnEl = document.createElement("div");
@@ -3738,6 +4298,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
                 sourceColumnId = payload.columnId;
               } catch {}
             }
+            if (!sourceColumnId) {
+              sourceColumnId = findCardColumnId(lastBoard, cardUri);
+            }
             if (searchActive && sourceColumnId === columnId) {
               return;
             }
@@ -3769,6 +4332,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           cardEl.draggable = true;
           cardEl.dataset.uri = card.uri;
           cardEl.dataset.column = columnId;
+          const projectValue = getProjectValue(card);
+          if (projectValue) {
+            cardEl.style.setProperty("--card-accent", projectBorderStyle(projectValue).background);
+          }
           const tagsHtml = renderTags(card.tags || []);
           const propertyBadgesHtml = renderPropertyBadges(card.properties || []);
           const created = new Date(card.createdAt);
@@ -3852,6 +4419,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               if (!cardUri) {
                 return;
               }
+              if (cardUri === card.uri) {
+                return;
+              }
               let sourceColumnId = draggingCard?.columnId;
               if (!sourceColumnId) {
                 try {
@@ -3859,9 +4429,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
                   sourceColumnId = payload.columnId;
                 } catch {}
               }
+              if (!sourceColumnId) {
+                sourceColumnId = findCardColumnId(lastBoard, cardUri);
+              }
               const rect = cardEl.getBoundingClientRect();
               const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
               const orderedUris = buildOrderedUris(allCards, cardUri, card.uri, position);
+              if (sourceColumnId === columnId && hasSameOrder(allCards, orderedUris)) {
+                return;
+              }
               vscode.postMessage({
                 type: "reorderCards",
                 cardUri,
@@ -3891,6 +4467,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       searchQuery = String(value ?? "");
       if (searchInputEl && searchInputEl.value !== searchQuery) {
         searchInputEl.value = searchQuery;
+      }
+      refreshBoard();
+    };
+
+    const setTagFilter = (value) => {
+      selectedTagFilter = String(value ?? "");
+      if (tagFilterEl && tagFilterEl.value !== selectedTagFilter) {
+        tagFilterEl.value = selectedTagFilter;
+      }
+      refreshBoard();
+    };
+
+    const clearSearchFilters = () => {
+      searchQuery = "";
+      selectedTagFilter = "";
+      if (searchInputEl) {
+        searchInputEl.value = "";
+      }
+      if (tagFilterEl) {
+        tagFilterEl.value = "";
       }
       refreshBoard();
     };
@@ -3927,9 +4523,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     }
 
+    if (tagFilterEl) {
+      tagFilterEl.addEventListener("change", () => {
+        setTagFilter(tagFilterEl.value);
+      });
+    }
+
     if (searchClearEl) {
       searchClearEl.addEventListener("click", () => {
-        setSearchQuery("");
+        clearSearchFilters();
         focusSearch();
       });
     }
@@ -3951,9 +4553,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         event.preventDefault();
         event.stopPropagation();
         if (actionType === "hideRunnerPanel") {
-          runnerStatus = { enabled: false, running: false };
+          const hideByDefaultInput = runnerPanelEl.querySelector("[data-runner-hide-default]");
+          const hideByDefault = Boolean(hideByDefaultInput?.checked);
+          runnerPanelHiddenForSession = true;
           renderRunnerPanel();
-          vscode.postMessage({ type: "hideRunnerPanel" });
+          if (hideByDefault) {
+            vscode.postMessage({ type: "hideRunnerPanel" });
+          }
           return;
         }
         if (actionType === "openRunnerLink") {
@@ -4022,11 +4628,31 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         vscode.postMessage({ type: actionType, path: actionValue });
         return;
       }
+      if (actionType === "openLocalPath") {
+        vscode.postMessage({ type: actionType, path: actionValue });
+        return;
+      }
       if (actionType === "openUrl") {
         vscode.postMessage({ type: actionType, url: actionValue });
+        return;
+      }
+      if (actionType === "deleteCard") {
+        vscode.postMessage({
+          type: actionType,
+          cardUri: actionValue,
+          title: selectedCard?.title || "",
+        });
       }
     });
-    detailsEl.addEventListener("dblclick", () => openCard(selectedCard));
+    detailsEl.addEventListener("dblclick", (event) => {
+      const actionButton = event.target instanceof Element
+        ? event.target.closest("[data-action-type]")
+        : null;
+      if (actionButton) {
+        return;
+      }
+      openCard(selectedCard);
+    });
 
     window.addEventListener("message", (event) => {
       const message = event.data;

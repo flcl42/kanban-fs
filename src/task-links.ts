@@ -3,8 +3,13 @@ import { findTaskProperties } from "./task-metadata";
 export { parseTaskPropertyLine } from "./task-metadata";
 export type { TaskProperty as ParsedTaskPropertyLine } from "./task-metadata";
 
-export type TaskLinkCommand = "resumeAgent" | "openPath" | "openCode" | "openUrl";
-export type TaskLinkTitle = "Connect" | "Open" | "Code";
+export type TaskLinkCommand =
+  | "resumeAgent"
+  | "openPath"
+  | "openCode"
+  | "openUrl"
+  | "openLocalPath";
+export type TaskLinkTitle = "Connect" | "Terminal" | "Open" | "Code";
 
 export type TaskLinkAction = {
   line: number;
@@ -95,7 +100,7 @@ export function getTaskPropertyActions(
     return [
       {
         command: "openPath",
-        title: "Open",
+        title: "Terminal",
         value: normalizedValue,
       },
       {
