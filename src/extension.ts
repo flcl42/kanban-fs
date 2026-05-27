@@ -1786,20 +1786,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
 
-    let stat: vscode.FileStat;
+    const uri = vscode.Uri.file(targetPath);
     try {
-      stat = await vscode.workspace.fs.stat(vscode.Uri.file(targetPath));
+      await vscode.workspace.fs.stat(uri);
     } catch {
       return;
     }
 
-    const uri = vscode.Uri.file(targetPath);
-    if (stat.type === vscode.FileType.Directory) {
-      await vscode.env.openExternal(uri);
-      return;
-    }
-
-    await vscode.commands.executeCommand("vscode.open", uri);
+    await vscode.env.openExternal(uri);
   }
 
   public async openUrl(rawUrl: string): Promise<void> {
@@ -2822,12 +2816,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .board-tag-filter-select {
       min-width: 150px;
-      border: 0;
+      border: 1px solid transparent;
+      border-radius: 8px;
       outline: none;
-      background: transparent;
-      color: var(--ink);
+      background: var(--vscode-dropdown-background, var(--panel));
+      color: var(--vscode-dropdown-foreground, var(--ink));
       font: inherit;
-      padding: 0;
+      padding: 2px 24px 2px 6px;
+    }
+    .board-tag-filter-select option {
+      background: var(--vscode-dropdown-background, var(--panel));
+      color: var(--vscode-dropdown-foreground, var(--ink));
+    }
+    .board-tag-filter-select:focus {
+      border-color: var(--vscode-focusBorder, var(--accent));
     }
     .search-meta {
       font-family: var(--mono);
@@ -3060,6 +3062,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .card h3 {
       margin: 0;
+      min-width: 0;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
       font-size: 15px;
     }
     .card-bump {
@@ -4345,7 +4352,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const isFirstCard = allCards[0]?.uri === card.uri;
           cardEl.innerHTML = \`
             <div class="card-title-row">
-              <h3>\${escapeHtml(card.title)}</h3>
+              <h3 title="\${escapeHtml(card.title)}">\${escapeHtml(card.title)}</h3>
               <button
                 class="card-bump"
                 type="button"

@@ -31,8 +31,22 @@ const html = vm.runInNewContext(
   {}
 );
 const scriptMatch = html.match(/<script nonce="[^"]*">([\s\S]*)<\/script>/);
+const openLocalPathSource = source.match(
+  /public async openLocalPath[\s\S]*?\n  public async openUrl/
+);
 
 assert.ok(scriptMatch, "webview script block not found");
+assert.ok(openLocalPathSource, "openLocalPath source block not found");
+assert.match(
+  openLocalPathSource[0],
+  /await vscode\.env\.openExternal\(uri\);/,
+  "local filesystem Open should use the OS external opener"
+);
+assert.doesNotMatch(
+  openLocalPathSource[0],
+  /executeCommand\("vscode\.open"/,
+  "local filesystem Open should not open files in a VS Code editor"
+);
 assert.doesNotThrow(
   () => new Function(scriptMatch[1]),
   "webview script should parse"
@@ -66,6 +80,11 @@ assert.match(
   html,
   /\.column-header\s*\{[^}]*position:\s*sticky;[^}]*top:\s*0;/,
   "column headers should stay visible while scrolling long columns"
+);
+assert.match(
+  html,
+  /\.card h3\s*\{[^}]*min-width:\s*0;[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;[^}]*white-space:\s*nowrap;/,
+  "long unbroken card titles should be clipped inside the card"
 );
 assert.match(
   html,
@@ -282,6 +301,11 @@ assert.equal(typeof windowListeners.mousemove, "function", "mousemove listener m
 assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
 assert.match(html, /id="board-tag-filter"/, "tag filter selector should render next to search");
+assert.match(
+  html,
+  /\.board-tag-filter-select\s*\{[^}]*background:\s*var\(--vscode-dropdown-background,\s*var\(--panel\)\);[^}]*color:\s*var\(--vscode-dropdown-foreground,\s*var\(--ink\)\);/,
+  "tag filter selector should use VS Code dropdown theme colors"
+);
 windowListeners.message({
   data: {
     type: "runnerStatus",

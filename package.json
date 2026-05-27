@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
   "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional Codex runner.",
-  "version": "1.0.23",
+  "version": "1.0.24",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
