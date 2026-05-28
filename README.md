@@ -75,9 +75,9 @@ Runner prerequisites:
 
 - .NET SDK.
 - `dotnet-script` global tool, installable with `dotnet tool install -g dotnet-script`.
-- Codex CLI available as `codex`.
+- Codex CLI, or another Codex-compatible executable. The default command is `codex`.
 
-You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
+Use `kanban.codexExecutable` if your Codex-compatible executable has a different name or path. You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
 
 ## Runner Task Format
 
@@ -103,9 +103,10 @@ Describe the work here.
 ## Settings
 
 - `kanban.detailsPaneWidth` controls the saved details pane width.
+- `kanban.codexExecutable` controls the Codex-compatible executable used by the runner and resume-agent terminals. Defaults to `codex`.
 - `kanban.runnerPanel.enabled` shows or hides the optional runner warning panel.
 - `kanban.runner.command` controls the command used to start the runner.
-- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, and `${workspaceFolder}`.
+- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, and `${codexExecutable}`.
 
 ## Development
 

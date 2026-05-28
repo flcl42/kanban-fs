@@ -7,6 +7,9 @@ const source = fs.readFileSync(
   path.join(__dirname, "..", "src", "extension.ts"),
   "utf8"
 );
+const manifest = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "..", "package.json"), "utf8")
+);
 const startMarker = "return `<!DOCTYPE html>";
 const endMarker = "</html>`;";
 const start = source.indexOf(startMarker);
@@ -46,6 +49,26 @@ assert.doesNotMatch(
   openLocalPathSource[0],
   /executeCommand\("vscode\.open"/,
   "local filesystem Open should not open files in a VS Code editor"
+);
+assert.equal(
+  manifest.contributes.configuration.properties["kanban.codexExecutable"].default,
+  "codex",
+  "manifest should expose a configurable Codex executable setting"
+);
+assert.deepEqual(
+  manifest.contributes.configuration.properties["kanban.runner.args"].default.slice(-2),
+  ["--codex-executable", "${codexExecutable}"],
+  "default runner args should pass the configured Codex executable to codex_runner"
+);
+assert.match(
+  source,
+  /const CODEX_EXECUTABLE_SETTING = "codexExecutable";/,
+  "extension should read the Codex executable setting"
+);
+assert.doesNotMatch(
+  source,
+  /\bterminal\.sendText\(\s*sessionCwd\s*\?\s*`codex resume/,
+  "resume-agent terminals should not hard-code the codex executable"
 );
 assert.doesNotThrow(
   () => new Function(scriptMatch[1]),

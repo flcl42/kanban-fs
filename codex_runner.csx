@@ -59,6 +59,7 @@ sealed class TaskOrchestrator
             _notifications.Initialize();
             _log.Info($"Board root: {_paths.Root}");
             _log.Info($"Codex mode: {_settings.CodexMode}");
+            _log.Info($"Codex executable: {_settings.CodexExecutable}");
             _log.Info($"Max agents: {_settings.MaxAgents}");
 
             if (_settings.RunOnce)
@@ -1281,7 +1282,7 @@ sealed class CodexRunner
         _settings = settings;
         _paths = paths;
         _log = log;
-        _codexExecutable = ToolPaths.ResolveCodexExecutable();
+        _codexExecutable = ToolPaths.ResolveCodexExecutable(settings.CodexExecutable);
     }
 
     public async Task<CodexRunResult> RunAsync(
@@ -2128,7 +2129,7 @@ sealed class BoardPaths
 
 sealed class OrchestratorSettings
 {
-    private OrchestratorSettings(string rootPath, string invocationDirectory, int maxAgents, TimeSpan pollInterval, bool runOnce, CodexMode codexMode)
+    private OrchestratorSettings(string rootPath, string invocationDirectory, int maxAgents, TimeSpan pollInterval, bool runOnce, CodexMode codexMode, string codexExecutable)
     {
         RootPath = rootPath;
         InvocationDirectory = invocationDirectory;
@@ -2136,6 +2137,7 @@ sealed class OrchestratorSettings
         PollInterval = pollInterval;
         RunOnce = runOnce;
         CodexMode = codexMode;
+        CodexExecutable = string.IsNullOrWhiteSpace(codexExecutable) ? "codex" : codexExecutable.Trim();
     }
 
     public string RootPath { get; }
@@ -2144,6 +2146,7 @@ sealed class OrchestratorSettings
     public TimeSpan PollInterval { get; }
     public bool RunOnce { get; }
     public CodexMode CodexMode { get; }
+    public string CodexExecutable { get; }
 
     public static OrchestratorSettings Parse(string[] args, string defaultRoot)
     {
@@ -2152,6 +2155,7 @@ sealed class OrchestratorSettings
         var pollInterval = TimeSpan.FromSeconds(10);
         var runOnce = false;
         var codexMode = CodexMode.Dangerous;
+        var codexExecutable = "codex";
 
         for (var index = 0; index < args.Length; index++)
         {
@@ -2177,6 +2181,10 @@ sealed class OrchestratorSettings
                     codexMode = Enum.Parse<CodexMode>(ReadNextValue(args, ref index, "--codex-mode"), ignoreCase: true);
                     break;
 
+                case "--codex-executable":
+                    codexExecutable = ReadNextValue(args, ref index, "--codex-executable");
+                    break;
+
                 case "--help":
                 case "-h":
                     PrintUsage();
@@ -2193,7 +2201,7 @@ sealed class OrchestratorSettings
             throw new ArgumentOutOfRangeException(nameof(maxAgents), "Max agents must be at least 1.");
         }
 
-        return new OrchestratorSettings(root, defaultRoot, maxAgents, pollInterval, runOnce, codexMode);
+        return new OrchestratorSettings(root, defaultRoot, maxAgents, pollInterval, runOnce, codexMode, codexExecutable);
     }
 
     private static string ReadNextValue(string[] args, ref int index, string optionName)
@@ -2220,6 +2228,7 @@ sealed class OrchestratorSettings
               --max-agents <n>        Maximum active Codex agents. Defaults to 5.
               --poll-seconds <n>      Full reconciliation interval. Defaults to 10.
               --codex-mode <mode>     `Dangerous` or `FullAuto`. Defaults to `Dangerous`.
+              --codex-executable <cmd> Codex-compatible executable or path. Defaults to `codex`.
               --once                  Run a single reconciliation pass and exit.
               --help                  Show this help.
             """);
@@ -2421,21 +2430,26 @@ static class BoardTemplates
 
 static class ToolPaths
 {
-    public static string ResolveCodexExecutable()
+    public static string ResolveCodexExecutable(string configuredExecutable)
     {
+        var executable = NormalizeExecutable(configuredExecutable);
         var candidates = new List<string>();
 
-        var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
-        foreach (var directory in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        if (IsPathLike(executable))
         {
-            candidates.Add(Path.Combine(directory, "codex.exe"));
-            candidates.Add(Path.Combine(directory, "codex.cmd"));
-            candidates.Add(Path.Combine(directory, "codex.bat"));
-            candidates.Add(Path.Combine(directory, "codex"));
+            AddExecutableCandidates(candidates, executable);
+        }
+        else
+        {
+            var pathEnv = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
+            foreach (var directory in pathEnv.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                AddExecutableCandidates(candidates, Path.Combine(directory, executable));
+            }
         }
 
         var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        if (!string.IsNullOrWhiteSpace(home))
+        if (executable.Equals("codex", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(home))
         {
             candidates.Add(Path.Combine(home, ".codex", ".sandbox-bin", "codex.exe"));
             candidates.Add(Path.Combine(home, ".codex", ".sandbox-bin", "codex"));
@@ -2449,6 +2463,50 @@ static class ToolPaths
             }
         }
 
-        throw new FileNotFoundException("Unable to locate a Codex executable on PATH or in ~/.codex/.sandbox-bin.");
+        throw new FileNotFoundException($"Unable to locate configured Codex executable `{executable}` on PATH or at the configured path.");
+    }
+
+    private static string NormalizeExecutable(string configuredExecutable)
+    {
+        var executable = string.IsNullOrWhiteSpace(configuredExecutable) ? "codex" : configuredExecutable.Trim().Trim('"');
+        executable = Environment.ExpandEnvironmentVariables(executable);
+        if (executable == "~")
+        {
+            return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+
+        if (executable.StartsWith($"~{Path.DirectorySeparatorChar}") || executable.StartsWith($"~{Path.AltDirectorySeparatorChar}"))
+        {
+            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            if (!string.IsNullOrWhiteSpace(home))
+            {
+                return Path.Combine(home, executable[2..]);
+            }
+        }
+
+        return executable;
+    }
+
+    private static bool IsPathLike(string executable)
+    {
+        return Path.IsPathRooted(executable)
+            || executable.Contains(Path.DirectorySeparatorChar)
+            || executable.Contains(Path.AltDirectorySeparatorChar);
+    }
+
+    private static void AddExecutableCandidates(List<string> candidates, string executablePath)
+    {
+        candidates.Add(executablePath);
+        if (Path.HasExtension(executablePath))
+        {
+            return;
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            candidates.Add($"{executablePath}.exe");
+            candidates.Add($"{executablePath}.cmd");
+            candidates.Add($"{executablePath}.bat");
+        }
     }
 }

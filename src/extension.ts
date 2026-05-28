@@ -118,9 +118,11 @@ const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
 const RUNNER_PANEL_ENABLED_SETTING = "runnerPanel.enabled";
 const RUNNER_COMMAND_SETTING = "runner.command";
 const RUNNER_ARGS_SETTING = "runner.args";
+const CODEX_EXECUTABLE_SETTING = "codexExecutable";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
+const DEFAULT_CODEX_EXECUTABLE = "codex";
 const RUNNER_STATUS_REFRESH_MS = 10_000;
 const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
 const RUNNER_LAUNCH_GRACE_MS = 45_000;
@@ -146,6 +148,8 @@ const DEFAULT_RUNNER_ARGS = [
   "--",
   "--root",
   "${runnerRoot}",
+  "--codex-executable",
+  "${codexExecutable}",
 ];
 
 export function activate(context: vscode.ExtensionContext) {
@@ -1744,9 +1748,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       name: formatAgentTerminalName(ticketTitle, trimmed),
       cwd: sessionCwd ?? undefined,
     });
+    const codexExecutableCommand = formatTerminalExecutable(
+      this.getCodexExecutableSetting()
+    );
     terminal.show(false);
     terminal.sendText(
-      sessionCwd ? `codex resume --cd . ${trimmed}` : `codex resume ${trimmed}`,
+      sessionCwd
+        ? `${codexExecutableCommand} resume --cd . ${trimmed}`
+        : `${codexExecutableCommand} resume ${trimmed}`,
       true
     );
     await this.focusTerminal();
@@ -1864,6 +1873,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return Array.isArray(args) && args.length > 0 ? args : DEFAULT_RUNNER_ARGS;
   }
 
+  private getCodexExecutableSetting(): string {
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(CODEX_EXECUTABLE_SETTING, DEFAULT_CODEX_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_CODEX_EXECUTABLE;
+  }
+
   private getRunnerScriptRequiredSetting(): boolean {
     const command = this.getRunnerCommandSetting();
     const args = this.getRunnerArgsSetting();
@@ -1876,7 +1893,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         "codex",
         this.detectRunnerTool(
           "Codex CLI",
-          "codex",
+          this.getCodexExecutableSetting(),
           ["--version"],
           CODEX_INSTALL_URL
         ),
@@ -2164,6 +2181,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     localRunnerScript: string | null;
     runnerScript: string;
     workspaceFolder: string;
+    codexExecutable: string;
   } {
     const kanbanDir = path.dirname(kanbanUri.fsPath);
     const runnerRoot =
@@ -2185,6 +2203,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       localRunnerScript,
       runnerScript,
       workspaceFolder,
+      codexExecutable: this.getCodexExecutableSetting(),
     };
   }
 
@@ -2323,13 +2342,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       runnerRoot: string;
       runnerScript: string;
       workspaceFolder: string;
+      codexExecutable: string;
     }
   ): string {
     return value
       .replace(/\$\{kanbanDir\}/g, paths.kanbanDir)
       .replace(/\$\{runnerRoot\}/g, paths.runnerRoot)
       .replace(/\$\{runnerScript\}/g, paths.runnerScript)
-      .replace(/\$\{workspaceFolder\}/g, paths.workspaceFolder);
+      .replace(/\$\{workspaceFolder\}/g, paths.workspaceFolder)
+      .replace(/\$\{codexExecutable\}/g, paths.codexExecutable);
   }
 
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
@@ -4860,6 +4881,19 @@ function formatAgentTerminalName(
       ? `${title.slice(0, maxTitleLength - 1).trimEnd()}…`
       : title;
   return `Kanban: ${trimmedTitle}`;
+}
+
+function formatTerminalExecutable(executable: string): string {
+  const trimmed = executable.trim() || DEFAULT_CODEX_EXECUTABLE;
+  if (!/\s/.test(trimmed)) {
+    return trimmed;
+  }
+
+  if (process.platform === "win32") {
+    return `& '${escapePowerShellSingleQuotedString(trimmed)}'`;
+  }
+
+  return `'${trimmed.replace(/'/g, "'\\''")}'`;
 }
 
 function normalizeContentForEol(

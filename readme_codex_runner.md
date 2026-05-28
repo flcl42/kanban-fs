@@ -116,6 +116,7 @@ dotnet script codex_runner.csx -- --max-agents 5
 dotnet script codex_runner.csx -- --poll-seconds 10
 dotnet script codex_runner.csx -- --codex-mode Dangerous
 dotnet script codex_runner.csx -- --codex-mode FullAuto
+dotnet script codex_runner.csx -- --codex-executable opencode
 dotnet script codex_runner.csx -- --once
 ```
 
@@ -125,6 +126,7 @@ Options:
 - `--max-agents <n>`: global active-agent limit. Default `5`.
 - `--poll-seconds <n>`: full reconciliation interval. Default `10`.
 - `--codex-mode Dangerous|FullAuto`: how Codex runs tasks.
+- `--codex-executable <cmd>`: Codex-compatible executable name or path. Default `codex`.
 - `--once`: run one reconciliation pass and exit.
 
 While running continuously, the runner exposes a localhost status endpoint on a deterministic port sequence derived from the board root. The VS Code Kanban view probes that endpoint and validates the normalized root path, so it does not depend on the runner process name or script location and can distinguish runners for different board paths.

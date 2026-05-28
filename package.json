@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
   "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional Codex runner.",
-  "version": "1.0.24",
+  "version": "1.0.25",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -148,13 +148,21 @@
             "${runnerScript}",
             "--",
             "--root",
-            "${runnerRoot}"
+            "${runnerRoot}",
+            "--codex-executable",
+            "${codexExecutable}"
           ],
           "items": {
             "type": "string"
           },
           "scope": "application",
-          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, and ${workspaceFolder}."
+          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, and ${codexExecutable}."
+        },
+        "kanban.codexExecutable": {
+          "type": "string",
+          "default": "codex",
+          "scope": "application",
+          "description": "Codex-compatible executable used by the Kanban runner and resume-agent terminals."
         }
       }
     }
