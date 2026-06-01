@@ -596,8 +596,14 @@ windowListeners.message({
               uri: "file:///task.md",
               fileName: "task.md",
               title: "Ship it",
-              body: Array.from({ length: 55 }, (_, index) => `Description line ${index + 1}`).join("\n"),
-              bodyHtml: Array.from({ length: 55 }, (_, index) => `<p>Description line ${index + 1}</p>`).join(""),
+              searchText: [
+                "ship it",
+                "task.md",
+                "jane",
+                "kanban",
+                "ship",
+                "description line 55",
+              ].join("\n"),
               properties: [
                 { key: "Tags", label: "Tags", value: "ship", action: null },
                 {
@@ -649,18 +655,19 @@ windowListeners.message({
               ],
               tags: ["ship"],
               priority: 2,
-              createdAt: Date.now(),
+              createdAt: 1000,
+              updatedAt: 2000,
             },
             {
               uri: "file:///second.md",
               fileName: "second.md",
               title: "Second card",
-              body: "",
-              bodyHtml: "",
+              searchText: "second card\nsecond.md",
               properties: [],
               tags: [],
               priority: 3,
-              createdAt: Date.now(),
+              createdAt: 1000,
+              updatedAt: 2000,
             },
           ],
         },
@@ -673,12 +680,12 @@ windowListeners.message({
               uri: "file:///existing.md",
               fileName: "existing.md",
               title: "Existing card",
-              body: "",
-              bodyHtml: "",
+              searchText: "existing card\nexisting.md",
               properties: [],
               tags: [],
               priority: 1,
-              createdAt: Date.now(),
+              createdAt: 1000,
+              updatedAt: 2000,
             },
           ],
         },
@@ -876,12 +883,26 @@ assert.deepEqual(
 
 boardEl.children[0].children[1].listeners.click();
 
+assert.equal(messages.at(-3)?.type, "requestCardDetails", "details should lazy-load the selected card body");
+assert.equal(messages.at(-3)?.cardUri, "file:///task.md");
 assert.equal(messages.at(-2)?.type, "requestGitStatus", "details should request git status for Repo properties");
 assert.equal(messages.at(-2)?.path, "C:\\work\\demo");
 assert.equal(messages.at(-1)?.type, "requestCodexOutput", "details should request codex output for Agent properties");
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
 
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
+assert.match(detailsEl.innerHTML, /Loading description/, "details should show a placeholder before the selected card body loads");
+
+windowListeners.message({
+  data: {
+    type: "cardDetails",
+    cardUri: "file:///task.md",
+    bodyHtml: Array.from({ length: 55 }, (_, index) => `<p>Description line ${index + 1}</p>`).join(""),
+    bodyLineCount: 55,
+    updatedAt: 2000,
+  },
+});
+
 assert.match(
   detailsEl.innerHTML,
   /data-action-type="expandDescription"/,

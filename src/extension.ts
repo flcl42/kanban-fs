@@ -46,12 +46,12 @@ type Card = {
   uri: string;
   fileName: string;
   title: string;
-  body: string;
-  bodyHtml: string;
+  searchText: string;
   properties: CardProperty[];
   tags: string[];
   priority: number | null;
   createdAt: number;
+  updatedAt: number;
 };
 
 type Column = {
@@ -1086,6 +1086,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         });
         return;
       }
+      if (message?.type === "requestCardDetails" && message?.cardUri) {
+        const cardUri = String(message.cardUri);
+        try {
+          const details = await this.readCardDetails(cardUri);
+          webviewPanel.webview.postMessage({
+            type: "cardDetails",
+            ...details,
+          });
+        } catch {
+          webviewPanel.webview.postMessage({
+            type: "cardDetails",
+            cardUri,
+            bodyHtml: "",
+            bodyLineCount: 0,
+            updatedAt: 0,
+          });
+        }
+        return;
+      }
       if (message?.type === "saveDetailsPaneWidth") {
         await this.updateDetailsPaneWidthSetting(message?.width);
         return;
@@ -1318,18 +1337,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           };
         })
       );
-      const bodyHtml = md.render(body || "");
       const stat = await vscode.workspace.fs.stat(fileUri);
       cards.push({
         uri: fileUri.toString(),
         fileName: name,
         title,
-        body,
-        bodyHtml,
+        searchText: buildCardSearchText(title, name, body, tags, properties),
         properties: propertiesWithActions,
         tags,
         priority: cardPriorities.get(name) ?? null,
         createdAt: stat.ctime,
+        updatedAt: stat.mtime,
       });
     }
 
@@ -1342,6 +1360,32 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return a.title.localeCompare(b.title);
     });
     return cards;
+  }
+
+  private async readCardDetails(cardUriString: string): Promise<{
+    cardUri: string;
+    bodyHtml: string;
+    bodyLineCount: number;
+    updatedAt: number;
+  }> {
+    const cardUri = vscode.Uri.parse(cardUriString);
+    if (cardUri.scheme !== "file") {
+      throw new Error("Card details are only available for local file cards.");
+    }
+
+    const raw = await vscode.workspace.fs.readFile(cardUri);
+    const text = Buffer.from(raw).toString("utf8");
+    const { body } = parseTaskMarkdown(text, path.basename(cardUri.fsPath));
+    const stat = await vscode.workspace.fs.stat(cardUri);
+    const bodyLineCount = String(body || "")
+      .split(/\r?\n/)
+      .filter((line) => line.trim().length > 0).length;
+    return {
+      cardUri: cardUri.toString(),
+      bodyHtml: md.render(body || ""),
+      bodyLineCount,
+      updatedAt: stat.mtime,
+    };
   }
 
   private async readColumnMeta(
@@ -3487,6 +3531,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let runnerPanelHiddenForSession = false;
     const gitStatusCache = new Map();
     const codexOutputCache = new Map();
+    const cardDetailsCache = new Map();
     let refreshTimer = null;
     let detailsRefreshTimer = null;
     const cardDragType = "application/x-kanban-card";
@@ -3829,15 +3874,37 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       \`;
     };
 
+    const requestCardDetails = (card) => {
+      if (!card?.uri) {
+        return;
+      }
+      const cached = cardDetailsCache.get(card.uri);
+      if (cached?.state === "loading" || (cached?.state === "ready" && cached.updatedAt === card.updatedAt)) {
+        return;
+      }
+      cardDetailsCache.set(card.uri, {
+        state: "loading",
+        bodyHtml: cached?.bodyHtml || "",
+        bodyLineCount: cached?.bodyLineCount || 0,
+        updatedAt: card.updatedAt,
+      });
+      vscode.postMessage({
+        type: "requestCardDetails",
+        cardUri: card.uri,
+      });
+    };
+
     const renderDescription = (card) => {
-      const bodyHtml = card?.bodyHtml || "";
+      const details = card?.uri ? cardDetailsCache.get(card.uri) : null;
+      if (!details || details.state === "loading" || details.updatedAt !== card?.updatedAt) {
+        requestCardDetails(card);
+        return '<div class="empty">Loading description...</div>';
+      }
+      const bodyHtml = details?.bodyHtml || "";
       if (!bodyHtml) {
         return '<div class="empty">No description.</div>';
       }
-      const bodyLines = String(card?.body || "")
-        .split(/\\r?\\n/)
-        .filter((line) => line.trim().length > 0);
-      const collapsed = bodyLines.length > 50;
+      const collapsed = Number(details?.bodyLineCount || 0) > 50;
       return \`
         <div class="description-frame\${collapsed ? " collapsed" : ""}" data-description-frame>
           \${bodyHtml}
@@ -3850,6 +3917,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (!card?.uri) {
         return;
       }
+      requestCardDetails(card);
       requestGitStatus(card);
       requestCodexOutput(card);
     };
@@ -3922,22 +3990,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
 
     const buildCardSearchText = (card) => {
-      const propertiesText = getVisibleProperties(card?.properties || [])
-        .map((property) => {
-          const label = String(property?.label || property?.key || "").trim();
-          const value = String(property?.value || "").trim();
-          return label ? label + ": " + value : value;
-        })
-        .join("\\n");
-      return [
-        card?.title,
-        card?.fileName,
-        card?.body,
-        ...(card?.tags || []),
-        propertiesText,
-      ]
-        .join("\\n")
-        .toLowerCase();
+      return String(card?.searchText || "").toLowerCase();
     };
 
     const matchesSearch = (card, query) => {
@@ -4196,6 +4249,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
       }
       return null;
+    };
+
+    const pruneCardDetailsCache = (board) => {
+      const currentCards = new Map();
+      for (const column of board?.columns || []) {
+        for (const card of column.cards || []) {
+          if (card?.uri) {
+            currentCards.set(card.uri, card.updatedAt);
+          }
+        }
+      }
+      for (const [cardUri, details] of cardDetailsCache) {
+        if (!currentCards.has(cardUri) || details?.updatedAt !== currentCards.get(cardUri)) {
+          cardDetailsCache.delete(cardUri);
+        }
+      }
     };
 
     const syncDetails = () => {
@@ -4686,6 +4755,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const message = event.data;
       if (message?.type === "boardData") {
         lastBoard = message.board;
+        pruneCardDetailsCache(lastBoard);
         refreshBoard();
         if (!refreshTimer) {
           refreshTimer = setInterval(() => {
@@ -4723,6 +4793,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           codexOutputCache.set(agentId, message?.output
             ? { state: "ready", text: String(message.output), refreshedAt: Date.now() }
             : { state: "missing", text: "", refreshedAt: Date.now() });
+        }
+        if (selectedCard && message?.cardUri === selectedCard.uri) {
+          renderDetails(selectedCard);
+        }
+      }
+      if (message?.type === "cardDetails") {
+        const cardUri = String(message?.cardUri || "").trim();
+        if (cardUri) {
+          cardDetailsCache.set(cardUri, {
+            state: "ready",
+            bodyHtml: String(message?.bodyHtml || ""),
+            bodyLineCount: Number(message?.bodyLineCount || 0),
+            updatedAt: Number(message?.updatedAt || 0),
+          });
         }
         if (selectedCard && message?.cardUri === selectedCard.uri) {
           renderDetails(selectedCard);
@@ -4852,6 +4936,26 @@ function buildCardPriorityList(orderedUris: string[]): string[] {
   }
 
   return priorities;
+}
+
+function buildCardSearchText(
+  title: string,
+  fileName: string,
+  body: string,
+  tags: string[],
+  properties: TaskProperty[]
+): string {
+  const propertiesText = properties
+    .filter((property) => property.key.trim().toLowerCase() !== "tags")
+    .map((property) => {
+      const label = String(property.label || property.key || "").trim();
+      const value = String(property.value || "").trim();
+      return label ? `${label}: ${value}` : value;
+    })
+    .join("\n");
+  return [title, fileName, body, ...tags, propertiesText]
+    .join("\n")
+    .toLowerCase();
 }
 
 function normalizeDetailsPaneWidth(value: unknown): number {
