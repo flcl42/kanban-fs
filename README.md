@@ -2,7 +2,7 @@
 
 [![Visual Studio Marketplace Installs](https://badgen.net/vs-marketplace/i/flcl42.kanban-vsix)](https://marketplace.visualstudio.com/items?itemName=flcl42.kanban-vsix)
 
-ai-kanban is a VS Code Kanban board backed by normal folders and Markdown files. It works as a simple local task board by default, and it can optionally run a background Codex runner for AI-assisted task execution.
+ai-kanban is a VS Code Kanban board backed by normal folders and Markdown files. It works as a simple local task board by default, and it can optionally run a background agent runner for AI-assisted task execution.
 
 ## Preview
 
@@ -33,7 +33,8 @@ Use one of these commands:
 
 - `AI Kanban: Create Empty Board` creates only a `.kanban` file in the folder you choose.
 - `AI Kanban: Create Board with Columns` creates `.kanban` plus the default workflow folders: `new`, `backlog`, `doing`, `done`, `confirmed`.
-- `AI Kanban: Create Board with Initialized Runner` creates `tasks/.kanban`, the default workflow folders, and a local `codex_runner.csx` script beside the board.
+- `AI Kanban: Create Board with Initialized Runner` creates `tasks/.kanban`, the default workflow folders, and a local `runner.py` script beside the board.
+- `AI Kanban: Initialize Runner` adds runner support to an existing board, or creates `tasks/.kanban` and copies the bundled `runner.py` into the selected root.
 
 You can also create a `.kanban` file manually and open it in VS Code. If a `template.md` file exists beside `.kanban`, new tickets use it as the card template.
 
@@ -59,25 +60,33 @@ folders:
   confirmed: confirmed
 ```
 
-## Optional Codex Runner
+Use `ignoreFolders` when directories beside `.kanban` should not appear as columns
+or be scanned for cards:
+
+```yaml
+ignoreFolders:
+  - archive
+  - scratch
+```
+
+## Optional Agent Runner
 
 The runner is optional. If you never start it, ai-kanban remains a normal Markdown-and-folder Kanban board.
 
-The runner watches `tasks/backlog`, starts Codex on cards, moves active cards to `doing`, and moves completed or blocked work to the matching workflow folders. It keeps running in the background after VS Code closes.
+The runner watches `tasks/backlog`, starts Claude Code or Codex on cards, moves active cards to `doing`, and moves completed or blocked work to the matching workflow folders. It keeps running in the background after VS Code closes.
 
 To use it:
 
-1. Run `AI Kanban: Create Board with Initialized Runner`, or open an existing board and click `Initialize runner` in the warning panel.
+1. Run `AI Kanban: Create Board with Initialized Runner`, run `AI Kanban: Initialize Runner`, or open an existing board and click `Initialize runner` in the warning panel.
 2. Install the required tools if the panel reports them missing.
 3. Click `Start runner` in the board warning panel.
 
 Runner prerequisites:
 
-- .NET SDK.
-- `dotnet-script` global tool, installable with `dotnet tool install -g dotnet-script`.
-- Codex CLI, or another Codex-compatible executable. The default command is `codex`.
+- Python 3.10+.
+- Claude Code and/or Codex CLI.
 
-Use `kanban.codexExecutable` if your Codex-compatible executable has a different name or path. You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
+Use `kanban.defaultAgent` to choose `claude` or `codex`. Leave it `null` to auto-detect Claude first and then Codex. Use `kanban.claudeExecutable` or `kanban.codexExecutable` if either executable has a different name or path. You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
 
 ## Runner Task Format
 
@@ -87,6 +96,7 @@ Runner cards use normal Markdown plus a few properties:
 # Example task
 
 Project: blank
+Tags:
 Agent:
 Repo:
 
@@ -98,15 +108,19 @@ Describe the work here.
 
 `Project:` can name a repository alias from `projects.md`. Use `Project: blank` or `Project: -` when the task should use a temporary empty workspace instead of a repository.
 
-`Agent:` and `Repo:` are managed by the runner. Leave them present when you want Codex sessions and repository state to resume cleanly.
+`Tags:` can override the runner agent per card with values such as `claude`, `codex`, `agent:claude`, or `agent:codex`.
+
+`Agent:` and `Repo:` are managed by the runner. Leave them present when you want agent sessions and repository state to resume cleanly.
 
 ## Settings
 
 - `kanban.detailsPaneWidth` controls the saved details pane width.
-- `kanban.codexExecutable` controls the Codex-compatible executable used by the runner and resume-agent terminals. Defaults to `codex`.
+- `kanban.defaultAgent` controls the default runner agent. Defaults to `null`, which auto-detects Claude first and Codex second.
+- `kanban.claudeExecutable` controls the Claude Code executable used by the runner. Defaults to `claude`.
+- `kanban.codexExecutable` controls the Codex executable used by the runner and resume-agent terminals. Defaults to `codex`.
 - `kanban.runnerPanel.enabled` shows or hides the optional runner warning panel.
 - `kanban.runner.command` controls the command used to start the runner.
-- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, and `${codexExecutable}`.
+- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, `${defaultAgent}`, `${codexExecutable}`, and `${claudeExecutable}`.
 
 ## Development
 

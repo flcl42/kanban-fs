@@ -3,6 +3,7 @@ const assert = require("assert/strict");
 const {
   buildFolderCardPriorityOverrides,
   buildFolderConfigMap,
+  isIgnoredFolder,
   orderColumnsByConfig,
   parseBoardConfig,
   serializeBoardConfig,
@@ -17,6 +18,32 @@ const sourceText = `folders:
 
 const boardConfig = parseBoardConfig(sourceText);
 assert.equal(boardConfig.valid, true, "valid .kanban YAML should be marked valid");
+const ignoredConfig = parseBoardConfig(`ignoreFolders:
+  - Archive
+ignoreDirs:
+  - scratch
+excludeFolders: trash
+`);
+assert.equal(
+  isIgnoredFolder(ignoredConfig, "archive"),
+  true,
+  "ignoreFolders should mark matching directory names as ignored"
+);
+assert.equal(
+  isIgnoredFolder(ignoredConfig, "Scratch"),
+  true,
+  "ignoreDirs alias should mark matching directory names as ignored"
+);
+assert.equal(
+  isIgnoredFolder(ignoredConfig, "trash"),
+  true,
+  "excludeFolders string values should mark matching directory names as ignored"
+);
+assert.equal(
+  isIgnoredFolder(ignoredConfig, "doing"),
+  false,
+  "unlisted directory names should not be ignored"
+);
 const columns = [
   { id: "Backlog", name: "Backlog", order: 2 },
   { id: "Archive", name: "Archive", order: null },

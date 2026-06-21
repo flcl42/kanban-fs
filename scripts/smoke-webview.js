@@ -51,24 +51,53 @@ assert.doesNotMatch(
   "local filesystem Open should not open files in a VS Code editor"
 );
 assert.equal(
-  manifest.contributes.configuration.properties["kanban.codexExecutable"].default,
-  "codex",
-  "manifest should expose a configurable Codex executable setting"
+  manifest.contributes.configuration.properties["kanban.defaultAgent"].default,
+  null,
+  "manifest should default runner agent selection to auto detection"
 );
 assert.deepEqual(
-  manifest.contributes.configuration.properties["kanban.runner.args"].default.slice(-2),
-  ["--codex-executable", "${codexExecutable}"],
-  "default runner args should pass the configured Codex executable to codex_runner"
+  manifest.contributes.configuration.properties["kanban.runner.args"].default,
+  [
+    "${runnerScript}",
+    "--root",
+    "${runnerRoot}",
+    "--default-agent",
+    "${defaultAgent}",
+    "--codex-executable",
+    "${codexExecutable}",
+    "--claude-executable",
+    "${claudeExecutable}",
+  ],
+  "default runner args should pass agent settings to runner.py"
 );
 assert.match(
   source,
-  /const CODEX_EXECUTABLE_SETTING = "codexExecutable";/,
-  "extension should read the Codex executable setting"
+  /const DEFAULT_AGENT_SETTING = "defaultAgent";/,
+  "extension should read the default agent setting"
+);
+assert.ok(
+  manifest.contributes.commands.some((command) => command.command === "kanban.initializeRunner"),
+  "manifest should expose an Initialize Runner command"
+);
+assert.match(
+  source,
+  /provider\.initializeRunner\(target\)/,
+  "extension should register the Initialize Runner command"
 );
 assert.doesNotMatch(
   source,
   /\bterminal\.sendText\(\s*sessionCwd\s*\?\s*`codex resume/,
   "resume-agent terminals should not hard-code the codex executable"
+);
+assert.match(
+  source,
+  /function renderMarkdownWithTaskLists/,
+  "card details should render Markdown through the task-list aware renderer"
+);
+assert.match(
+  source,
+  /message\?\.type === "toggleTaskCheckbox"/,
+  "details checkbox changes should be handled by the extension host"
 );
 assert.doesNotThrow(
   () => new Function(scriptMatch[1]),
@@ -322,6 +351,7 @@ assert.equal(typeof windowListeners.message, "function", "message listener missi
 assert.equal(typeof windowListeners.keydown, "function", "keydown listener missing");
 assert.equal(typeof windowListeners.mousemove, "function", "mousemove listener missing");
 assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missing");
+assert.equal(typeof detailsEl.listeners.change, "function", "details checkbox change listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
 assert.match(html, /id="board-tag-filter"/, "tag filter selector should render next to search");
 assert.match(
@@ -338,26 +368,19 @@ windowListeners.message({
       runnerScriptRequired: true,
       runnerScriptExists: false,
       requirements: {
-        dotnet: {
-          label: ".NET SDK",
-          command: "dotnet",
+        python: {
+          label: "Python",
+          command: "python",
           installed: true,
-          version: "8.0.100",
-          installUrl: "https://dotnet.microsoft.com/download",
+          version: "Python 3.11.9",
+          installUrl: "https://www.python.org/downloads/",
         },
-        dotnetScript: {
-          label: "dotnet-script",
-          command: "dotnet",
+        agent: {
+          label: "Claude Code or Codex CLI",
+          command: "claude / codex",
           installed: false,
           version: "",
-          installUrl: "https://github.com/dotnet-script/dotnet-script",
-        },
-        codex: {
-          label: "Codex CLI",
-          command: "codex",
-          installed: false,
-          version: "",
-          installUrl: "https://github.com/openai/codex",
+          installUrl: "https://docs.anthropic.com/en/docs/claude-code",
         },
       },
       message: "Runner start requested.",
@@ -370,24 +393,23 @@ assert.match(
   /No local runner script found/,
   "runner panel should ask to create a local runner script when the default runner is missing"
 );
-assert.doesNotMatch(runnerPanelEl.innerHTML, /\.NET SDK/, "runner panel should hide installed tool rows");
-assert.match(runnerPanelEl.innerHTML, /dotnet-script/, "runner panel should show missing dotnet-script status");
-assert.match(runnerPanelEl.innerHTML, /Codex CLI/, "runner panel should show codex status");
+assert.doesNotMatch(runnerPanelEl.innerHTML, /Python/, "runner panel should hide installed tool rows");
+assert.match(runnerPanelEl.innerHTML, /Claude Code or Codex CLI/, "runner panel should show missing auto-agent status");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="openRunnerLink"/, "missing runner tools should render install links");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="hideRunnerPanel"/, "runner panel should expose a hide action");
 assert.match(runnerPanelEl.innerHTML, /by default/, "runner panel hide should expose a persistent setting checkbox");
 
-const installCodexButton = new FakeElement("button");
-installCodexButton.setAttribute("data-action-type", "openRunnerLink");
-installCodexButton.setAttribute("data-action-url", "https://github.com/openai/codex");
-installCodexButton.closest = () => installCodexButton;
+const installAgentButton = new FakeElement("button");
+installAgentButton.setAttribute("data-action-type", "openRunnerLink");
+installAgentButton.setAttribute("data-action-url", "https://docs.anthropic.com/en/docs/claude-code");
+installAgentButton.closest = () => installAgentButton;
 runnerPanelEl.listeners.click({
-  target: installCodexButton,
+  target: installAgentButton,
   preventDefault() {},
   stopPropagation() {},
 });
 assert.equal(messages.at(-1)?.type, "openUrl", "runner install links should open externally");
-assert.equal(messages.at(-1)?.url, "https://github.com/openai/codex");
+assert.equal(messages.at(-1)?.url, "https://docs.anthropic.com/en/docs/claude-code");
 
 windowListeners.message({
   data: {
@@ -398,26 +420,19 @@ windowListeners.message({
       runnerScriptRequired: true,
       runnerScriptExists: false,
       requirements: {
-        dotnet: {
-          label: ".NET SDK",
-          command: "dotnet",
+        python: {
+          label: "Python",
+          command: "python",
           installed: true,
-          version: "8.0.100",
-          installUrl: "https://dotnet.microsoft.com/download",
+          version: "Python 3.11.9",
+          installUrl: "https://www.python.org/downloads/",
         },
-        dotnetScript: {
-          label: "dotnet-script",
-          command: "dotnet",
+        agent: {
+          label: "Claude Code or Codex CLI",
+          command: "claude / codex",
           installed: false,
           version: "",
-          installUrl: "https://github.com/dotnet-script/dotnet-script",
-        },
-        codex: {
-          label: "Codex CLI",
-          command: "codex",
-          installed: false,
-          version: "",
-          installUrl: "https://github.com/openai/codex",
+          installUrl: "https://docs.anthropic.com/en/docs/claude-code",
         },
       },
     },
@@ -444,32 +459,25 @@ windowListeners.message({
       runnerScriptRequired: true,
       runnerScriptExists: true,
       requirements: {
-        dotnet: {
-          label: ".NET SDK",
-          command: "dotnet",
+        python: {
+          label: "Python",
+          command: "python",
           installed: true,
-          version: "8.0.100",
-          installUrl: "https://dotnet.microsoft.com/download",
+          version: "Python 3.11.9",
+          installUrl: "https://www.python.org/downloads/",
         },
-        dotnetScript: {
-          label: "dotnet-script",
-          command: "dotnet",
+        agent: {
+          label: "Claude Code or Codex CLI",
+          command: "claude / codex",
           installed: true,
-          version: "2.0.0",
-          installUrl: "https://github.com/dotnet-script/dotnet-script",
-        },
-        codex: {
-          label: "Codex CLI",
-          command: "codex",
-          installed: true,
-          version: "codex 0.1.0",
-          installUrl: "https://github.com/openai/codex",
+          version: "Claude Code 1.0.0",
+          installUrl: "https://docs.anthropic.com/en/docs/claude-code",
         },
       },
     },
   },
 });
-assert.match(runnerPanelEl.innerHTML, /No Codex runner detected/, "runner panel should warn about a missing runner");
+assert.match(runnerPanelEl.innerHTML, /No Kanban runner detected/, "runner panel should warn about a missing runner");
 assert.doesNotMatch(runnerPanelEl.innerHTML, /Install requirements/, "start should be available when runner tools are installed");
 assert.match(
   runnerPanelEl.innerHTML,
@@ -508,26 +516,19 @@ windowListeners.message({
       runnerScriptRequired: true,
       runnerScriptExists: true,
       requirements: {
-        dotnet: {
-          label: ".NET SDK",
-          command: "dotnet",
+        python: {
+          label: "Python",
+          command: "python",
           installed: true,
-          version: "8.0.100",
-          installUrl: "https://dotnet.microsoft.com/download",
+          version: "Python 3.11.9",
+          installUrl: "https://www.python.org/downloads/",
         },
-        dotnetScript: {
-          label: "dotnet-script",
-          command: "dotnet",
+        agent: {
+          label: "Claude Code or Codex CLI",
+          command: "claude / codex",
           installed: true,
-          version: "2.0.0",
-          installUrl: "https://github.com/dotnet-script/dotnet-script",
-        },
-        codex: {
-          label: "Codex CLI",
-          command: "codex",
-          installed: true,
-          version: "codex 0.1.0",
-          installUrl: "https://github.com/openai/codex",
+          version: "Claude Code 1.0.0",
+          installUrl: "https://docs.anthropic.com/en/docs/claude-code",
         },
       },
     },
@@ -897,7 +898,9 @@ windowListeners.message({
   data: {
     type: "cardDetails",
     cardUri: "file:///task.md",
-    bodyHtml: Array.from({ length: 55 }, (_, index) => `<p>Description line ${index + 1}</p>`).join(""),
+    bodyHtml:
+      '<ul><li><input class="task-list-checkbox" type="checkbox" data-task-index="0" /> Review markdown rendering</li></ul>' +
+      Array.from({ length: 55 }, (_, index) => `<p>Description line ${index + 1}</p>`).join(""),
     bodyLineCount: 55,
     updatedAt: 2000,
   },
@@ -908,6 +911,25 @@ assert.match(
   /data-action-type="expandDescription"/,
   "long descriptions should render an expand button"
 );
+assert.match(
+  detailsEl.innerHTML,
+  /class="task-list-checkbox"/,
+  "details markdown should render task-list checkboxes"
+);
+
+const taskCheckbox = new FakeElement("input");
+taskCheckbox.setAttribute("type", "checkbox");
+taskCheckbox.setAttribute("data-task-index", "0");
+taskCheckbox.checked = true;
+
+detailsEl.listeners.change({
+  target: taskCheckbox,
+});
+
+assert.equal(messages.at(-1)?.type, "toggleTaskCheckbox", "task checkbox changes should patch the card");
+assert.equal(messages.at(-1)?.cardUri, "file:///task.md");
+assert.equal(messages.at(-1)?.taskIndex, 0);
+assert.equal(messages.at(-1)?.checked, true);
 assert.doesNotMatch(
   detailsEl.innerHTML,
   /Tags:/,

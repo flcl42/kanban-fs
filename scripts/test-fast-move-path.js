@@ -17,11 +17,11 @@ assert.match(
   /vscode\.workspace\.fs\.rename\s*\(/,
   "file moves should use the direct workspace filesystem rename path"
 );
-const runnerSource = fs.readFileSync(path.join(__dirname, "..", "codex_runner.csx"), "utf8");
+const runnerSource = fs.readFileSync(path.join(__dirname, "..", "runner.py"), "utf8");
 
 assert.match(
   runnerSource,
-  /PropertyNamingPolicy\s*=\s*JsonNamingPolicy\.CamelCase/,
+  /"boardRoot":/,
   "runner move bridge requests must use camelCase JSON expected by the extension"
 );
 assert.match(
@@ -31,6 +31,26 @@ assert.match(
 );
 assert.match(
   runnerSource,
-  /ToolPaths\.ResolveCodexExecutable\(settings\.CodexExecutable\)/,
+  /--claude-executable/,
+  "runner should expose a CLI option for choosing the Claude executable"
+);
+assert.match(
+  runnerSource,
+  /--default-agent/,
+  "runner should expose a CLI option for choosing the default agent"
+);
+assert.match(
+  runnerSource,
+  /for kind in \[AgentKind\.CLAUDE, AgentKind\.CODEX\]/,
+  "runner should auto-detect Claude before Codex"
+);
+assert.match(
+  runnerSource,
+  /agent_kind_from_tags/,
+  "runner should allow task tags to override the selected agent kind"
+);
+assert.match(
+  runnerSource,
+  /ToolPaths\.resolve_executable\(.*AgentKind\.CODEX/s,
   "runner should resolve the configured Codex executable instead of always using codex"
 );

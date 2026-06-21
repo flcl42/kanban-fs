@@ -1,8 +1,8 @@
 {
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
-  "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional Codex runner.",
-  "version": "1.0.26",
+  "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional agent runner.",
+  "version": "1.0.27",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -32,8 +32,8 @@
   "files": [
     "out/extension.js",
     "docs/kanban.png",
-    "codex_runner.csx",
-    "readme_codex_runner.md",
+    "runner.py",
+    "readme_runner.md",
     "LICENSE",
     "icon.png",
     "language-configuration.json",
@@ -78,6 +78,11 @@
       {
         "command": "kanban.createBoardWithRunner",
         "title": "Create Board with Initialized Runner",
+        "category": "AI Kanban"
+      },
+      {
+        "command": "kanban.initializeRunner",
+        "title": "Initialize Runner",
         "category": "AI Kanban"
       },
       {
@@ -137,32 +142,54 @@
         },
         "kanban.runner.command": {
           "type": "string",
-          "default": "dotnet",
+          "default": "python",
           "scope": "application",
           "description": "Command used to start the Kanban runner from the warning panel."
         },
         "kanban.runner.args": {
           "type": "array",
           "default": [
-            "script",
             "${runnerScript}",
-            "--",
             "--root",
             "${runnerRoot}",
+            "--default-agent",
+            "${defaultAgent}",
             "--codex-executable",
-            "${codexExecutable}"
+            "${codexExecutable}",
+            "--claude-executable",
+            "${claudeExecutable}"
           ],
           "items": {
             "type": "string"
           },
           "scope": "application",
-          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, and ${codexExecutable}."
+          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, ${defaultAgent}, ${codexExecutable}, and ${claudeExecutable}."
+        },
+        "kanban.defaultAgent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null,
+          "enum": [
+            null,
+            "claude",
+            "codex"
+          ],
+          "scope": "application",
+          "description": "Default agent for runner tasks. When null, the runner auto-detects Claude first and then Codex. Task tags such as claude, codex, agent:claude, or agent:codex override this per card."
         },
         "kanban.codexExecutable": {
           "type": "string",
           "default": "codex",
           "scope": "application",
-          "description": "Codex-compatible executable used by the Kanban runner and resume-agent terminals."
+          "description": "Codex executable used by the Kanban runner and resume-agent terminals."
+        },
+        "kanban.claudeExecutable": {
+          "type": "string",
+          "default": "claude",
+          "scope": "application",
+          "description": "Claude Code executable used by the Kanban runner."
         }
       }
     }
@@ -175,7 +202,8 @@
     "watch": "tsc -watch -p ./",
     "package:vsix": "npm test && vsce package",
     "publish:marketplace": "npm test && vsce publish",
-    "test": "npm run compile && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card && npm run test:fast-move-path",
+    "test": "npm run compile && npm run test:runner && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card && npm run test:fast-move-path",
+    "test:runner": "python -m py_compile runner.py",
     "test:board-config": "node scripts/test-board-config.js",
     "test:new-card": "node scripts/test-new-card.js",
     "test:webview": "node scripts/smoke-webview.js",

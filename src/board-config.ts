@@ -21,6 +21,7 @@ export type BoardConfig = {
   data: Record<string, unknown>;
   folders: BoardFolderConfig[];
   folderMap: Map<string, BoardFolderConfig>;
+  ignoredFolders: Set<string>;
   sourceText: string;
   valid: boolean;
 };
@@ -33,6 +34,7 @@ export function createEmptyBoardConfig(
     data: {},
     folders: [],
     folderMap: new Map(),
+    ignoredFolders: new Set(),
     sourceText,
     valid,
   };
@@ -107,14 +109,23 @@ export function parseBoardConfig(content: string): BoardConfig {
       order += 1;
     }
   }
+  const ignoredFolders = readIgnoredFolders(data);
 
   return {
     data,
     folders,
     folderMap: new Map(folders.map((folder) => [folder.id, folder])),
+    ignoredFolders,
     sourceText: content,
     valid,
   };
+}
+
+export function isIgnoredFolder(
+  boardConfig: BoardConfig,
+  folderId: string
+): boolean {
+  return boardConfig.ignoredFolders.has(normalizeFolderId(folderId));
 }
 
 export function serializeBoardConfig(
@@ -327,6 +338,40 @@ function readFolderCardPriorities(value: unknown): Map<string, number> {
   return priorities;
 }
 
+function readIgnoredFolders(data: Record<string, unknown>): Set<string> {
+  const ignoredFolders = new Set<string>();
+  for (const key of [
+    "ignoreFolders",
+    "ignoredFolders",
+    "ignoreDirs",
+    "ignoredDirs",
+    "excludeFolders",
+    "excludedFolders",
+    "excludeDirs",
+    "excludedDirs",
+    "ignore",
+    "exclude",
+  ]) {
+    for (const folderId of readStringList(data[key])) {
+      ignoredFolders.add(normalizeFolderId(folderId));
+    }
+  }
+  return ignoredFolders;
+}
+
+function readStringList(value: unknown): string[] {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => coerceString(item))
+    .filter((item): item is string => !!item);
+}
+
 function toPriorityList(
   priorities: Map<string, number> | undefined
 ): string[] | null {
@@ -362,6 +407,10 @@ function coerceString(value: unknown): string | null {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : null;
+}
+
+function normalizeFolderId(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

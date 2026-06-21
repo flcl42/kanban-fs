@@ -10,6 +10,7 @@ import {
   buildFolderCardPriorityOverrides,
   buildFolderConfigMap,
   createEmptyBoardConfig,
+  isIgnoredFolder,
   normalizeLineEndings,
   orderColumnsByConfig,
   parseBoardConfig,
@@ -113,16 +114,20 @@ const OPEN_LOCAL_PATH_COMMAND = "kanban.openLocalPath";
 const CREATE_EMPTY_BOARD_COMMAND = "kanban.createEmptyBoard";
 const CREATE_BOARD_WITH_COLUMNS_COMMAND = "kanban.createBoardWithColumns";
 const CREATE_BOARD_WITH_RUNNER_COMMAND = "kanban.createBoardWithRunner";
+const INITIALIZE_RUNNER_COMMAND = "kanban.initializeRunner";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
 const RUNNER_PANEL_ENABLED_SETTING = "runnerPanel.enabled";
 const RUNNER_COMMAND_SETTING = "runner.command";
 const RUNNER_ARGS_SETTING = "runner.args";
+const DEFAULT_AGENT_SETTING = "defaultAgent";
 const CODEX_EXECUTABLE_SETTING = "codexExecutable";
+const CLAUDE_EXECUTABLE_SETTING = "claudeExecutable";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
 const DEFAULT_CODEX_EXECUTABLE = "codex";
+const DEFAULT_CLAUDE_EXECUTABLE = "claude";
 const RUNNER_STATUS_REFRESH_MS = 10_000;
 const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
 const RUNNER_LAUNCH_GRACE_MS = 45_000;
@@ -131,10 +136,11 @@ const RUNNER_STATUS_PORT_RANGE = 20_000;
 const RUNNER_STATUS_PORT_STEP = 997;
 const RUNNER_STATUS_PORT_CANDIDATES = 32;
 const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
-const DOTNET_INSTALL_URL = "https://dotnet.microsoft.com/download";
-const DOTNET_SCRIPT_INSTALL_URL = "https://github.com/dotnet-script/dotnet-script";
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
+const CLAUDE_INSTALL_URL = "https://docs.anthropic.com/en/docs/claude-code";
+const PYTHON_INSTALL_URL = "https://www.python.org/downloads/";
 const KANBAN_FILE_NAME = ".kanban";
+const RUNNER_SCRIPT_NAME = "runner.py";
 const DEFAULT_BOARD_COLUMNS = [
   { id: "new", name: "new" },
   { id: "backlog", name: "backlog" },
@@ -143,13 +149,15 @@ const DEFAULT_BOARD_COLUMNS = [
   { id: "confirmed", name: "confirmed" },
 ];
 const DEFAULT_RUNNER_ARGS = [
-  "script",
   "${runnerScript}",
-  "--",
   "--root",
   "${runnerRoot}",
+  "--default-agent",
+  "${defaultAgent}",
   "--codex-executable",
   "${codexExecutable}",
+  "--claude-executable",
+  "${claudeExecutable}",
 ];
 
 export function activate(context: vscode.ExtensionContext) {
@@ -181,6 +189,9 @@ export function activate(context: vscode.ExtensionContext) {
     ),
     vscode.commands.registerCommand(CREATE_BOARD_WITH_RUNNER_COMMAND, async () =>
       provider.createBoardWithRunner()
+    ),
+    vscode.commands.registerCommand(INITIALIZE_RUNNER_COMMAND, async (target?: vscode.Uri) =>
+      provider.initializeRunner(target)
     ),
     vscode.window.registerCustomEditorProvider("kanban.board", provider, {
       webviewOptions: { retainContextWhenHidden: true },
@@ -776,6 +787,108 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
   }
 
+  async initializeRunner(target?: vscode.Uri): Promise<void> {
+    const kanbanUri = await this.resolveRunnerInitializationTarget(target);
+    if (!kanbanUri) {
+      return;
+    }
+
+    const result = await this.initializeRunnerForBoard(kanbanUri);
+    await this.openBoard(result.kanbanUri);
+    vscode.window.showInformationMessage(
+      `AI Kanban runner initialized: ${result.runnerPath}`
+    );
+  }
+
+  private async resolveRunnerInitializationTarget(
+    target?: vscode.Uri
+  ): Promise<vscode.Uri | null> {
+    const directTarget = await this.resolveKanbanUriFromTarget(target);
+    if (directTarget) {
+      return directTarget;
+    }
+
+    const activeTarget = await this.resolveKanbanUriFromTarget(
+      vscode.window.activeTextEditor?.document.uri
+    );
+    if (activeTarget) {
+      return activeTarget;
+    }
+
+    const boards = (await vscode.workspace.findFiles(
+      `**/${KANBAN_FILE_NAME}`,
+      "**/{.git,node_modules}/**"
+    )).filter((uri) => uri.scheme === "file");
+    if (boards.length === 1) {
+      return boards[0];
+    }
+    if (boards.length > 1) {
+      const selected = await vscode.window.showQuickPick(
+        boards.map((uri) => ({
+          label: vscode.workspace.asRelativePath(uri, false),
+          description: uri.fsPath,
+          uri,
+        })),
+        {
+          title: "Select a board to initialize runner support",
+          placeHolder: "Select .kanban",
+        }
+      );
+      return selected?.uri ?? null;
+    }
+
+    const rootFolder = await this.pickBoardFolder(
+      "Select a root folder for the AI Kanban runner"
+    );
+    if (!rootFolder) {
+      return null;
+    }
+    return this.ensureRunnerBoardInRoot(rootFolder);
+  }
+
+  private async resolveKanbanUriFromTarget(
+    target?: vscode.Uri
+  ): Promise<vscode.Uri | null> {
+    if (!target || target.scheme !== "file") {
+      return null;
+    }
+    const targetPath = target.fsPath;
+    if (path.basename(targetPath).toLowerCase() === KANBAN_FILE_NAME) {
+      return target;
+    }
+
+    try {
+      const stat = await vscode.workspace.fs.stat(target);
+      if (stat.type !== vscode.FileType.Directory) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+
+    const rootKanbanUri = vscode.Uri.joinPath(target, KANBAN_FILE_NAME);
+    if (await this.fileExists(rootKanbanUri)) {
+      return rootKanbanUri;
+    }
+    const tasksKanbanUri = vscode.Uri.joinPath(target, "tasks", KANBAN_FILE_NAME);
+    if (await this.fileExists(tasksKanbanUri)) {
+      return tasksKanbanUri;
+    }
+    return this.ensureRunnerBoardInRoot(target);
+  }
+
+  private async ensureRunnerBoardInRoot(rootFolder: vscode.Uri): Promise<vscode.Uri> {
+    const tasksUri = vscode.Uri.joinPath(rootFolder, "tasks");
+    await vscode.workspace.fs.createDirectory(tasksUri);
+    const kanbanUri = vscode.Uri.joinPath(tasksUri, KANBAN_FILE_NAME);
+    const existing = await this.readExistingText(kanbanUri);
+    if (existing === null || existing.trim().length === 0) {
+      await this.writeTextFile(kanbanUri, createDefaultBoardConfigText());
+    }
+    await this.createDefaultColumnDirectories(tasksUri);
+    return kanbanUri;
+  }
+
   async openCustomDocument(
     uri: vscode.Uri,
     openContext: vscode.CustomDocumentOpenContext,
@@ -1105,6 +1218,23 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
         return;
       }
+      if (message?.type === "toggleTaskCheckbox" && message?.cardUri) {
+        const cardUri = String(message.cardUri);
+        await runBoardMutation(() =>
+          this.updateTaskCheckbox(
+            cardUri,
+            Number(message?.taskIndex),
+            Boolean(message?.checked)
+          )
+        );
+        await sendBoard();
+        const details = await this.readCardDetails(cardUri);
+        webviewPanel.webview.postMessage({
+          type: "cardDetails",
+          ...details,
+        });
+        return;
+      }
       if (message?.type === "saveDetailsPaneWidth") {
         await this.updateDetailsPaneWidthSetting(message?.width);
         return;
@@ -1179,6 +1309,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     for (const [name, type] of entries) {
       if (type !== vscode.FileType.Directory) {
+        continue;
+      }
+      if (isIgnoredFolder(boardConfig, name)) {
         continue;
       }
       const columnUri = vscode.Uri.joinPath(boardFolder, name);
@@ -1382,10 +1515,57 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .filter((line) => line.trim().length > 0).length;
     return {
       cardUri: cardUri.toString(),
-      bodyHtml: md.render(body || ""),
+      bodyHtml: renderMarkdownWithTaskLists(body || ""),
       bodyLineCount,
       updatedAt: stat.mtime,
     };
+  }
+
+  private async updateTaskCheckbox(
+    cardUriString: string,
+    taskIndex: number,
+    checked: boolean
+  ): Promise<void> {
+    if (!Number.isInteger(taskIndex) || taskIndex < 0) {
+      return;
+    }
+
+    const cardUri = vscode.Uri.parse(cardUriString);
+    if (cardUri.scheme !== "file") {
+      return;
+    }
+
+    const existing = await this.readExistingText(cardUri);
+    if (existing === null) {
+      return;
+    }
+
+    const lines = existing.split(/\r?\n/);
+    let currentTaskIndex = 0;
+    let changed = false;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index];
+      const match = line.match(/^(\s*(?:[-+*]|\d+[.)])\s+\[)([ xX])(\])/);
+      if (!match) {
+        continue;
+      }
+      if (currentTaskIndex === taskIndex) {
+        const nextMarker = checked ? "x" : " ";
+        if (match[2] !== nextMarker) {
+          lines[index] = `${match[1]}${nextMarker}${match[3]}${line.slice(match[0].length)}`;
+          changed = true;
+        }
+        break;
+      }
+      currentTaskIndex += 1;
+    }
+
+    if (!changed) {
+      return;
+    }
+
+    await this.applyContentEdit(cardUri, lines.join("\n"));
   }
 
   private async readColumnMeta(
@@ -1905,9 +2085,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private getRunnerCommandSetting(): string {
     const command = vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION)
-      .get<string>(RUNNER_COMMAND_SETTING, "dotnet")
+      .get<string>(RUNNER_COMMAND_SETTING, "python")
       .trim();
-    return command || "dotnet";
+    return command || "python";
   }
 
   private getRunnerArgsSetting(): string[] {
@@ -1925,6 +2105,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return executable || DEFAULT_CODEX_EXECUTABLE;
   }
 
+  private getClaudeExecutableSetting(): string {
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(CLAUDE_EXECUTABLE_SETTING, DEFAULT_CLAUDE_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_CLAUDE_EXECUTABLE;
+  }
+
+  private getDefaultAgentSetting(): string {
+    const value = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string | null>(DEFAULT_AGENT_SETTING, null);
+    return typeof value === "string" ? value.trim().toLowerCase() : "";
+  }
+
   private getRunnerScriptRequiredSetting(): boolean {
     const command = this.getRunnerCommandSetting();
     const args = this.getRunnerArgsSetting();
@@ -1932,72 +2127,64 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   }
 
   private async getRunnerToolStatuses(): Promise<RunnerToolStatuses> {
-    const checks: Array<[string, Promise<RunnerToolStatus>]> = [
-      [
-        "codex",
-        this.detectRunnerTool(
+    const pythonStatus = await this.detectRunnerTool(
+      "Python",
+      this.getRunnerCommandSetting(),
+      ["--version"],
+      PYTHON_INSTALL_URL
+    );
+    const defaultAgent = this.getDefaultAgentSetting();
+    if (defaultAgent === "claude") {
+      return {
+        python: pythonStatus,
+        claude: await this.detectRunnerTool(
+          "Claude Code",
+          this.getClaudeExecutableSetting(),
+          ["--version"],
+          CLAUDE_INSTALL_URL
+        ),
+      };
+    }
+    if (defaultAgent === "codex") {
+      return {
+        python: pythonStatus,
+        codex: await this.detectRunnerTool(
           "Codex CLI",
           this.getCodexExecutableSetting(),
           ["--version"],
           CODEX_INSTALL_URL
         ),
-      ],
-    ];
-
-    if (this.runnerCommandUsesDotnet()) {
-      checks.push([
-        "dotnet",
-        this.detectRunnerTool(
-          ".NET SDK",
-          "dotnet",
-          ["--version"],
-          DOTNET_INSTALL_URL
-        ),
-      ]);
+      };
     }
 
-    if (this.runnerCommandUsesDotnetScript()) {
-      checks.push([
-        "dotnetScript",
-        this.detectRunnerTool(
-          "dotnet-script",
-          "dotnet",
-          ["script", "--version"],
-          DOTNET_SCRIPT_INSTALL_URL
-        ),
-      ]);
-    }
-
-    const results = await Promise.all(
-      checks.map(async ([key, status]) => [key, await status] as const)
-    );
-    return Object.fromEntries(results);
-  }
-
-  private runnerCommandUsesDotnet(): boolean {
-    const commandParts = this.getRunnerCommandSetting()
-      .trim()
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean);
-    const commandName = commandParts[0]
-      ? path.basename(commandParts[0]).replace(/\.exe$/i, "")
-      : "";
-    return commandName === "dotnet";
-  }
-
-  private runnerCommandUsesDotnetScript(): boolean {
-    if (!this.runnerCommandUsesDotnet()) {
-      return false;
-    }
-
-    const commandParts = this.getRunnerCommandSetting()
-      .trim()
-      .toLowerCase()
-      .split(/\s+/)
-      .filter(Boolean);
-    const args = this.getRunnerArgsSetting().map((arg) => arg.toLowerCase());
-    return commandParts.includes("script") || args.includes("script");
+    const [claudeStatus, codexStatus] = await Promise.all([
+      this.detectRunnerTool(
+        "Claude Code",
+        this.getClaudeExecutableSetting(),
+        ["--version"],
+        CLAUDE_INSTALL_URL
+      ),
+      this.detectRunnerTool(
+        "Codex CLI",
+        this.getCodexExecutableSetting(),
+        ["--version"],
+        CODEX_INSTALL_URL
+      ),
+    ]);
+    return {
+      python: pythonStatus,
+      agent: {
+        label: "Claude Code or Codex CLI",
+        command: `${claudeStatus.command} / ${codexStatus.command}`,
+        installed: claudeStatus.installed || codexStatus.installed,
+        version: claudeStatus.installed
+          ? `Claude Code ${claudeStatus.version}`
+          : codexStatus.installed
+            ? `Codex CLI ${codexStatus.version}`
+            : "",
+        installUrl: CLAUDE_INSTALL_URL,
+      },
+    };
   }
 
   private async detectRunnerTool(
@@ -2203,6 +2390,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async fileExists(uri: vscode.Uri): Promise<boolean> {
+    try {
+      await vscode.workspace.fs.stat(uri);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async writeTextFile(uri: vscode.Uri, content: string): Promise<void> {
     await vscode.workspace.fs.writeFile(uri, Buffer.from(content, "utf8"));
   }
@@ -2225,7 +2421,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     localRunnerScript: string | null;
     runnerScript: string;
     workspaceFolder: string;
+    defaultAgent: string;
     codexExecutable: string;
+    claudeExecutable: string;
   } {
     const kanbanDir = path.dirname(kanbanUri.fsPath);
     const runnerRoot =
@@ -2239,7 +2437,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       kanbanDir,
       workspaceFolder
     );
-    const bundledRunnerScript = this.context.asAbsolutePath("codex_runner.csx");
+    const bundledRunnerScript = this.context.asAbsolutePath(RUNNER_SCRIPT_NAME);
     const runnerScript = localRunnerScript ?? bundledRunnerScript;
     return {
       kanbanDir,
@@ -2247,7 +2445,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       localRunnerScript,
       runnerScript,
       workspaceFolder,
+      defaultAgent: this.getDefaultAgentSetting(),
       codexExecutable: this.getCodexExecutableSetting(),
+      claudeExecutable: this.getClaudeExecutableSetting(),
     };
   }
 
@@ -2260,12 +2460,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const preparedKanbanUri = await this.prepareRunnerKanbanLocation(kanbanUri);
     const paths = this.getRunnerTokenPaths(preparedKanbanUri);
-    const destination = path.join(paths.kanbanDir, "codex_runner.csx");
+    const destination = path.join(paths.kanbanDir, RUNNER_SCRIPT_NAME);
     if (existsSync(destination)) {
       return { runnerPath: destination, kanbanUri: preparedKanbanUri };
     }
 
-    const source = this.context.asAbsolutePath("codex_runner.csx");
+    const source = this.context.asAbsolutePath(RUNNER_SCRIPT_NAME);
     const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
     return { runnerPath: destination, kanbanUri: preparedKanbanUri };
@@ -2372,9 +2572,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     workspaceFolder: string
   ): string | null {
     const candidates = [
-      path.join(runnerRoot, "codex_runner.csx"),
-      path.join(kanbanDir, "codex_runner.csx"),
-      path.join(workspaceFolder, "codex_runner.csx"),
+      path.join(runnerRoot, RUNNER_SCRIPT_NAME),
+      path.join(kanbanDir, RUNNER_SCRIPT_NAME),
+      path.join(workspaceFolder, RUNNER_SCRIPT_NAME),
     ];
     return candidates.find((candidate) => existsSync(candidate)) ?? null;
   }
@@ -2386,7 +2586,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       runnerRoot: string;
       runnerScript: string;
       workspaceFolder: string;
+      defaultAgent: string;
       codexExecutable: string;
+      claudeExecutable: string;
     }
   ): string {
     return value
@@ -2394,7 +2596,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .replace(/\$\{runnerRoot\}/g, paths.runnerRoot)
       .replace(/\$\{runnerScript\}/g, paths.runnerScript)
       .replace(/\$\{workspaceFolder\}/g, paths.workspaceFolder)
-      .replace(/\$\{codexExecutable\}/g, paths.codexExecutable);
+      .replace(/\$\{defaultAgent\}/g, paths.defaultAgent)
+      .replace(/\$\{codexExecutable\}/g, paths.codexExecutable)
+      .replace(/\$\{claudeExecutable\}/g, paths.claudeExecutable);
   }
 
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
@@ -3367,6 +3571,45 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .description-frame {
       position: relative;
     }
+    .description-frame p,
+    .description-frame ul,
+    .description-frame ol,
+    .description-frame blockquote,
+    .description-frame pre {
+      margin: 0 0 10px;
+    }
+    .description-frame ul,
+    .description-frame ol {
+      padding-left: 22px;
+    }
+    .description-frame li {
+      margin: 4px 0;
+    }
+    .description-frame code {
+      font-family: var(--mono);
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    .description-frame pre {
+      overflow: auto;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface);
+    }
+    .description-frame pre code {
+      border: 0;
+      padding: 0;
+      background: transparent;
+    }
+    .task-list-checkbox {
+      margin: 0 6px 0 0;
+      vertical-align: -2px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
     .description-frame.collapsed {
       max-height: 40rem;
       overflow: hidden;
@@ -3596,7 +3839,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerPanelEl.innerHTML = \`
           <div>
             <div class="runner-panel-title">No local runner script found</div>
-            <p class="runner-panel-text">Initialize runner support: create tasks/, move this .kanban there, and add codex_runner.csx beside it.</p>
+            <p class="runner-panel-text">Initialize runner support: create tasks/, move this .kanban there, and add runner.py beside it.</p>
             \${messageHtml}
             \${requirementsHtml}
           </div>
@@ -3609,7 +3852,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       runnerPanelEl.innerHTML = \`
         <div>
-          <div class="runner-panel-title">No Codex runner detected</div>
+          <div class="runner-panel-title">No Kanban runner detected</div>
           <p class="runner-panel-text">Start a background runner for this board. It keeps working if VS Code closes.</p>
           \${messageHtml}
           \${requirementsHtml}
@@ -4687,6 +4930,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     window.addEventListener("mousemove", updateDetailsResize);
     window.addEventListener("mouseup", finishDetailsResize);
 
+    detailsEl.addEventListener("change", (event) => {
+      const target = event.target instanceof Element
+        ? event.target
+        : null;
+      if (!target || target.getAttribute("type") !== "checkbox") {
+        return;
+      }
+      const taskIndex = Number(target.getAttribute("data-task-index"));
+      if (!Number.isInteger(taskIndex) || !selectedCard?.uri) {
+        return;
+      }
+      vscode.postMessage({
+        type: "toggleTaskCheckbox",
+        cardUri: selectedCard.uri,
+        taskIndex,
+        checked: Boolean(target.checked),
+      });
+    });
+
     detailsEl.addEventListener("click", (event) => {
       const actionButton = event.target instanceof Element
         ? event.target.closest("[data-action-type]")
@@ -4956,6 +5218,22 @@ function buildCardSearchText(
   return [title, fileName, body, ...tags, propertiesText]
     .join("\n")
     .toLowerCase();
+}
+
+function renderMarkdownWithTaskLists(markdown: string): string {
+  let taskIndex = 0;
+  return md.render(markdown).replace(
+    /(<li\b[^>]*>\s*(?:<p>)?)\[( |x|X)\]\s+/g,
+    (_match, prefix: string, marker: string) => {
+      const checked = marker.toLowerCase() === "x";
+      const checkbox =
+        `<input class="task-list-checkbox" type="checkbox" data-task-index="${taskIndex}"` +
+        (checked ? " checked" : "") +
+        " /> ";
+      taskIndex += 1;
+      return `${prefix}${checkbox}`;
+    }
+  );
 }
 
 function normalizeDetailsPaneWidth(value: unknown): number {
