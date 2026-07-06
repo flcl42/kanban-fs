@@ -1085,6 +1085,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await sendBoard();
         return;
       }
+      if (message?.type === "renameColumn") {
+        const columnId = String(message?.columnId ?? "").trim();
+        if (!columnId) {
+          return;
+        }
+        const currentTitle = String(message?.currentTitle ?? columnId).trim() || columnId;
+        const title = await vscode.window.showInputBox({
+          prompt: `Rename column "${currentTitle}"`,
+          value: currentTitle,
+          ignoreFocusOut: true,
+        });
+        if (title === undefined) {
+          return;
+        }
+        await runBoardMutation(() =>
+          this.renameColumnTitle(document.uri, columnId, title)
+        );
+        await sendBoard();
+        return;
+      }
       if (message?.type === "moveCard") {
         await runBoardMutation(() =>
           this.moveCard(
@@ -1942,6 +1962,62 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     await this.updateBoardFolderOrder(kanbanUri, orderedIds, columns, boardConfig);
   }
 
+  private async renameColumnTitle(
+    kanbanUri: vscode.Uri,
+    columnId: string,
+    title: string
+  ): Promise<void> {
+    const trimmedColumnId = String(columnId ?? "").trim();
+    if (!trimmedColumnId) {
+      return;
+    }
+    const boardConfig = await this.readBoardConfigForWrite(kanbanUri);
+    if (!boardConfig) {
+      return;
+    }
+
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const entries = await vscode.workspace.fs.readDirectory(boardFolder);
+    const columns: { id: string; name: string; order: number | null }[] = [];
+    let found = false;
+    const nextTitle = title.trim() || trimmedColumnId;
+
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory || isIgnoredFolder(boardConfig, name)) {
+        continue;
+      }
+      const columnUri = vscode.Uri.joinPath(boardFolder, name);
+      const meta = await this.readColumnMeta(columnUri, name, boardConfig);
+      if (name === trimmedColumnId) {
+        found = true;
+      }
+      columns.push({
+        id: name,
+        name: name === trimmedColumnId ? nextTitle : meta.title,
+        order: meta.order,
+      });
+    }
+
+    if (!found) {
+      return;
+    }
+
+    const nextData = { ...boardConfig.data };
+    nextData.folders = buildFolderConfigMap(
+      this.orderColumns(columns, boardConfig),
+      boardConfig
+    );
+    const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    const nextConfig = parseBoardConfig(serialized);
+    if (
+      normalizeLineEndings(serialized) !==
+      normalizeLineEndings(boardConfig.sourceText)
+    ) {
+      await this.applyContentEdit(kanbanUri, serialized);
+    }
+    this.boardConfigCache.set(kanbanUri.toString(), nextConfig);
+  }
+
   private async updateBoardFolderOrder(
     kanbanUri: vscode.Uri,
     orderedIds: string[],
@@ -2458,45 +2534,45 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       throw new Error("Runner creation is only supported for local file boards.");
     }
 
-    const preparedKanbanUri = await this.prepareRunnerKanbanLocation(kanbanUri);
-    const paths = this.getRunnerTokenPaths(preparedKanbanUri);
+    const paths = this.getRunnerTokenPaths(kanbanUri);
+    if (paths.kanbanDir === paths.runnerRoot) {
+      await this.ensureRootRunnerIgnoredFolders(kanbanUri);
+    }
     const destination = path.join(paths.kanbanDir, RUNNER_SCRIPT_NAME);
     if (existsSync(destination)) {
-      return { runnerPath: destination, kanbanUri: preparedKanbanUri };
+      return { runnerPath: destination, kanbanUri };
     }
 
     const source = this.context.asAbsolutePath(RUNNER_SCRIPT_NAME);
     const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
-    return { runnerPath: destination, kanbanUri: preparedKanbanUri };
+    return { runnerPath: destination, kanbanUri };
   }
 
-  private async prepareRunnerKanbanLocation(
-    kanbanUri: vscode.Uri
-  ): Promise<vscode.Uri> {
-    const kanbanDir = path.dirname(kanbanUri.fsPath);
-    if (path.basename(kanbanDir).toLowerCase() === "tasks") {
-      return kanbanUri;
+  private async ensureRootRunnerIgnoredFolders(kanbanUri: vscode.Uri): Promise<void> {
+    const boardConfig = await this.readBoardConfig(kanbanUri);
+    if (!boardConfig.valid) {
+      return;
     }
-
-    const tasksUri = vscode.Uri.file(path.join(kanbanDir, "tasks"));
-    await vscode.workspace.fs.createDirectory(tasksUri);
-    const destinationUri = vscode.Uri.joinPath(
-      tasksUri,
-      path.basename(kanbanUri.fsPath)
+    const runnerFolders = ["projects", "cache", "trash", "logs"];
+    const missingFolders = runnerFolders.filter(
+      (folder) => !boardConfig.ignoredFolders.has(folder)
     );
-    if (destinationUri.toString() === kanbanUri.toString()) {
-      return kanbanUri;
+    if (missingFolders.length === 0) {
+      return;
     }
 
-    try {
-      await vscode.workspace.fs.stat(destinationUri);
-      return destinationUri;
-    } catch {
-      await vscode.workspace.fs.rename(kanbanUri, destinationUri, {
-        overwrite: false,
-      });
-      return destinationUri;
+    const existingIgnoredFolders = readStringList(boardConfig.data.ignoreFolders);
+    const nextData = {
+      ...boardConfig.data,
+      ignoreFolders: [...existingIgnoredFolders, ...missingFolders],
+    };
+    const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    if (
+      normalizeLineEndings(serialized) !==
+      normalizeLineEndings(boardConfig.sourceText)
+    ) {
+      await this.applyContentEdit(kanbanUri, serialized);
     }
   }
 
@@ -3278,6 +3354,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       text-transform: uppercase;
       margin: 0;
       color: var(--muted);
+    }
+    .column-title {
+      cursor: text;
     }
     .add-card {
       border: 1px solid var(--line);
@@ -4573,9 +4652,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           });
         }
         const titleEl = document.createElement("h2");
+        titleEl.className = "column-title";
         titleEl.textContent = searchActive
           ? \`\${column.name} (\${visibleCards.length}/\${allCards.length})\`
           : \`\${column.name} (\${allCards.length})\`;
+        titleEl.addEventListener("dblclick", (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          vscode.postMessage({
+            type: "renameColumn",
+            columnId,
+            currentTitle: column.name,
+          });
+        });
         headerEl.appendChild(titleEl);
         if (columnId === firstColumnId) {
           const addButton = document.createElement("button");
@@ -5245,6 +5334,19 @@ function normalizeDetailsPaneWidth(value: unknown): number {
     MIN_DETAILS_PANE_WIDTH,
     Math.min(MAX_DETAILS_PANE_WIDTH, Math.round(numeric))
   );
+}
+
+function readStringList(value: unknown): string[] {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed ? [trimmed] : [];
+  }
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter((item) => item.length > 0);
 }
 
 function formatAgentTerminalName(

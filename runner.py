@@ -160,7 +160,11 @@ class OrchestratorSettings:
 class BoardPaths:
     def __init__(self, root: str) -> None:
         self.root = os.path.abspath(root)
-        self.tasks_root = os.path.join(self.root, "tasks")
+        root_kanban_marker = os.path.join(self.root, ".kanban")
+        nested_tasks_root = os.path.join(self.root, "tasks")
+        nested_kanban_marker = os.path.join(nested_tasks_root, ".kanban")
+        self.uses_root_board = os.path.exists(root_kanban_marker)
+        self.tasks_root = self.root if self.uses_root_board else nested_tasks_root
         self.projects_root = os.path.join(self.root, "projects")
         self.cache_root = os.path.join(self.root, "cache")
         self.trash_root = os.path.join(self.root, "trash")
@@ -168,7 +172,7 @@ class BoardPaths:
         self.gitignore_path = os.path.join(self.root, ".gitignore")
         self.context_path = os.path.join(self.root, "context.md")
         self.projects_map_path = os.path.join(self.root, "projects.md")
-        self.kanban_marker_path = os.path.join(self.tasks_root, ".kanban")
+        self.kanban_marker_path = root_kanban_marker if self.uses_root_board else nested_kanban_marker
         self.task_template_path = os.path.join(self.tasks_root, "template.md")
         self.kanban_folders = [
             KanbanFolder("new", os.path.join(self.tasks_root, "new")),
@@ -342,7 +346,6 @@ class TaskOrchestrator:
     def ensure_board_scaffold(self) -> None:
         os.makedirs(self.paths.root, exist_ok=True)
         os.makedirs(self.paths.tasks_root, exist_ok=True)
-        self.move_root_kanban_marker_into_tasks()
         should_seed_kanban = self.should_seed_kanban_config(self.paths.kanban_marker_path)
         for directory in self.paths.required_directories:
             os.makedirs(directory, exist_ok=True)
@@ -364,35 +367,6 @@ class TaskOrchestrator:
         self.ensure_file_exists(
             self.paths.task_template_path,
             BoardTemplates.resolve_task_template(self.settings.invocation_directory),
-        )
-
-    def move_root_kanban_marker_into_tasks(self) -> None:
-        root_marker = os.path.join(self.paths.root, ".kanban")
-        if not os.path.exists(root_marker) or path_equals(root_marker, self.paths.kanban_marker_path):
-            return
-
-        if not os.path.exists(self.paths.kanban_marker_path):
-            shutil.move(root_marker, self.paths.kanban_marker_path)
-            self.log.info(f"Moved root .kanban marker into tasks: {self.paths.kanban_marker_path}")
-            return
-
-        root_text = read_text(root_marker)
-        task_text = read_text(self.paths.kanban_marker_path)
-        if not task_text.strip() and root_text.strip():
-            write_text(self.paths.kanban_marker_path, root_text)
-            os.remove(root_marker)
-            self.log.info(
-                f"Moved root .kanban marker content into tasks: {self.paths.kanban_marker_path}"
-            )
-            return
-
-        if not root_text.strip():
-            os.remove(root_marker)
-            self.log.info("Removed empty root .kanban marker after runner initialization.")
-            return
-
-        self.log.warn(
-            f"Root .kanban marker was left in place because tasks/.kanban already exists: {root_marker}"
         )
 
     @staticmethod
@@ -1583,6 +1557,13 @@ Project: {{CURSOR}}
         lines = ["folders:"]
         for folder in folders:
             lines.append(f"  {folder.name}: {folder.name}")
+        lines.extend([
+            "ignoreFolders:",
+            "  - projects",
+            "  - cache",
+            "  - trash",
+            "  - logs",
+        ])
         return "\n".join(lines) + "\n"
 
 

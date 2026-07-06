@@ -8,7 +8,23 @@ Agents are expected to read both `README.md` and `context.md` before they begin 
 
 ## Board Layout
 
-The runner expects this root layout:
+The runner supports a root board when `.kanban` is in the root:
+
+```text
+.
+├─ .kanban
+├─ runner.py
+├─ backlog/
+├─ doing/
+├─ done/
+├─ confirmed/
+├─ projects/
+├─ cache/
+├─ trash/
+└─ logs/
+```
+
+It also supports the nested runner layout:
 
 ```text
 .
@@ -30,7 +46,7 @@ The runner expects this root layout:
    └─ confirmed/
 ```
 
-`new/` is a staging column for cards that are not ready to run yet. `runner.py` only starts work from `tasks/backlog/`.
+`new/` is a staging column for cards that are not ready to run yet. `runner.py` starts work from `backlog/` in root-board mode or `tasks/backlog/` in nested mode.
 
 ## Task Format
 

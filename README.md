@@ -34,7 +34,7 @@ Use one of these commands:
 - `AI Kanban: Create Empty Board` creates only a `.kanban` file in the folder you choose.
 - `AI Kanban: Create Board with Columns` creates `.kanban` plus the default workflow folders: `new`, `backlog`, `doing`, `done`, `confirmed`.
 - `AI Kanban: Create Board with Initialized Runner` creates `tasks/.kanban`, the default workflow folders, and a local `runner.py` script beside the board.
-- `AI Kanban: Initialize Runner` adds runner support to an existing board, or creates `tasks/.kanban` and copies the bundled `runner.py` into the selected root.
+- `AI Kanban: Initialize Runner` adds runner support to an existing board by copying the bundled `runner.py` beside its `.kanban` file. If no board exists, it creates `tasks/.kanban` and places `runner.py` beside that file.
 
 You can also create a `.kanban` file manually and open it in VS Code. If a `template.md` file exists beside `.kanban`, new tickets use it as the card template.
 
@@ -46,6 +46,7 @@ Useful board actions:
 
 - Press `Ctrl+F` or `Cmd+F` in the board to search cards by title, body, tags, file name, and properties.
 - Drag cards between columns or within a column to reorder them.
+- Double-click a column title to rename its display title in `.kanban`.
 - Use the bump button on a card to move it to the top of its column.
 - Use property actions in the details panel to open local paths, URLs, repositories, or VS Code windows.
 

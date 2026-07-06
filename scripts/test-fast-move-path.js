@@ -51,6 +51,16 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /uses_root_board = os\.path\.exists\(root_kanban_marker\)/,
+  "runner should use root-board mode when .kanban is in the root"
+);
+assert.doesNotMatch(
+  runnerSource,
+  /move_root_kanban_marker_into_tasks/,
+  "runner should not move a root .kanban into tasks"
+);
+assert.match(
+  runnerSource,
   /ToolPaths\.resolve_executable\(.*AgentKind\.CODEX/s,
   "runner should resolve the configured Codex executable instead of always using codex"
 );

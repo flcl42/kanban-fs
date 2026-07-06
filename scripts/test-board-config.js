@@ -114,6 +114,31 @@ const moveSourceText = `folders:
 `;
 
 const moveBoardConfig = parseBoardConfig(moveSourceText);
+const renamedWithPriorities = parseBoardConfig(
+  serializeBoardConfig(
+    {
+      ...moveBoardConfig.data,
+      folders: buildFolderConfigMap(
+        [
+          { id: "Doing", name: "Active" },
+          { id: "Done", name: "Done" },
+        ],
+        moveBoardConfig
+      ),
+    },
+    moveBoardConfig.sourceText
+  )
+);
+assert.equal(
+  renamedWithPriorities.folderMap.get("Doing")?.title,
+  "Active",
+  "renaming a folder with priorities should store the custom display title"
+);
+assert.deepEqual(
+  Array.from(renamedWithPriorities.folderMap.get("Doing")?.cardPriorities.keys() ?? []),
+  ["moved-task.md", "existing-doing.md"],
+  "renaming a folder should preserve existing card priorities"
+);
 const movePriorityOverrides = buildFolderCardPriorityOverrides(
   [
     {

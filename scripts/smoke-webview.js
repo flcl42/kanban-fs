@@ -84,6 +84,16 @@ assert.match(
   /provider\.initializeRunner\(target\)/,
   "extension should register the Initialize Runner command"
 );
+assert.match(
+  source,
+  /ensureRootRunnerIgnoredFolders\(kanbanUri\)/,
+  "root-board runner initialization should add ignored runtime folders"
+);
+assert.doesNotMatch(
+  source,
+  /prepareRunnerKanbanLocation/,
+  "runner initialization should not move a root .kanban into tasks"
+);
 assert.doesNotMatch(
   source,
   /\bterminal\.sendText\(\s*sessionCwd\s*\?\s*`codex resume/,
@@ -702,6 +712,21 @@ assert.equal(boardEl.children[0].children.length, 3, "expected header and two ca
 assert.equal(boardEl.children[1].children.length, 2, "expected second column header and one card");
 assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)");
 assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1)");
+let columnRenamePrevented = false;
+let columnRenameStopped = false;
+boardEl.children[0].children[0].children[0].listeners.dblclick({
+  preventDefault() {
+    columnRenamePrevented = true;
+  },
+  stopPropagation() {
+    columnRenameStopped = true;
+  },
+});
+assert.equal(columnRenamePrevented, true, "column-title double click should prevent default selection handling");
+assert.equal(columnRenameStopped, true, "column-title double click should not start a header drag");
+assert.equal(messages.at(-1)?.type, "renameColumn", "column-title double click should request a rename");
+assert.equal(messages.at(-1)?.columnId, "Doing");
+assert.equal(messages.at(-1)?.currentTitle, "Doing");
 assert.match(searchMetaEl.textContent, /3 cards/, "search summary should show card count");
 assert.equal(searchClearEl.hidden, true, "clear button should stay hidden with no filter");
 assert.deepEqual(
