@@ -262,6 +262,7 @@ const searchInputEl = new FakeElement("input");
 const tagFilterEl = new FakeElement("select");
 const searchMetaEl = new FakeElement("div");
 const searchClearEl = new FakeElement("button");
+const agentCountEl = new FakeElement("div");
 const runnerPanelEl = new FakeElement("div");
 const windowListeners = {};
 const messages = [];
@@ -333,6 +334,9 @@ const context = {
       if (id === "search-clear") {
         return searchClearEl;
       }
+      if (id === "board-agent-count") {
+        return agentCountEl;
+      }
       if (id === "runner-panel") {
         return runnerPanelEl;
       }
@@ -364,6 +368,7 @@ assert.equal(typeof windowListeners.mouseup, "function", "mouseup listener missi
 assert.equal(typeof detailsEl.listeners.change, "function", "details checkbox change listener missing");
 assert.match(searchInputEl.placeholder, /Ctrl\+F/, "search input should advertise the shortcut");
 assert.match(html, /id="board-tag-filter"/, "tag filter selector should render next to search");
+assert.match(html, /id="board-agent-count"/, "active agent count should render next to the tag filter");
 assert.match(
   html,
   /\.board-tag-filter-select\s*\{[^}]*background:\s*var\(--vscode-dropdown-background,\s*var\(--panel\)\);[^}]*color:\s*var\(--vscode-dropdown-foreground,\s*var\(--ink\)\);/,
@@ -516,6 +521,20 @@ windowListeners.message({
   },
 });
 assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner status endpoint is detected");
+assert.equal(agentCountEl.hidden, true, "active agent count should stay hidden without a positive count");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: true,
+      activeAgentCount: 2,
+    },
+  },
+});
+assert.equal(agentCountEl.hidden, false, "active agent count should show when agents are active");
+assert.equal(agentCountEl.textContent, "2 active", "active agent count should render compact text");
 
 windowListeners.message({
   data: {
@@ -626,6 +645,12 @@ windowListeners.message({
                     title: "Connect",
                     value: "019d0095-6102-7fe2-9fc8-5db0155692e9",
                   },
+                },
+                {
+                  key: "Agent Kind",
+                  label: "Agent Kind",
+                  value: "claude",
+                  action: null,
                 },
                 {
                   key: "Project",
@@ -913,8 +938,9 @@ assert.equal(messages.at(-3)?.type, "requestCardDetails", "details should lazy-l
 assert.equal(messages.at(-3)?.cardUri, "file:///task.md");
 assert.equal(messages.at(-2)?.type, "requestGitStatus", "details should request git status for Repo properties");
 assert.equal(messages.at(-2)?.path, "C:\\work\\demo");
-assert.equal(messages.at(-1)?.type, "requestCodexOutput", "details should request codex output for Agent properties");
+assert.equal(messages.at(-1)?.type, "requestAgentOutput", "details should request agent output for Agent properties");
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
+assert.equal(messages.at(-1)?.agentKind, "claude");
 
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
 assert.match(detailsEl.innerHTML, /Loading description/, "details should show a placeholder before the selected card body loads");
@@ -1025,6 +1051,8 @@ detailsEl.listeners.click({
 assert.equal(messages.at(-1)?.type, "resumeAgent");
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
 assert.equal(messages.at(-1)?.title, "Ship it");
+assert.equal(messages.at(-1)?.agentKind, "claude");
+assert.equal(messages.at(-1)?.repoPath, "C:\\work\\demo");
 
 windowListeners.message({
   data: {
@@ -1046,30 +1074,31 @@ assert.match(detailsEl.innerHTML, /M src\/extension\.ts/, "git status body shoul
 
 windowListeners.message({
   data: {
-    type: "codexOutput",
+    type: "agentOutput",
     cardUri: "file:///task.md",
     agentId: "019d0095-6102-7fe2-9fc8-5db0155692e9",
+    agentKind: "claude",
     output: "Investigating the issue.\nInvestigating the issue.\nPatched the validator.",
   },
 });
 
-assert.match(detailsEl.innerHTML, /Codex Output/, "details should render a codex output section for Agent properties");
+assert.match(detailsEl.innerHTML, /Claude Output/, "details should render a Claude output section for Agent properties");
 assert.doesNotMatch(
   detailsEl.innerHTML,
-  /<hr\s*\/>\s*<h2 class="details-section-title">Codex Output<\/h2>/,
-  "codex output should not render a separator line above its title"
+  /<hr\s*\/>\s*<h2 class="details-section-title">Claude Output<\/h2>/,
+  "agent output should not render a separator line above its title"
 );
 assert.match(
   html,
   /\.git-status-text\s*\+\s*\.details-section-title\s*\{[^}]*margin-top:\s*18px;/,
-  "codex output title should have breathing room when it follows the git status block"
+  "agent output title should have breathing room when it follows the git status block"
 );
-assert.match(detailsEl.innerHTML, /Investigating the issue\./, "codex output should be displayed in the details pane");
-assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest codex output should preserve line breaks");
+assert.match(detailsEl.innerHTML, /Investigating the issue\./, "agent output should be displayed in the details pane");
+assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest agent output should preserve line breaks");
 assert.equal(
   (detailsEl.innerHTML.match(/Investigating the issue\./g) || []).length,
   1,
-  "duplicate adjacent codex output lines should be hidden in the details pane"
+  "duplicate adjacent agent output lines should be hidden in the details pane"
 );
 
 let descriptionExpanded = false;

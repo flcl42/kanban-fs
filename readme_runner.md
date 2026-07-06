@@ -50,7 +50,7 @@ It also supports the nested runner layout:
 
 ## Task Format
 
-Each task is a Markdown file. `runner.py` manages `Agent:` and `Repo:`; keep them present even if blank.
+Each task is a Markdown file. `runner.py` manages `Agent:`, `Agent Kind:`, and `Repo:`; keep them present even if blank.
 
 ```md
 # Title
@@ -58,6 +58,7 @@ Each task is a Markdown file. `runner.py` manages `Agent:` and `Repo:`; keep the
 Tags: claude
 Project: nm
 Agent:
+Agent Kind:
 Repo:
 
 ## Description
@@ -73,6 +74,7 @@ Behavior:
 - `Project:` picks the repo alias from `projects.md`. Use `Project: blank` or `Project: -` for an empty workspace that is moved to `trash/` when the task is done.
 - `Tags:` can select an agent per card. Supported markers include `claude`, `codex`, `agent:claude`, and `agent:codex`.
 - `Agent:` stores the agent session id so a task can resume later.
+- `Agent Kind:` stores `claude` or `codex` for that session. Existing sessions keep using this stored kind even if tags or default settings change. Clear both `Agent:` and `Agent Kind:` to intentionally start over with a different agent.
 - `Repo:` stores the repo working-copy path or cache path.
 - `## Comments` is for open questions, blockers, and missing context.
 - `### Report` is for completion notes, handoff details, or a short summary of what changed.
@@ -85,6 +87,8 @@ Requirements:
 - Claude Code and/or Codex CLI.
 
 Auto mode prefers Claude Code when `claude` is available, then falls back to Codex when `codex` is available.
+
+The VS Code board details pane can display recent output for both Claude and Codex sessions. Connect-agent terminals use `claude --resume <session>` for Claude cards and `codex resume <session>` for Codex cards.
 
 ```powershell
 python runner.py --root D:\board

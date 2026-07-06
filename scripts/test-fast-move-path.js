@@ -51,6 +51,21 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /Agent Kind/,
+  "runner should persist the selected agent kind in task metadata"
+);
+assert.match(
+  runnerSource,
+  /card\.agent_id and stored_agent/,
+  "runner should use stored agent kind when resuming an existing session"
+);
+assert.match(
+  runnerSource,
+  /class ClaudeRunner[\s\S]*"--print"[\s\S]*"--verbose"[\s\S]*"--output-format"[\s\S]*"stream-json"/,
+  "Claude stream-json runs should include --verbose because current Claude CLI requires it"
+);
+assert.match(
+  runnerSource,
   /uses_root_board = os\.path\.exists\(root_kanban_marker\)/,
   "runner should use root-board mode when .kanban is in the root"
 );

@@ -99,6 +99,7 @@ Runner cards use normal Markdown plus a few properties:
 Project: blank
 Tags:
 Agent:
+Agent Kind:
 Repo:
 
 ## Description
@@ -111,14 +112,16 @@ Describe the work here.
 
 `Tags:` can override the runner agent per card with values such as `claude`, `codex`, `agent:claude`, or `agent:codex`.
 
-`Agent:` and `Repo:` are managed by the runner. Leave them present when you want agent sessions and repository state to resume cleanly.
+`Agent:`, `Agent Kind:`, and `Repo:` are managed by the runner. `Agent:` stores the session id, `Agent Kind:` stores `claude` or `codex`, and `Repo:` stores the working-copy path. Leave them present when you want agent sessions and repository state to resume cleanly. For an existing session, `Agent Kind:` wins over tags so the runner does not resume a Claude session with Codex or the other way around. Clear both `Agent:` and `Agent Kind:` if you intentionally want a card to start a fresh session with a different agent.
+
+The details pane shows recent agent output for either Codex or Claude sessions. `Connect` opens the matching CLI: Codex sessions use `codex resume`, and Claude sessions use `claude --resume`.
 
 ## Settings
 
 - `kanban.detailsPaneWidth` controls the saved details pane width.
 - `kanban.defaultAgent` controls the default runner agent. Defaults to `null`, which auto-detects Claude first and Codex second.
-- `kanban.claudeExecutable` controls the Claude Code executable used by the runner. Defaults to `claude`.
-- `kanban.codexExecutable` controls the Codex executable used by the runner and resume-agent terminals. Defaults to `codex`.
+- `kanban.claudeExecutable` controls the Claude Code executable used by the runner and Claude resume-agent terminals. Defaults to `claude`.
+- `kanban.codexExecutable` controls the Codex executable used by the runner and Codex resume-agent terminals. Defaults to `codex`.
 - `kanban.runnerPanel.enabled` shows or hides the optional runner warning panel.
 - `kanban.runner.command` controls the command used to start the runner.
 - `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, `${defaultAgent}`, `${codexExecutable}`, and `${claudeExecutable}`.

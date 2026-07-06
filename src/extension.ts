@@ -99,6 +99,13 @@ type RunnerToolStatus = {
 
 type RunnerToolStatuses = Record<string, RunnerToolStatus>;
 
+type RunnerStatusProbe = {
+  port: number;
+  activeAgentCount?: number;
+};
+
+type AgentKind = "claude" | "codex";
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
@@ -702,6 +709,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
   private readonly boardConfigCache = new Map<string, BoardConfig>();
   private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
+  private readonly claudeSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly runnerLaunches = new Map<string, number>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
@@ -1196,7 +1204,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       if (message?.type === "resumeAgent" && message?.agentId) {
-        await this.resumeAgent(String(message.agentId), message?.title);
+        await this.resumeAgent(
+          String(message.agentId),
+          message?.title,
+          message?.agentKind,
+          message?.repoPath
+        );
         return;
       }
       if (message?.type === "requestGitStatus" && message?.path) {
@@ -1209,13 +1222,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         });
         return;
       }
-      if (message?.type === "requestCodexOutput" && message?.agentId) {
-        const output = await this.readCodexOutput(String(message.agentId));
+      if (message?.type === "requestAgentOutput" && message?.agentId) {
+        const output = await this.readAgentOutput(
+          String(message.agentId),
+          message?.agentKind
+        );
         webviewPanel.webview.postMessage({
-          type: "codexOutput",
+          type: "agentOutput",
           cardUri: String(message?.cardUri ?? ""),
           agentId: String(message.agentId),
-          output,
+          agentKind: output.agentKind,
+          output: output.output,
         });
         return;
       }
@@ -2037,27 +2054,47 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   public async resumeAgent(
     agentId: string,
-    ticketTitle?: unknown
+    ticketTitle?: unknown,
+    agentKind?: unknown,
+    repoPath?: unknown
   ): Promise<void> {
     const trimmed = normalizeTaskPropertyValue(agentId);
     if (!isTaskGuidValue(trimmed)) {
       return;
     }
-    const sessionCwd = await this.readCodexSessionCwd(trimmed);
+    const kind =
+      normalizeAgentKindValue(agentKind)
+      ?? await this.detectAgentKindFromSessions(trimmed)
+      ?? await this.detectDefaultResumeAgentKind();
+    const repoCwd =
+      typeof repoPath === "string"
+        ? await this.resolvePathDirectory(repoPath)
+        : null;
+    const sessionCwd =
+      repoCwd
+      ?? (kind === "claude"
+        ? await this.readClaudeSessionCwd(trimmed)
+        : await this.readCodexSessionCwd(trimmed));
     const terminal = vscode.window.createTerminal({
       name: formatAgentTerminalName(ticketTitle, trimmed),
       cwd: sessionCwd ?? undefined,
     });
-    const codexExecutableCommand = formatTerminalExecutable(
-      this.getCodexExecutableSetting()
+    const executableCommand = formatTerminalExecutable(
+      kind === "claude"
+        ? this.getClaudeExecutableSetting()
+        : this.getCodexExecutableSetting()
     );
     terminal.show(false);
-    terminal.sendText(
-      sessionCwd
-        ? `${codexExecutableCommand} resume --cd . ${trimmed}`
-        : `${codexExecutableCommand} resume ${trimmed}`,
-      true
-    );
+    if (kind === "claude") {
+      terminal.sendText(`${executableCommand} --resume ${trimmed}`, true);
+    } else {
+      terminal.sendText(
+        sessionCwd
+          ? `${executableCommand} resume --cd . ${trimmed}`
+          : `${executableCommand} resume ${trimmed}`,
+        true
+      );
+    }
     await this.focusTerminal();
   }
 
@@ -2305,6 +2342,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   ): Promise<{
     enabled: boolean;
     running: boolean;
+    activeAgentCount?: number;
     runnerScriptRequired?: boolean;
     runnerScriptExists?: boolean;
     runnerScriptPath?: string;
@@ -2340,6 +2378,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerScriptExists: Boolean(paths.localRunnerScript),
         runnerScriptPath: paths.localRunnerScript ?? "",
         port: probe.port,
+        activeAgentCount: probe.activeAgentCount,
         requirements,
         message,
       };
@@ -2578,12 +2617,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   private async probeRunnerStatus(
     runnerRoot: string
-  ): Promise<{ port: number } | null> {
+  ): Promise<RunnerStatusProbe | null> {
     const normalizedRoot = normalizeMovePath(runnerRoot);
     for (const port of getRunnerStatusPorts(runnerRoot)) {
       const found = await this.probeRunnerStatusPort(port, normalizedRoot);
       if (found) {
-        return { port };
+        return { port, ...found };
       }
     }
     return null;
@@ -2592,13 +2631,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private async probeRunnerStatusPort(
     port: number,
     normalizedRoot: string
-  ): Promise<boolean> {
+  ): Promise<Omit<RunnerStatusProbe, "port"> | null> {
     return new Promise((resolve) => {
       const socket = net.createConnection({ host: "127.0.0.1", port });
       let buffer = "";
       let settled = false;
       let timer: NodeJS.Timeout | undefined;
-      const finish = (running: boolean) => {
+      const finish = (status: Omit<RunnerStatusProbe, "port"> | null) => {
         if (settled) {
           return;
         }
@@ -2607,12 +2646,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           clearTimeout(timer);
         }
         socket.destroy();
-        resolve(running);
+        resolve(status);
       };
       const parseStatus = () => {
         const line = buffer.trim().split(/\r?\n/)[0];
         if (!line) {
-          return false;
+          return null;
         }
         try {
           const payload = JSON.parse(line);
@@ -2620,15 +2659,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const payloadRoot = String(
             payload.NormalizedRootPath ?? payload.normalizedRootPath ?? ""
           );
-          return (
-            kind === "kanban-runner-status" &&
-            payloadRoot === normalizedRoot
-          );
+          if (kind !== "kanban-runner-status" || payloadRoot !== normalizedRoot) {
+            return null;
+          }
+
+          const rawActiveCount =
+            payload.ActiveAgentCount ?? payload.activeAgentCount;
+          const activeAgentCount = Number(rawActiveCount);
+          return {
+            activeAgentCount:
+              Number.isFinite(activeAgentCount) && activeAgentCount >= 0
+                ? Math.floor(activeAgentCount)
+                : undefined,
+          };
         } catch {
-          return false;
+          return null;
         }
       };
-      timer = setTimeout(() => finish(false), RUNNER_STATUS_CONNECT_TIMEOUT_MS);
+      timer = setTimeout(() => finish(null), RUNNER_STATUS_CONNECT_TIMEOUT_MS);
       socket.setEncoding("utf8");
       socket.on("data", (chunk) => {
         buffer += chunk;
@@ -2636,7 +2684,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           finish(parseStatus());
         }
       });
-      socket.on("error", () => finish(false));
+      socket.on("error", () => finish(null));
       socket.on("end", () => finish(parseStatus()));
       socket.on("close", () => finish(parseStatus()));
     });
@@ -2735,6 +2783,40 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readAgentOutput(
+    agentId: string,
+    agentKind: unknown
+  ): Promise<{ agentKind: AgentKind | null; output: string | null }> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return { agentKind: null, output: null };
+    }
+
+    const requestedKind = normalizeAgentKindValue(agentKind);
+    if (requestedKind === "claude") {
+      return { agentKind: "claude", output: await this.readClaudeOutput(trimmed) };
+    }
+    if (requestedKind === "codex") {
+      return { agentKind: "codex", output: await this.readCodexOutput(trimmed) };
+    }
+
+    if (await this.findClaudeSessionFile(trimmed)) {
+      return { agentKind: "claude", output: await this.readClaudeOutput(trimmed) };
+    }
+    if (await this.findCodexSessionFile(trimmed)) {
+      return { agentKind: "codex", output: await this.readCodexOutput(trimmed) };
+    }
+
+    const defaultKind = await this.detectDefaultResumeAgentKind();
+    return {
+      agentKind: defaultKind,
+      output:
+        defaultKind === "claude"
+          ? await this.readClaudeOutput(trimmed)
+          : await this.readCodexOutput(trimmed),
+    };
+  }
+
   private async readCodexOutput(agentId: string): Promise<string | null> {
     const trimmed = normalizeTaskPropertyValue(agentId);
     if (!isTaskGuidValue(trimmed)) {
@@ -2826,6 +2908,65 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readClaudeOutput(agentId: string): Promise<string | null> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return null;
+    }
+
+    const sessionFile = await this.findClaudeSessionFile(trimmed);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const outputBlocks: string[] = [];
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(lines[index]);
+        } catch {
+          continue;
+        }
+
+        const text = extractClaudeRecordText(entry);
+        if (text) {
+          outputBlocks.push(text);
+        }
+
+        if (outputBlocks.length >= 3) {
+          break;
+        }
+      }
+
+      if (outputBlocks.length === 0) {
+        return null;
+      }
+
+      const recentLines = outputBlocks
+        .reverse()
+        .join("\n\n")
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .filter((line) => line.trim().length > 0)
+        .filter((line, index, lines) => {
+          if (index === 0) {
+            return true;
+          }
+          return line.trim() !== lines[index - 1].trim();
+        })
+        .slice(-5);
+
+      return recentLines.length > 0 ? recentLines.join("\n") : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async readCodexSessionCwd(agentId: string): Promise<string | null> {
     const sessionFile = await this.findCodexSessionFile(agentId);
     if (!sessionFile) {
@@ -2864,6 +3005,80 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     return null;
+  }
+
+  private async readClaudeSessionCwd(agentId: string): Promise<string | null> {
+    const sessionFile = await this.findClaudeSessionFile(agentId);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+
+      for (const line of lines) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        const cwd = findNestedString(entry, "cwd") ?? findNestedString(entry, "project");
+        if (!cwd) {
+          continue;
+        }
+
+        const stat = await vscode.workspace.fs.stat(vscode.Uri.file(cwd));
+        return stat.type === vscode.FileType.Directory ? cwd : null;
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
+  }
+
+  private async detectAgentKindFromSessions(
+    agentId: string
+  ): Promise<AgentKind | null> {
+    if (await this.findClaudeSessionFile(agentId)) {
+      return "claude";
+    }
+    if (await this.findCodexSessionFile(agentId)) {
+      return "codex";
+    }
+    return null;
+  }
+
+  private async detectDefaultResumeAgentKind(): Promise<AgentKind> {
+    const configured = normalizeAgentKindValue(this.getDefaultAgentSetting());
+    if (configured) {
+      return configured;
+    }
+    const [claude, codex] = await Promise.all([
+      this.canExecuteTool(this.getClaudeExecutableSetting()),
+      this.canExecuteTool(this.getCodexExecutableSetting()),
+    ]);
+    if (claude || !codex) {
+      return "claude";
+    }
+    return "codex";
+  }
+
+  private async canExecuteTool(executable: string): Promise<boolean> {
+    try {
+      await execFileAsync(executable, ["--version"], {
+        windowsHide: true,
+        timeout: RUNNER_TOOL_CHECK_TIMEOUT_MS,
+        maxBuffer: 1024 * 1024,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async findCodexSessionFile(agentId: string): Promise<string | null> {
@@ -2913,6 +3128,53 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     this.codexSessionFiles.set(agentId, {
+      path: "",
+      lastCheckedAt: now,
+    });
+    return null;
+  }
+
+  private async findClaudeSessionFile(agentId: string): Promise<string | null> {
+    const cached = this.claudeSessionFiles.get(agentId);
+    const now = Date.now();
+    if (cached && now - cached.lastCheckedAt < DETAILS_REFRESH_INTERVAL_MS) {
+      return cached.path || null;
+    }
+    if (cached === null) {
+      return null;
+    }
+
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home) {
+      this.claudeSessionFiles.set(agentId, null);
+      return null;
+    }
+
+    const root = path.join(home, ".claude", "projects");
+    try {
+      const command = `Get-ChildItem -Path '${escapePowerShellSingleQuotedString(root)}' -Recurse -File -Filter '${agentId}.jsonl' | Select-Object -First 1 -ExpandProperty FullName`;
+      const result = await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-Command", command],
+        {
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+      const found = String(result.stdout || "").trim();
+      if (found) {
+        this.claudeSessionFiles.set(agentId, {
+          path: found,
+          lastCheckedAt: now,
+        });
+        return found;
+      }
+    } catch {
+      // fall through to the cached miss below
+    }
+
+    this.claudeSessionFiles.set(agentId, {
       path: "",
       lastCheckedAt: now,
     });
@@ -3175,6 +3437,23 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     .board-tag-filter-select:focus {
       border-color: var(--vscode-focusBorder, var(--accent));
+    }
+    .board-agent-count {
+      display: inline-flex;
+      align-items: center;
+      min-height: 38px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface);
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .board-agent-count[hidden] {
+      display: none;
     }
     .search-meta {
       font-family: var(--mono);
@@ -3818,6 +4097,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             <option value="">All tags</option>
           </select>
         </label>
+        <div class="board-agent-count" id="board-agent-count" title="Active agents" hidden></div>
         <button class="search-clear" id="search-clear" type="button" hidden>Clear</button>
         <div class="search-meta" id="search-meta"></div>
       </div>
@@ -3841,6 +4121,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const tagFilterEl = document.getElementById("board-tag-filter");
     const searchMetaEl = document.getElementById("search-meta");
     const searchClearEl = document.getElementById("search-clear");
+    const agentCountEl = document.getElementById("board-agent-count");
     const runnerPanelEl = document.getElementById("runner-panel");
     const rootStyle = document.documentElement?.style || null;
     let selectedCard = null;
@@ -3852,7 +4133,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let runnerCreatePending = false;
     let runnerPanelHiddenForSession = false;
     const gitStatusCache = new Map();
-    const codexOutputCache = new Map();
+    const agentOutputCache = new Map();
     const cardDetailsCache = new Map();
     let refreshTimer = null;
     let detailsRefreshTimer = null;
@@ -3941,6 +4222,33 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         </button>
         \${hideActionHtml}
       \`;
+    };
+
+    const activeAgentCount = () => {
+      const value = Number(runnerStatus?.activeAgentCount);
+      if (!Number.isFinite(value) || value < 1) {
+        return 0;
+      }
+      return Math.floor(value);
+    };
+
+    const renderActiveAgentCount = () => {
+      if (!agentCountEl) {
+        return;
+      }
+      const count = runnerStatus?.running ? activeAgentCount() : 0;
+      if (count < 1) {
+        agentCountEl.hidden = true;
+        agentCountEl.textContent = "";
+        agentCountEl.removeAttribute?.("aria-label");
+        return;
+      }
+      const label = count === 1 ? "1 active" : \`\${count} active\`;
+      const title = count === 1 ? "1 active agent" : \`\${count} active agents\`;
+      agentCountEl.hidden = false;
+      agentCountEl.textContent = label;
+      agentCountEl.setAttribute("aria-label", title);
+      agentCountEl.setAttribute("title", title);
     };
 
     const clampDetailsPaneWidth = (value) => {
@@ -4071,20 +4379,62 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       detailsEl.innerHTML = \`<div class="empty">\${escapeHtml(message)}</div>\`;
     };
 
-    const getAgentId = (card) => {
-      const agentProperty = (card?.properties || []).find((property) => {
-        return String(property?.key || "").trim().toLowerCase() === "agent";
+    const getPropertyValue = (card, names) => {
+      const normalizedNames = new Set(
+        (Array.isArray(names) ? names : [names])
+          .map((name) => String(name || "").trim().toLowerCase())
+          .filter(Boolean)
+      );
+      const property = (card?.properties || []).find((property) => {
+        return normalizedNames.has(String(property?.key || "").trim().toLowerCase());
       });
-      const value = String(agentProperty?.value || "").trim();
+      const value = String(property?.value || "").trim();
       return value || null;
     };
 
+    const normalizeAgentKind = (value) => {
+      const normalized = String(value || "").trim().toLowerCase();
+      if (normalized === "claude" || normalized === "agent:claude") {
+        return "claude";
+      }
+      if (normalized === "codex" || normalized === "agent:codex") {
+        return "codex";
+      }
+      return null;
+    };
+
+    const getAgentKindFromTags = (card) => {
+      for (const tag of card?.tags || []) {
+        const kind = normalizeAgentKind(tag);
+        if (kind) {
+          return kind;
+        }
+      }
+      return null;
+    };
+
+    const getAgentKind = (card) => {
+      return normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
+        || getAgentKindFromTags(card);
+    };
+
+    const getAgentOutputTitle = (card, cached) => {
+      const kind = normalizeAgentKind(cached?.agentKind) || getAgentKind(card);
+      if (kind === "claude") {
+        return "Claude Output";
+      }
+      if (kind === "codex") {
+        return "Codex Output";
+      }
+      return "Agent Output";
+    };
+
+    const getAgentId = (card) => {
+      return getPropertyValue(card, "Agent");
+    };
+
     const getRepoPath = (card) => {
-      const repoProperty = (card?.properties || []).find((property) => {
-        return String(property?.key || "").trim().toLowerCase() === "repo";
-      });
-      const value = String(repoProperty?.value || "").trim();
-      return value || null;
+      return getPropertyValue(card, "Repo");
     };
 
     const shouldRefreshCache = (entry) => {
@@ -4116,24 +4466,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     };
 
-    const requestCodexOutput = (card) => {
+    const requestAgentOutput = (card) => {
       const agentId = getAgentId(card);
       if (!agentId) {
         return;
       }
-      const cached = codexOutputCache.get(agentId);
+      const cached = agentOutputCache.get(agentId);
       if (cached?.state === "loading" || !shouldRefreshCache(cached)) {
         return;
       }
-      codexOutputCache.set(agentId, {
+      const agentKind = getAgentKind(card);
+      agentOutputCache.set(agentId, {
         state: "loading",
         text: cached?.text || "",
+        agentKind: cached?.agentKind || agentKind,
         refreshedAt: cached?.refreshedAt || 0,
       });
       vscode.postMessage({
-        type: "requestCodexOutput",
+        type: "requestAgentOutput",
         cardUri: card.uri,
         agentId,
+        agentKind,
       });
     };
 
@@ -4162,19 +4515,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       \`;
     };
 
-    const renderCodexOutput = (card) => {
+    const renderAgentOutput = (card) => {
       const agentId = getAgentId(card);
       if (!agentId) {
         return "";
       }
-      const cached = codexOutputCache.get(agentId);
+      const cached = agentOutputCache.get(agentId);
       if (!cached) {
-        requestCodexOutput(card);
+        requestAgentOutput(card);
         return "";
       }
+      const title = getAgentOutputTitle(card, cached);
       if (cached.state === "loading") {
         return \`
-          <h2 class="details-section-title">Codex Output</h2>
+          <h2 class="details-section-title">\${escapeHtml(title)}</h2>
           <pre class="codex-output-text">\${escapeHtml(cached.text || "Loading...")}</pre>
         \`;
       }
@@ -4191,7 +4545,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         })
         .join("\\n");
       return \`
-        <h2 class="details-section-title">Codex Output</h2>
+        <h2 class="details-section-title">\${escapeHtml(title)}</h2>
         <pre class="codex-output-text">\${escapeHtml(text)}</pre>
       \`;
     };
@@ -4241,7 +4595,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       requestCardDetails(card);
       requestGitStatus(card);
-      requestCodexOutput(card);
+      requestAgentOutput(card);
     };
 
     const startDetailsRefresh = () => {
@@ -4269,7 +4623,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const tagsHtml = renderTags(card.tags || []);
       const propertiesHtml = renderProperties(card.properties || []);
       const gitStatusHtml = renderGitStatus(card);
-      const codexOutputHtml = renderCodexOutput(card);
+      const agentOutputHtml = renderAgentOutput(card);
       const metaLine = "Created: " + createdLabel + " · " + createdRelative;
       detailsEl.innerHTML = \`
         <div class="details-header">
@@ -4300,7 +4654,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <hr />
           \${descriptionHtml}
           \${gitStatusHtml}
-          \${codexOutputHtml}
+          \${agentOutputHtml}
         </div>
       \`;
       refreshDetailsData(card);
@@ -5065,6 +5419,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           type: actionType,
           agentId: actionValue,
           title: selectedCard?.title || "",
+          agentKind: getAgentKind(selectedCard),
+          repoPath: getRepoPath(selectedCard),
         });
         return;
       }
@@ -5126,6 +5482,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerStartPending = false;
         runnerCreatePending = false;
         renderRunnerPanel();
+        renderActiveAgentCount();
       }
       if (message?.type === "gitStatus") {
         const repoPath = String(message?.path || "").trim();
@@ -5138,12 +5495,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           renderDetails(selectedCard);
         }
       }
-      if (message?.type === "codexOutput") {
+      if (message?.type === "agentOutput") {
         const agentId = String(message?.agentId || "").trim();
         if (agentId) {
-          codexOutputCache.set(agentId, message?.output
-            ? { state: "ready", text: String(message.output), refreshedAt: Date.now() }
-            : { state: "missing", text: "", refreshedAt: Date.now() });
+          const cached = agentOutputCache.get(agentId);
+          const agentKind = normalizeAgentKind(message?.agentKind)
+            || normalizeAgentKind(cached?.agentKind);
+          agentOutputCache.set(agentId, message?.output
+            ? { state: "ready", text: String(message.output), agentKind, refreshedAt: Date.now() }
+            : { state: "missing", text: "", agentKind, refreshedAt: Date.now() });
         }
         if (selectedCard && message?.cardUri === selectedCard.uri) {
           renderDetails(selectedCard);
@@ -5323,6 +5683,99 @@ function renderMarkdownWithTaskLists(markdown: string): string {
       return `${prefix}${checkbox}`;
     }
   );
+}
+
+function normalizeAgentKindValue(value: unknown): AgentKind | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (normalized === "claude" || normalized === "agent:claude") {
+    return "claude";
+  }
+  if (normalized === "codex" || normalized === "agent:codex") {
+    return "codex";
+  }
+  return null;
+}
+
+function extractClaudeRecordText(entry: unknown): string {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const record = entry as {
+    type?: unknown;
+    result?: unknown;
+    message?: unknown;
+    content?: unknown;
+  };
+  const type = String(record.type || "").toLowerCase();
+  if (type === "result" && typeof record.result === "string") {
+    return record.result.trim();
+  }
+  if (type === "assistant") {
+    const message = record.message;
+    if (message && typeof message === "object") {
+      const text = extractClaudeContentText(
+        (message as { content?: unknown }).content
+      );
+      if (text) {
+        return text;
+      }
+    }
+    return extractClaudeContentText(record.content);
+  }
+  return "";
+}
+
+function extractClaudeContentText(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const record = item as { type?: unknown; text?: unknown };
+      if (
+        typeof record.text === "string"
+        && (!record.type || String(record.type).toLowerCase() === "text")
+      ) {
+        return record.text.trim();
+      }
+      return "";
+    })
+    .filter((item) => item.length > 0)
+    .join("\n\n")
+    .trim();
+}
+
+function findNestedString(value: unknown, key: string): string | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const found = findNestedString(item, key);
+      if (found) {
+        return found;
+      }
+    }
+    return null;
+  }
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const raw = record[key];
+  if (typeof raw === "string" && raw.trim()) {
+    return raw.trim();
+  }
+  for (const child of Object.values(record)) {
+    const found = findNestedString(child, key);
+    if (found) {
+      return found;
+    }
+  }
+  return null;
 }
 
 function normalizeDetailsPaneWidth(value: unknown): number {

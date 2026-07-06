@@ -229,11 +229,11 @@ class TaskOrchestrator:
         self.log = LogSink(os.path.join(self.paths.logs_root, "runner.log"))
         self.notifications = NotificationService(self.log)
         self.workspace_mover = WorkspaceMoveBridge(self.paths.root, self.log)
-        self.status_server = RunnerStatusServer(
-            self.paths.root, self.paths.tasks_root, self.log
-        )
         self.active_agents: dict[str, ActiveAgent] = {}
         self.active_agents_lock = threading.Lock()
+        self.status_server = RunnerStatusServer(
+            self.paths.root, self.paths.tasks_root, self.log, self._active_count
+        )
         self.reconcile_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.signal_event = threading.Event()
@@ -432,7 +432,14 @@ class TaskOrchestrator:
             destination = make_unique_directory_path(
                 cache_project_dir, os.path.basename(repo_path)
             )
-            self.workspace_mover.move_directory(repo_path, destination)
+            try:
+                self.workspace_mover.move_directory(repo_path, destination)
+            except (OSError, shutil.Error) as exc:
+                self.log.warn(
+                    f"Skipped moving completed repo to cache because it is locked or inaccessible: {repo_path} -> {destination}. {exc}"
+                )
+                continue
+
             for reference in references:
                 if reference.managed_card:
                     reference.managed_card.with_updated_repo_path(destination)
@@ -466,7 +473,14 @@ class TaskOrchestrator:
             destination = make_unique_directory_path(
                 trash_project_dir, os.path.basename(repo_path)
             )
-            self.workspace_mover.move_directory(repo_path, destination)
+            try:
+                self.workspace_mover.move_directory(repo_path, destination)
+            except (OSError, shutil.Error) as exc:
+                self.log.warn(
+                    f"Skipped moving orphaned repo to trash because it is locked or inaccessible: {repo_path} -> {destination}. {exc}"
+                )
+                continue
+
             self.log.info(f"Moved orphaned repo to trash: {destination}")
 
     def trash_completed_blank_workspaces(self) -> None:
@@ -493,7 +507,14 @@ class TaskOrchestrator:
         )
         os.makedirs(trash_project_dir, exist_ok=True)
         destination = make_unique_directory_path(trash_project_dir, os.path.basename(repo_path))
-        self.workspace_mover.move_directory(repo_path, destination)
+        try:
+            self.workspace_mover.move_directory(repo_path, destination)
+        except (OSError, shutil.Error) as exc:
+            self.log.warn(
+                f"Skipped moving blank workspace to trash because it is locked or inaccessible: {repo_path} -> {destination}. {exc}"
+            )
+            return
+
         card.with_updated_repo_path(destination)
         self.log.info(f"Moved blank workspace to trash: {destination}")
 
@@ -516,19 +537,23 @@ class TaskOrchestrator:
     def start_or_resume_task(
         self, backlog_card: "TaskCard", assignment: ProjectAssignment
     ) -> None:
+        try:
+            self.log.info(
+                f"Provisioning repository for task before moving it to doing: {backlog_card.path}"
+            )
+            repo_path = self.ensure_working_repository(backlog_card, assignment)
+        except Exception as exc:
+            self.log.error(f"Repository provisioning failed for `{backlog_card.path}`: {exc}")
+            self.block_task_for_issue(backlog_card, f"Repository provisioning failed: {exc}")
+            return
+
         doing_path = self.move_task(backlog_card, TaskStep.DOING)
         doing_card = TaskCard.load(doing_path, TaskStep.DOING, self.paths)
-
-        try:
-            repo_path = self.ensure_working_repository(doing_card, assignment)
-            doing_card = doing_card.with_updated_repo_path(repo_path)
-        except Exception as exc:
-            self.log.error(f"Repository provisioning failed for `{doing_card.path}`: {exc}")
-            self.block_task_for_issue(doing_card, f"Repository provisioning failed: {exc}")
-            return
+        doing_card = doing_card.with_updated_repo_path(repo_path)
 
         try:
             agent_kind = self.agent_resolver.select_agent_kind(doing_card)
+            doing_card = doing_card.with_updated_agent_kind(agent_kind)
         except Exception as exc:
             self.block_task_for_issue(doing_card, str(exc))
             return
@@ -554,10 +579,14 @@ class TaskOrchestrator:
                     doing_card,
                     repo_path,
                     prompt,
-                    lambda session_id: self._record_agent_id(doing_card, session_id),
+                    lambda session_id: self._record_agent_id(
+                        doing_card, session_id, agent_kind
+                    ),
                 )
                 if result.session_id and result.session_id != doing_card.agent_id:
-                    doing_card = doing_card.with_updated_agent_id(result.session_id)
+                    doing_card = doing_card.with_updated_agent_id(
+                        result.session_id, agent_kind
+                    )
                 self.handle_agent_completion(doing_card, result, agent_kind)
             except Exception as exc:
                 self.log.error(f"Agent failure for `{doing_card.path}`: {exc}")
@@ -574,9 +603,11 @@ class TaskOrchestrator:
         self.agent_threads.append(thread)
         thread.start()
 
-    def _record_agent_id(self, card: "TaskCard", session_id: str) -> None:
+    def _record_agent_id(
+        self, card: "TaskCard", session_id: str, agent_kind: AgentKind
+    ) -> None:
         if session_id and session_id != card.agent_id:
-            card.with_updated_agent_id(session_id)
+            card.with_updated_agent_id(session_id, agent_kind)
 
     def ensure_working_repository(
         self, card: "TaskCard", assignment: ProjectAssignment
@@ -595,9 +626,14 @@ class TaskOrchestrator:
                     restored_path = make_unique_directory_path(
                         repo_base_dir, preferred_repo_folder_name
                     )
-                    self.workspace_mover.move_directory(recorded_path, restored_path)
-                    GitCli.refresh(restored_path, self.log)
-                    return restored_path
+                    try:
+                        self.workspace_mover.move_directory(recorded_path, restored_path)
+                        GitCli.refresh(restored_path, self.log)
+                        return restored_path
+                    except (OSError, shutil.Error) as exc:
+                        self.log.warn(
+                            f"Skipped recorded cached repo because it is locked or inaccessible: {recorded_path} -> {restored_path}. {exc}"
+                        )
                 GitCli.refresh(recorded_path, self.log)
                 return recorded_path
 
@@ -611,27 +647,50 @@ class TaskOrchestrator:
             self.paths.cache_root, sanitize_file_name(card.project_alias)
         )
         if os.path.isdir(cache_project_dir):
-            reusable_repos = sorted(
-                (
-                    os.path.join(cache_project_dir, name)
-                    for name in os.listdir(cache_project_dir)
-                    if os.path.isdir(os.path.join(cache_project_dir, name))
-                ),
-                key=lambda item: os.path.getmtime(item),
-                reverse=True,
-            )
-            if reusable_repos:
+            skipped_cache_count = 0
+            first_cache_skip = None
+            for reusable_repo in self.enumerate_reusable_cache_repositories(cache_project_dir):
                 restored_path = make_unique_directory_path(
                     repo_base_dir, preferred_repo_folder_name
                 )
-                self.workspace_mover.move_directory(reusable_repos[0], restored_path)
-                GitCli.refresh(restored_path, self.log)
-                return restored_path
+                try:
+                    self.workspace_mover.move_directory(reusable_repo, restored_path)
+                    GitCli.refresh(restored_path, self.log)
+                    return restored_path
+                except (OSError, shutil.Error) as exc:
+                    skipped_cache_count += 1
+                    if first_cache_skip is None:
+                        first_cache_skip = f"{reusable_repo}: {exc}"
+
+            if skipped_cache_count:
+                self.log.warn(
+                    f"Skipped {skipped_cache_count} cached repo(s) for `{card.project_alias}` because they are locked or inaccessible; cloning fresh. First failure: {first_cache_skip}"
+                )
 
         os.makedirs(repo_base_dir, exist_ok=True)
         repo_path = make_unique_directory_path(repo_base_dir, preferred_repo_folder_name)
+        self.log.info(f"Cloning fresh repository for task `{card.path}` into `{repo_path}`.")
         GitCli.clone(assignment.repo_url or "", repo_path, self.log)
         return repo_path
+
+    def enumerate_reusable_cache_repositories(self, cache_project_dir: str) -> list[str]:
+        try:
+            names = os.listdir(cache_project_dir)
+        except OSError as exc:
+            self.log.warn(f"Skipped cache directory because it is inaccessible: {cache_project_dir}. {exc}")
+            return []
+
+        candidates: list[tuple[float, str]] = []
+        for name in names:
+            path = os.path.join(cache_project_dir, name)
+            try:
+                if os.path.isdir(path):
+                    candidates.append((os.path.getmtime(path), path))
+            except OSError as exc:
+                self.log.warn(f"Skipped cached repo metadata because it is inaccessible: {path}. {exc}")
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return [path for _, path in candidates]
 
     def handle_agent_completion(
         self, card: "TaskCard", result: AgentRunResult, agent_kind: AgentKind
@@ -776,14 +835,29 @@ class TaskOrchestrator:
         if not os.path.isdir(root):
             return []
         result: list[str] = []
-        for alias_name in sorted(os.listdir(root), key=str.lower if IS_WINDOWS else None):
+        try:
+            alias_names = sorted(os.listdir(root), key=str.lower if IS_WINDOWS else None)
+        except OSError as exc:
+            self.log.warn(f"Skipped managed repository root because it is inaccessible: {root}. {exc}")
+            return []
+
+        for alias_name in alias_names:
             alias_dir = os.path.join(root, alias_name)
-            if not os.path.isdir(alias_dir):
+            try:
+                if not os.path.isdir(alias_dir):
+                    continue
+                repo_names = sorted(os.listdir(alias_dir), key=str.lower if IS_WINDOWS else None)
+            except OSError as exc:
+                self.log.warn(f"Skipped managed repository alias because it is inaccessible: {alias_dir}. {exc}")
                 continue
-            for repo_name in sorted(os.listdir(alias_dir), key=str.lower if IS_WINDOWS else None):
+
+            for repo_name in repo_names:
                 repo_dir = os.path.join(alias_dir, repo_name)
-                if os.path.isdir(repo_dir):
-                    result.append(os.path.abspath(repo_dir))
+                try:
+                    if os.path.isdir(repo_dir):
+                        result.append(os.path.abspath(repo_dir))
+                except OSError as exc:
+                    self.log.warn(f"Skipped managed repository because it is inaccessible: {repo_dir}. {exc}")
         return result
 
     def get_managed_project_alias(self, repo_path: str) -> str | None:
@@ -903,11 +977,18 @@ class WorkspaceMoveBridge:
 
 
 class RunnerStatusServer:
-    def __init__(self, root_path: str, kanban_path: str, log: LogSink) -> None:
+    def __init__(
+        self,
+        root_path: str,
+        kanban_path: str,
+        log: LogSink,
+        active_agent_count: Callable[[], int],
+    ) -> None:
         self.root_path = os.path.abspath(root_path)
         self.normalized_root_path = normalize_path(self.root_path)
         self.kanban_path = os.path.abspath(kanban_path)
         self.log = log
+        self.active_agent_count = active_agent_count
         self.process_id = os.getpid()
         self.started_at_utc = utc_now_iso()
         self.stop_event = threading.Event()
@@ -970,6 +1051,7 @@ class RunnerStatusServer:
                 "startedAtUtc": self.started_at_utc,
                 "updatedAtUtc": utc_now_iso(),
                 "port": self.port,
+                "activeAgentCount": self.active_agent_count(),
             }
             try:
                 client.sendall((json.dumps(payload) + "\n").encode(ENCODING))
@@ -984,11 +1066,19 @@ class AgentResolver:
         self._auto_agent: AgentKind | None = None
 
     def select_agent_kind(self, card: "TaskCard") -> AgentKind:
+        stored_agent = agent_kind_from_value(card.agent_kind_value)
+        if card.agent_id and stored_agent:
+            self.ensure_agent_available(stored_agent)
+            return stored_agent
+
         tagged_agent = agent_kind_from_tags(card.tags)
         if tagged_agent:
             self.ensure_agent_available(tagged_agent)
             self.log.info(f"Task `{card.path}` selected agent from tag: {tagged_agent.value}")
             return tagged_agent
+        if stored_agent:
+            self.ensure_agent_available(stored_agent)
+            return stored_agent
         if self.settings.default_agent:
             self.ensure_agent_available(self.settings.default_agent)
             return self.settings.default_agent
@@ -1171,6 +1261,7 @@ class ClaudeRunner(AgentRunner):
         args = [
             executable,
             "--print",
+            "--verbose",
             "--output-format",
             "stream-json",
             "--input-format",
@@ -1307,12 +1398,26 @@ class TaskCard:
     def get_metadata_value(self, key: str) -> str | None:
         return self.read_metadata_value(self.content, key)
 
+    @property
+    def agent_kind_value(self) -> str | None:
+        return self.get_metadata_value("Agent Kind") or self.get_metadata_value("AgentKind")
+
     def get_section_body(self, heading: str, level: int = 2) -> str:
         return get_section_body(self.content, heading, level)
 
-    def with_updated_agent_id(self, agent_id: str) -> "TaskCard":
+    def with_updated_agent_id(
+        self, agent_id: str, agent_kind: AgentKind | None = None
+    ) -> "TaskCard":
         updated = ensure_task_template(self.content)
         updated = set_metadata_value(updated, "Agent", agent_id)
+        if agent_kind:
+            updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
+        self.write(updated)
+        return TaskCard.load(self.path, self.step, self.paths)
+
+    def with_updated_agent_kind(self, agent_kind: AgentKind) -> "TaskCard":
+        updated = ensure_task_template(self.content)
+        updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
@@ -1368,7 +1473,7 @@ Requirements:
 - Follow `{{working directory}}/context.md` for task-card conventions, question formatting, and report handling.
 - Work only inside the repository path and the task file.
 - If the repository path is not a Git repository, treat it as an empty task workspace.
-- Do not change `Project:`, `Agent:`, or `Repo:` lines.
+- Do not change `Project:`, `Agent:`, `Agent Kind:`, or `Repo:` lines.
 - Keep `## Comments` and `### Report` aligned with the current state.
 - Do not move the task file between folders; `runner.py` does that.
 
@@ -1626,6 +1731,17 @@ def parse_default_agent(value: str | None) -> AgentKind | None:
     raise ValueError("Default agent must be claude, codex, null, or auto.")
 
 
+def agent_kind_from_value(value: str | None) -> AgentKind | None:
+    if value is None:
+        return None
+    normalized = normalize_tag(value)
+    if normalized in {"claude", "agent:claude", "agent=claude"}:
+        return AgentKind.CLAUDE
+    if normalized in {"codex", "agent:codex", "agent=codex"}:
+        return AgentKind.CODEX
+    return None
+
+
 def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
     normalized_tags = {normalize_tag(tag) for tag in tags}
     claude_markers = {
@@ -1775,6 +1891,7 @@ def ensure_task_template(content: str) -> str:
     updated = content
     updated = ensure_metadata_line(updated, "Project")
     updated = ensure_metadata_line(updated, "Agent")
+    updated = ensure_metadata_line(updated, "Agent Kind")
     updated = ensure_metadata_line(updated, "Repo")
     updated = migrate_legacy_sections(updated)
     updated = ensure_section(updated, "Description")
@@ -1795,7 +1912,11 @@ def ensure_metadata_line(content: str, key: str) -> str:
 
 def set_metadata_value(content: str, key: str, value: str) -> str:
     if re.search(rf"(?m)^{re.escape(key)}:[ \t]*.*$", content):
-        return re.sub(rf"(?m)^{re.escape(key)}:[ \t]*.*$", f"{key}: {value}", content)
+        return re.sub(
+            rf"(?m)^{re.escape(key)}:[ \t]*.*$",
+            lambda _match: f"{key}: {value}",
+            content,
+        )
     ensured = ensure_metadata_line(content, key)
     return ensured.replace(f"{key}: \n", f"{key}: {value}\n", 1)
 
