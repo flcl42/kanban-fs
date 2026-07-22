@@ -67,8 +67,19 @@ assert.deepEqual(
     "${codexExecutable}",
     "--claude-executable",
     "${claudeExecutable}",
+    "--kimi-executable",
+    "${kimiExecutable}",
   ],
   "default runner args should pass agent settings to runner.py"
+);
+assert.ok(
+  manifest.contributes.configuration.properties["kanban.defaultAgent"].enum.includes("kimi"),
+  "default agent setting should include Kimi"
+);
+assert.equal(
+  manifest.contributes.configuration.properties["kanban.kimiExecutable"].default,
+  "kimi",
+  "manifest should expose a Kimi executable setting"
 );
 assert.match(
   source,
@@ -89,6 +100,51 @@ assert.match(
   /ensureRootRunnerIgnoredFolders\(kanbanUri\)/,
   "root-board runner initialization should add ignored runtime folders"
 );
+assert.match(
+  source,
+  /path\.join\(paths\.runnerRoot,\s*RUNNER_SCRIPT_NAME\)/,
+  "runner initialization should place runner.py at the runner root"
+);
+assert.doesNotMatch(
+  source,
+  /path\.join\(paths\.kanbanDir,\s*RUNNER_SCRIPT_NAME\)/,
+  "runner initialization should not place runner.py inside tasks for nested boards"
+);
+assert.match(
+  source,
+  /blank = https:\/\/github\.com\/flcl42\/blank\.git/,
+  "runner initialization should seed projects.md with the blank project alias"
+);
+assert.match(
+  source,
+  /knowledge[\s\S]*README\.md/,
+  "runner initialization should seed knowledge/README.md"
+);
+assert.match(
+  source,
+  /DEFAULT_TASK_TEMPLATE_TEXT[\s\S]*# \{\{TITLE\}\}[\s\S]*Project: \{\{CURSOR\}\}[\s\S]*Model:/,
+  "runner initialization should define the default task template"
+);
+assert.match(
+  source,
+  /ensureTaskTemplateFile\(kanbanUri\)/,
+  "runner initialization should seed template.md beside .kanban"
+);
+assert.match(
+  source,
+  /const agentOutputMd = new MarkdownIt\([\s\S]*breaks:\s*true/,
+  "agent output should render Markdown while preserving single line breaks"
+);
+assert.match(
+  source,
+  /outputHtml:\s*output\.outputHtml/,
+  "agent output messages should carry rendered Markdown HTML"
+);
+assert.match(
+  source,
+  /formatRecentAgentOutputBlocks\(outputBlocks\)/,
+  "agent output extraction should preserve recent Markdown blocks"
+);
 assert.doesNotMatch(
   source,
   /prepareRunnerKanbanLocation/,
@@ -98,6 +154,11 @@ assert.doesNotMatch(
   source,
   /\bterminal\.sendText\(\s*sessionCwd\s*\?\s*`codex resume/,
   "resume-agent terminals should not hard-code the codex executable"
+);
+assert.match(
+  source,
+  /--session \$\{trimmed\}/,
+  "resume-agent terminals should use Kimi session resume syntax"
 );
 assert.match(
   source,
@@ -391,8 +452,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code or Codex CLI",
-          command: "claude / codex",
+          label: "Claude Code, Codex CLI, or Kimi CLI",
+          command: "claude / codex / kimi",
           installed: false,
           version: "",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -409,7 +470,7 @@ assert.match(
   "runner panel should ask to create a local runner script when the default runner is missing"
 );
 assert.doesNotMatch(runnerPanelEl.innerHTML, /Python/, "runner panel should hide installed tool rows");
-assert.match(runnerPanelEl.innerHTML, /Claude Code or Codex CLI/, "runner panel should show missing auto-agent status");
+assert.match(runnerPanelEl.innerHTML, /Claude Code, Codex CLI, or Kimi CLI/, "runner panel should show missing auto-agent status");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="openRunnerLink"/, "missing runner tools should render install links");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="hideRunnerPanel"/, "runner panel should expose a hide action");
 assert.match(runnerPanelEl.innerHTML, /by default/, "runner panel hide should expose a persistent setting checkbox");
@@ -443,8 +504,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code or Codex CLI",
-          command: "claude / codex",
+          label: "Claude Code, Codex CLI, or Kimi CLI",
+          command: "claude / codex / kimi",
           installed: false,
           version: "",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -482,8 +543,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code or Codex CLI",
-          command: "claude / codex",
+          label: "Claude Code, Codex CLI, or Kimi CLI",
+          command: "claude / codex / kimi",
           installed: true,
           version: "Claude Code 1.0.0",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -521,7 +582,8 @@ windowListeners.message({
   },
 });
 assert.equal(runnerPanelEl.hidden, true, "runner panel should hide when a runner status endpoint is detected");
-assert.equal(agentCountEl.hidden, true, "active agent count should stay hidden without a positive count");
+assert.equal(agentCountEl.hidden, false, "runner count should show when a runner is connected");
+assert.equal(agentCountEl.textContent, "0 running agents", "runner count should show zero active agents");
 
 windowListeners.message({
   data: {
@@ -534,7 +596,24 @@ windowListeners.message({
   },
 });
 assert.equal(agentCountEl.hidden, false, "active agent count should show when agents are active");
-assert.equal(agentCountEl.textContent, "2 active", "active agent count should render compact text");
+assert.equal(agentCountEl.textContent, "2 running agents", "active agent count should render explicit text");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: false,
+      running: true,
+      activeAgentCount: 3,
+    },
+  },
+});
+assert.equal(
+  agentCountEl.hidden,
+  false,
+  "active agent count should still show when the runner warning panel is disabled"
+);
+assert.equal(agentCountEl.textContent, "3 running agents");
 
 windowListeners.message({
   data: {
@@ -553,8 +632,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code or Codex CLI",
-          command: "claude / codex",
+          label: "Claude Code, Codex CLI, or Kimi CLI",
+          command: "claude / codex / kimi",
           installed: true,
           version: "Claude Code 1.0.0",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -737,6 +816,21 @@ assert.equal(boardEl.children[0].children.length, 3, "expected header and two ca
 assert.equal(boardEl.children[1].children.length, 2, "expected second column header and one card");
 assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)");
 assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1)");
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: true,
+      activeAgentCount: 2,
+    },
+  },
+});
+assert.match(
+  searchMetaEl.textContent,
+  /3 cards.*2 running agents/,
+  "card summary should include active agent count when a runner reports active work"
+);
 let columnRenamePrevented = false;
 let columnRenameStopped = false;
 boardEl.children[0].children[0].children[0].listeners.dblclick({
@@ -940,7 +1034,7 @@ assert.equal(messages.at(-2)?.type, "requestGitStatus", "details should request 
 assert.equal(messages.at(-2)?.path, "C:\\work\\demo");
 assert.equal(messages.at(-1)?.type, "requestAgentOutput", "details should request agent output for Agent properties");
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
-assert.equal(messages.at(-1)?.agentKind, "claude");
+assert.equal(messages.at(-1)?.agentKind, "codex");
 
 assert.match(detailsEl.innerHTML, /Owner:/, "details should render non-tag properties");
 assert.match(detailsEl.innerHTML, /Loading description/, "details should show a placeholder before the selected card body loads");
@@ -1051,7 +1145,7 @@ detailsEl.listeners.click({
 assert.equal(messages.at(-1)?.type, "resumeAgent");
 assert.equal(messages.at(-1)?.agentId, "019d0095-6102-7fe2-9fc8-5db0155692e9");
 assert.equal(messages.at(-1)?.title, "Ship it");
-assert.equal(messages.at(-1)?.agentKind, "claude");
+assert.equal(messages.at(-1)?.agentKind, "codex");
 assert.equal(messages.at(-1)?.repoPath, "C:\\work\\demo");
 
 windowListeners.message({
@@ -1077,12 +1171,16 @@ windowListeners.message({
     type: "agentOutput",
     cardUri: "file:///task.md",
     agentId: "019d0095-6102-7fe2-9fc8-5db0155692e9",
-    agentKind: "claude",
-    output: "Investigating the issue.\nInvestigating the issue.\nPatched the validator.",
+    agentKind: "codex",
+    output: "Investigating the issue.\nInvestigating the issue.\n- Patched **validator**.\nLine one\nLine two",
+    outputHtml:
+      "<p>Investigating the issue.</p>\n" +
+      "<ul><li>Patched <strong>validator</strong>.</li></ul>\n" +
+      "<p>Line one<br />\nLine two</p>\n",
   },
 });
 
-assert.match(detailsEl.innerHTML, /Claude Output/, "details should render a Claude output section for Agent properties");
+assert.match(detailsEl.innerHTML, /Codex Output/, "details should render a Codex output section for Agent properties");
 assert.doesNotMatch(
   detailsEl.innerHTML,
   /<hr\s*\/>\s*<h2 class="details-section-title">Claude Output<\/h2>/,
@@ -1094,7 +1192,11 @@ assert.match(
   "agent output title should have breathing room when it follows the git status block"
 );
 assert.match(detailsEl.innerHTML, /Investigating the issue\./, "agent output should be displayed in the details pane");
-assert.match(detailsEl.innerHTML, /Patched the validator\./, "latest agent output should preserve line breaks");
+assert.match(detailsEl.innerHTML, /<strong>validator<\/strong>/, "agent output should render Markdown emphasis");
+assert.match(detailsEl.innerHTML, /<ul><li>Patched/, "agent output should render Markdown lists");
+assert.match(detailsEl.innerHTML, /Line one<br\s*\/>/, "agent output should preserve single line breaks");
+assert.doesNotMatch(detailsEl.innerHTML, /<pre class="codex-output-text">/, "agent output should not render as a preformatted text block");
+assert.doesNotMatch(detailsEl.innerHTML, /&lt;strong&gt;validator/, "agent output Markdown HTML should not be escaped as text");
 assert.equal(
   (detailsEl.innerHTML.match(/Investigating the issue\./g) || []).length,
   1,
@@ -1264,3 +1366,4 @@ assert.equal(searchInputEl.value, "", "clear action should reset the query");
 assert.equal(searchClearEl.hidden, true, "clear button should hide after clearing");
 assert.equal(boardEl.children[0].children[1].dataset.uri, "file:///task.md", "clearing should restore matching cards");
 assert.match(detailsEl.innerHTML, /Owner:/, "clearing the filter should restore selected card details");
+

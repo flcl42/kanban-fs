@@ -104,11 +104,21 @@ type RunnerStatusProbe = {
   activeAgentCount?: number;
 };
 
-type AgentKind = "claude" | "codex";
+type AgentKind = "claude" | "codex" | "kimi";
+type WorkspaceMoveCallback = (
+  root: string,
+  sourcePath: string,
+  destinationPath: string
+) => void;
 
 const md = new MarkdownIt({
   html: false,
   linkify: true,
+});
+const agentOutputMd = new MarkdownIt({
+  html: false,
+  linkify: true,
+  breaks: true,
 });
 const execFileAsync = promisify(execFile);
 const DETAILS_REFRESH_INTERVAL_MS = 10000;
@@ -130,12 +140,15 @@ const RUNNER_ARGS_SETTING = "runner.args";
 const DEFAULT_AGENT_SETTING = "defaultAgent";
 const CODEX_EXECUTABLE_SETTING = "codexExecutable";
 const CLAUDE_EXECUTABLE_SETTING = "claudeExecutable";
+const KIMI_EXECUTABLE_SETTING = "kimiExecutable";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
 const DEFAULT_CODEX_EXECUTABLE = "codex";
 const DEFAULT_CLAUDE_EXECUTABLE = "claude";
+const DEFAULT_KIMI_EXECUTABLE = "kimi";
 const RUNNER_STATUS_REFRESH_MS = 10_000;
+const BOARD_DISK_REFRESH_MS = 10_000;
 const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
 const RUNNER_LAUNCH_GRACE_MS = 45_000;
 const RUNNER_STATUS_PORT_BASE = 41_000;
@@ -145,6 +158,7 @@ const RUNNER_STATUS_PORT_CANDIDATES = 32;
 const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
 const CLAUDE_INSTALL_URL = "https://docs.anthropic.com/en/docs/claude-code";
+const KIMI_INSTALL_URL = "https://moonshotai.github.io/kimi-code/";
 const PYTHON_INSTALL_URL = "https://www.python.org/downloads/";
 const KANBAN_FILE_NAME = ".kanban";
 const RUNNER_SCRIPT_NAME = "runner.py";
@@ -165,12 +179,38 @@ const DEFAULT_RUNNER_ARGS = [
   "${codexExecutable}",
   "--claude-executable",
   "${claudeExecutable}",
+  "--kimi-executable",
+  "${kimiExecutable}",
 ];
+const DEFAULT_PROJECTS_MAP_TEXT = "blank = https://github.com/flcl42/blank.git\n";
+const DEFAULT_TASK_TEMPLATE_TEXT = `# {{TITLE}}
+
+Tags: 
+Project: {{CURSOR}}
+Model: 
+
+## Description
+
+
+`;
+const DEFAULT_CONTEXT_TEXT = `# Context
+
+- Read the task card and this file before starting.
+- Keep work inside the assigned repository and task file.
+- Check \`knowledge/README.md\` for shared board notes.
+- Put completion notes in the task report.
+`;
+const DEFAULT_KNOWLEDGE_README_TEXT = `# Knowledge
+
+Add durable board notes, links, and project references here.
+`;
 
 export function activate(context: vscode.ExtensionContext) {
   const provider = new KanbanEditorProvider(context);
   const taskActionProvider = new TaskActionEditorProvider(context);
-  const workspaceMoveServer = new WorkspaceMoveServer();
+  const workspaceMoveServer = new WorkspaceMoveServer((root, sourcePath, destinationPath) =>
+    provider.notifyWorkspaceMove(root, sourcePath, destinationPath)
+  );
   context.subscriptions.push(
     workspaceMoveServer,
     vscode.commands.registerCommand(RESUME_AGENT_COMMAND, async (agentId: string) =>
@@ -214,7 +254,7 @@ class WorkspaceMoveServer implements vscode.Disposable {
   private readonly servers = new Map<string, net.Server>();
   private readonly disposables: vscode.Disposable[] = [];
 
-  constructor() {
+  constructor(private readonly onMove?: WorkspaceMoveCallback) {
     this.disposables.push(
       vscode.workspace.onDidChangeWorkspaceFolders(() => {
         void this.syncServers();
@@ -390,6 +430,7 @@ class WorkspaceMoveServer implements vscode.Disposable {
       };
     }
 
+    this.onMove?.(root, sourcePath, destinationPath);
     return { ok: true };
   }
 }
@@ -707,9 +748,11 @@ function createDefaultBoardConfigText(): string {
 
 class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly watchers = new Map<string, vscode.FileSystemWatcher>();
+  private readonly boardRefreshersByRoot = new Map<string, Set<() => void>>();
   private readonly boardConfigCache = new Map<string, BoardConfig>();
   private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly claudeSessionFiles = new Map<string, CodexSessionFile | null>();
+  private readonly kimiSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly runnerLaunches = new Map<string, number>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
@@ -725,6 +768,41 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       })
     );
     void this.resolveEditorCursorPlaceholder(vscode.window.activeTextEditor);
+  }
+
+  notifyWorkspaceMove(
+    root: string,
+    _sourcePath: string,
+    _destinationPath: string
+  ): void {
+    const refreshers = this.boardRefreshersByRoot.get(normalizeMovePath(root));
+    if (!refreshers) {
+      return;
+    }
+    for (const refresh of refreshers) {
+      refresh();
+    }
+  }
+
+  private registerBoardRefresher(
+    root: string,
+    refresh: () => void
+  ): vscode.Disposable {
+    const normalizedRoot = normalizeMovePath(root);
+    let refreshers = this.boardRefreshersByRoot.get(normalizedRoot);
+    if (!refreshers) {
+      refreshers = new Set();
+      this.boardRefreshersByRoot.set(normalizedRoot, refreshers);
+    }
+    refreshers.add(refresh);
+    return {
+      dispose: () => {
+        refreshers?.delete(refresh);
+        if (refreshers?.size === 0) {
+          this.boardRefreshersByRoot.delete(normalizedRoot);
+        }
+      },
+    };
   }
 
   async createEmptyBoard(): Promise<void> {
@@ -1010,9 +1088,18 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const runnerStatusTimer = setInterval(() => {
       void sendRunnerStatus();
     }, RUNNER_STATUS_REFRESH_MS);
+    const boardDiskRefreshTimer = setInterval(() => {
+      scheduleBoardRefresh();
+    }, BOARD_DISK_REFRESH_MS);
+    const boardRefreshRegistration = this.registerBoardRefresher(
+      this.getRunnerTokenPaths(document.uri).runnerRoot,
+      scheduleBoardRefresh
+    );
     webviewPanel.onDidDispose(() => {
+      boardRefreshRegistration.dispose();
       detailsPaneWidthListener.dispose();
       clearInterval(runnerStatusTimer);
+      clearInterval(boardDiskRefreshTimer);
       if (scheduledBoardRefresh) {
         clearTimeout(scheduledBoardRefresh);
       }
@@ -1199,7 +1286,18 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       if (message?.type === "openFile" && message?.cardUri) {
-        const target = vscode.Uri.parse(message.cardUri);
+        const requestedCardUri = String(message.cardUri);
+        const target = await this.resolveCurrentCardUri(document.uri, requestedCardUri);
+        if (!target) {
+          await sendBoard();
+          vscode.window.showWarningMessage(
+            "That ticket moved or was deleted. The board has been refreshed."
+          );
+          return;
+        }
+        if (target.toString() !== requestedCardUri) {
+          await sendBoard();
+        }
         await vscode.window.showTextDocument(target, { preview: true });
         return;
       }
@@ -1233,21 +1331,29 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           agentId: String(message.agentId),
           agentKind: output.agentKind,
           output: output.output,
+          outputHtml: output.outputHtml,
         });
         return;
       }
       if (message?.type === "requestCardDetails" && message?.cardUri) {
         const cardUri = String(message.cardUri);
         try {
-          const details = await this.readCardDetails(cardUri);
+          const details = await this.readCardDetails(document.uri, cardUri);
           webviewPanel.webview.postMessage({
             type: "cardDetails",
+            requestedUpdatedAt: Number(message?.updatedAt),
             ...details,
           });
+          if (details.currentCardUri !== cardUri) {
+            scheduleBoardRefresh();
+          }
         } catch {
+          scheduleBoardRefresh();
           webviewPanel.webview.postMessage({
             type: "cardDetails",
             cardUri,
+            currentCardUri: cardUri,
+            requestedUpdatedAt: Number(message?.updatedAt),
             bodyHtml: "",
             bodyLineCount: 0,
             updatedAt: 0,
@@ -1257,17 +1363,23 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "toggleTaskCheckbox" && message?.cardUri) {
         const cardUri = String(message.cardUri);
+        const resolvedCardUri = await this.resolveCurrentCardUri(document.uri, cardUri);
+        if (!resolvedCardUri) {
+          await sendBoard();
+          return;
+        }
         await runBoardMutation(() =>
           this.updateTaskCheckbox(
-            cardUri,
+            resolvedCardUri.toString(),
             Number(message?.taskIndex),
             Boolean(message?.checked)
           )
         );
         await sendBoard();
-        const details = await this.readCardDetails(cardUri);
+        const details = await this.readCardDetails(document.uri, cardUri);
         webviewPanel.webview.postMessage({
           type: "cardDetails",
+          requestedUpdatedAt: Number(message?.updatedAt),
           ...details,
         });
         return;
@@ -1532,13 +1644,72 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return cards;
   }
 
-  private async readCardDetails(cardUriString: string): Promise<{
+  private async resolveCurrentCardUri(
+    kanbanUri: vscode.Uri,
+    cardUriString: string
+  ): Promise<vscode.Uri | null> {
+    let cardUri: vscode.Uri;
+    try {
+      cardUri = vscode.Uri.parse(cardUriString);
+    } catch {
+      return null;
+    }
+
+    if (cardUri.scheme !== "file") {
+      return cardUri;
+    }
+
+    const existingStat = await this.statUri(cardUri);
+    if (existingStat?.type === vscode.FileType.File) {
+      return cardUri;
+    }
+
+    const fileName = path.basename(cardUri.fsPath);
+    if (!fileName || !fileName.toLowerCase().endsWith(".md")) {
+      return null;
+    }
+    if (fileName.toLowerCase() === "folder.md") {
+      return null;
+    }
+
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const boardConfig = await this.readBoardConfig(kanbanUri);
+    let entries: [string, vscode.FileType][];
+    try {
+      entries = await vscode.workspace.fs.readDirectory(boardFolder);
+    } catch {
+      return null;
+    }
+
+    const matches: vscode.Uri[] = [];
+    for (const [name, type] of entries) {
+      if (type !== vscode.FileType.Directory || isIgnoredFolder(boardConfig, name)) {
+        continue;
+      }
+      const candidate = vscode.Uri.joinPath(boardFolder, name, fileName);
+      const candidateStat = await this.statUri(candidate);
+      if (candidateStat?.type === vscode.FileType.File) {
+        matches.push(candidate);
+      }
+    }
+
+    return matches.length === 1 ? matches[0] : null;
+  }
+
+  private async readCardDetails(
+    kanbanUri: vscode.Uri,
+    cardUriString: string
+  ): Promise<{
     cardUri: string;
+    currentCardUri: string;
     bodyHtml: string;
     bodyLineCount: number;
     updatedAt: number;
   }> {
-    const cardUri = vscode.Uri.parse(cardUriString);
+    const cardUri = await this.resolveCurrentCardUri(kanbanUri, cardUriString);
+    if (!cardUri) {
+      throw new Error("Card file no longer exists.");
+    }
     if (cardUri.scheme !== "file") {
       throw new Error("Card details are only available for local file cards.");
     }
@@ -1551,7 +1722,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .split(/\r?\n/)
       .filter((line) => line.trim().length > 0).length;
     return {
-      cardUri: cardUri.toString(),
+      cardUri: cardUriString,
+      currentCardUri: cardUri.toString(),
       bodyHtml: renderMarkdownWithTaskLists(body || ""),
       bodyLineCount,
       updatedAt: stat.mtime,
@@ -2063,7 +2235,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
     const kind =
-      normalizeAgentKindValue(agentKind)
+      agentKindFromAgentId(trimmed)
+      ?? normalizeAgentKindValue(agentKind)
       ?? await this.detectAgentKindFromSessions(trimmed)
       ?? await this.detectDefaultResumeAgentKind();
     const repoCwd =
@@ -2074,6 +2247,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       repoCwd
       ?? (kind === "claude"
         ? await this.readClaudeSessionCwd(trimmed)
+        : kind === "kimi"
+          ? await this.readKimiSessionCwd(trimmed)
         : await this.readCodexSessionCwd(trimmed));
     const terminal = vscode.window.createTerminal({
       name: formatAgentTerminalName(ticketTitle, trimmed),
@@ -2082,11 +2257,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const executableCommand = formatTerminalExecutable(
       kind === "claude"
         ? this.getClaudeExecutableSetting()
+        : kind === "kimi"
+          ? this.getKimiExecutableSetting()
         : this.getCodexExecutableSetting()
     );
     terminal.show(false);
     if (kind === "claude") {
       terminal.sendText(`${executableCommand} --resume ${trimmed}`, true);
+    } else if (kind === "kimi") {
+      terminal.sendText(`${executableCommand} --session ${trimmed}`, true);
     } else {
       terminal.sendText(
         sessionCwd
@@ -2226,6 +2405,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return executable || DEFAULT_CLAUDE_EXECUTABLE;
   }
 
+  private getKimiExecutableSetting(): string {
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(KIMI_EXECUTABLE_SETTING, DEFAULT_KIMI_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_KIMI_EXECUTABLE;
+  }
+
   private getDefaultAgentSetting(): string {
     const value = vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION)
@@ -2269,8 +2456,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ),
       };
     }
+    if (defaultAgent === "kimi") {
+      return {
+        python: pythonStatus,
+        kimi: await this.detectRunnerTool(
+          "Kimi CLI",
+          this.getKimiExecutableSetting(),
+          ["--version"],
+          KIMI_INSTALL_URL
+        ),
+      };
+    }
 
-    const [claudeStatus, codexStatus] = await Promise.all([
+    const [claudeStatus, codexStatus, kimiStatus] = await Promise.all([
       this.detectRunnerTool(
         "Claude Code",
         this.getClaudeExecutableSetting(),
@@ -2283,17 +2481,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ["--version"],
         CODEX_INSTALL_URL
       ),
+      this.detectRunnerTool(
+        "Kimi CLI",
+        this.getKimiExecutableSetting(),
+        ["--version"],
+        KIMI_INSTALL_URL
+      ),
     ]);
     return {
       python: pythonStatus,
       agent: {
-        label: "Claude Code or Codex CLI",
-        command: `${claudeStatus.command} / ${codexStatus.command}`,
-        installed: claudeStatus.installed || codexStatus.installed,
+        label: "Claude Code, Codex CLI, or Kimi CLI",
+        command: `${claudeStatus.command} / ${codexStatus.command} / ${kimiStatus.command}`,
+        installed: claudeStatus.installed || codexStatus.installed || kimiStatus.installed,
         version: claudeStatus.installed
           ? `Claude Code ${claudeStatus.version}`
           : codexStatus.installed
             ? `Codex CLI ${codexStatus.version}`
+            : kimiStatus.installed
+              ? `Kimi CLI ${kimiStatus.version}`
             : "",
         installUrl: CLAUDE_INSTALL_URL,
       },
@@ -2351,13 +2557,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     message?: string;
   }> {
     const enabled = this.getRunnerPanelEnabledSetting();
-    if (!enabled) {
-      return { enabled: false, running: false };
-    }
-
     if (kanbanUri.scheme !== "file") {
       return {
-        enabled: true,
+        enabled,
         running: false,
         message: "Runner status is only available for local file boards.",
       };
@@ -2365,14 +2567,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const paths = this.getRunnerTokenPaths(kanbanUri);
     const runnerScriptRequired = this.getRunnerScriptRequiredSetting();
-    const [probe, requirements] = await Promise.all([
-      this.probeRunnerStatus(paths.runnerRoot),
-      this.getRunnerToolStatuses(),
-    ]);
+    const probe = await this.probeRunnerStatus(paths.runnerRoot);
+    const requirements = enabled ? await this.getRunnerToolStatuses() : undefined;
     if (probe) {
       this.runnerLaunches.delete(normalizeMovePath(paths.runnerRoot));
       return {
-        enabled: true,
+        enabled,
         running: true,
         runnerScriptRequired,
         runnerScriptExists: Boolean(paths.localRunnerScript),
@@ -2388,7 +2588,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const launchedAt = this.runnerLaunches.get(normalizedRoot);
     if (launchedAt && Date.now() - launchedAt <= RUNNER_LAUNCH_GRACE_MS) {
       return {
-        enabled: true,
+        enabled,
         running: true,
         runnerScriptRequired,
         runnerScriptExists: Boolean(paths.localRunnerScript),
@@ -2404,7 +2604,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       this.runnerLaunches.delete(normalizedRoot);
     }
     return {
-      enabled: true,
+      enabled,
       running: false,
       runnerScriptRequired,
       runnerScriptExists: Boolean(paths.localRunnerScript),
@@ -2506,11 +2706,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   }
 
   private async fileExists(uri: vscode.Uri): Promise<boolean> {
+    return Boolean(await this.statUri(uri));
+  }
+
+  private async statUri(uri: vscode.Uri): Promise<vscode.FileStat | null> {
     try {
-      await vscode.workspace.fs.stat(uri);
-      return true;
+      return await vscode.workspace.fs.stat(uri);
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -2539,6 +2742,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     defaultAgent: string;
     codexExecutable: string;
     claudeExecutable: string;
+    kimiExecutable: string;
   } {
     const kanbanDir = path.dirname(kanbanUri.fsPath);
     const runnerRoot =
@@ -2563,6 +2767,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       defaultAgent: this.getDefaultAgentSetting(),
       codexExecutable: this.getCodexExecutableSetting(),
       claudeExecutable: this.getClaudeExecutableSetting(),
+      kimiExecutable: this.getKimiExecutableSetting(),
     };
   }
 
@@ -2577,7 +2782,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (paths.kanbanDir === paths.runnerRoot) {
       await this.ensureRootRunnerIgnoredFolders(kanbanUri);
     }
-    const destination = path.join(paths.kanbanDir, RUNNER_SCRIPT_NAME);
+    const runnerRootUri = vscode.Uri.file(paths.runnerRoot);
+    await this.ensureRunnerSupportFiles(runnerRootUri);
+    await this.ensureTaskTemplateFile(kanbanUri);
+    const destination = path.join(paths.runnerRoot, RUNNER_SCRIPT_NAME);
     if (existsSync(destination)) {
       return { runnerPath: destination, kanbanUri };
     }
@@ -2586,6 +2794,42 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
     await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
     return { runnerPath: destination, kanbanUri };
+  }
+
+  private async ensureTaskTemplateFile(kanbanUri: vscode.Uri): Promise<void> {
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    await this.writeTextFileIfMissingOrEmpty(
+      vscode.Uri.joinPath(boardFolder, CARD_TEMPLATE_FILE_NAME),
+      DEFAULT_TASK_TEMPLATE_TEXT
+    );
+  }
+
+  private async ensureRunnerSupportFiles(runnerRootUri: vscode.Uri): Promise<void> {
+    await this.writeTextFileIfMissingOrEmpty(
+      vscode.Uri.joinPath(runnerRootUri, "projects.md"),
+      DEFAULT_PROJECTS_MAP_TEXT
+    );
+    await this.writeTextFileIfMissingOrEmpty(
+      vscode.Uri.joinPath(runnerRootUri, "context.md"),
+      DEFAULT_CONTEXT_TEXT
+    );
+    const knowledgeUri = vscode.Uri.joinPath(runnerRootUri, "knowledge");
+    await vscode.workspace.fs.createDirectory(knowledgeUri);
+    await this.writeTextFileIfMissingOrEmpty(
+      vscode.Uri.joinPath(knowledgeUri, "README.md"),
+      DEFAULT_KNOWLEDGE_README_TEXT
+    );
+  }
+
+  private async writeTextFileIfMissingOrEmpty(
+    uri: vscode.Uri,
+    content: string
+  ): Promise<void> {
+    const existing = await this.readExistingText(uri);
+    if (existing !== null && existing.trim().length > 0) {
+      return;
+    }
+    await this.writeTextFile(uri, content);
   }
 
   private async ensureRootRunnerIgnoredFolders(kanbanUri: vscode.Uri): Promise<void> {
@@ -2713,6 +2957,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       defaultAgent: string;
       codexExecutable: string;
       claudeExecutable: string;
+      kimiExecutable: string;
     }
   ): string {
     return value
@@ -2722,7 +2967,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .replace(/\$\{workspaceFolder\}/g, paths.workspaceFolder)
       .replace(/\$\{defaultAgent\}/g, paths.defaultAgent)
       .replace(/\$\{codexExecutable\}/g, paths.codexExecutable)
-      .replace(/\$\{claudeExecutable\}/g, paths.claudeExecutable);
+      .replace(/\$\{claudeExecutable\}/g, paths.claudeExecutable)
+      .replace(/\$\{kimiExecutable\}/g, paths.kimiExecutable);
   }
 
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
@@ -2786,35 +3032,69 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private async readAgentOutput(
     agentId: string,
     agentKind: unknown
-  ): Promise<{ agentKind: AgentKind | null; output: string | null }> {
+  ): Promise<{
+    agentKind: AgentKind | null;
+    output: string | null;
+    outputHtml: string | null;
+  }> {
     const trimmed = normalizeTaskPropertyValue(agentId);
     if (!isTaskGuidValue(trimmed)) {
-      return { agentKind: null, output: null };
+      return { agentKind: null, output: null, outputHtml: null };
+    }
+
+    const buildResult = async (
+      selectedKind: AgentKind,
+      outputPromise: Promise<string | null>
+    ) => {
+      const output = await outputPromise;
+      return {
+        agentKind: selectedKind,
+        output,
+        outputHtml: output ? renderAgentOutputMarkdown(output) : null,
+      };
+    };
+
+    const inferredKind = agentKindFromAgentId(trimmed);
+    if (inferredKind === "claude") {
+      return buildResult("claude", this.readClaudeOutput(trimmed));
+    }
+    if (inferredKind === "codex") {
+      return buildResult("codex", this.readCodexOutput(trimmed));
+    }
+    if (inferredKind === "kimi") {
+      return buildResult("kimi", this.readKimiOutput(trimmed));
     }
 
     const requestedKind = normalizeAgentKindValue(agentKind);
     if (requestedKind === "claude") {
-      return { agentKind: "claude", output: await this.readClaudeOutput(trimmed) };
+      return buildResult("claude", this.readClaudeOutput(trimmed));
     }
     if (requestedKind === "codex") {
-      return { agentKind: "codex", output: await this.readCodexOutput(trimmed) };
+      return buildResult("codex", this.readCodexOutput(trimmed));
+    }
+    if (requestedKind === "kimi") {
+      return buildResult("kimi", this.readKimiOutput(trimmed));
     }
 
     if (await this.findClaudeSessionFile(trimmed)) {
-      return { agentKind: "claude", output: await this.readClaudeOutput(trimmed) };
+      return buildResult("claude", this.readClaudeOutput(trimmed));
     }
     if (await this.findCodexSessionFile(trimmed)) {
-      return { agentKind: "codex", output: await this.readCodexOutput(trimmed) };
+      return buildResult("codex", this.readCodexOutput(trimmed));
+    }
+    if (await this.findKimiSessionFile(trimmed)) {
+      return buildResult("kimi", this.readKimiOutput(trimmed));
     }
 
     const defaultKind = await this.detectDefaultResumeAgentKind();
-    return {
-      agentKind: defaultKind,
-      output:
-        defaultKind === "claude"
-          ? await this.readClaudeOutput(trimmed)
-          : await this.readCodexOutput(trimmed),
-    };
+    return buildResult(
+      defaultKind,
+      defaultKind === "claude"
+        ? this.readClaudeOutput(trimmed)
+        : defaultKind === "kimi"
+          ? this.readKimiOutput(trimmed)
+        : this.readCodexOutput(trimmed)
+    );
   }
 
   private async readCodexOutput(agentId: string): Promise<string | null> {
@@ -2888,21 +3168,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return null;
       }
 
-      const recentLines = outputBlocks
-        .reverse()
-        .join("\n\n")
-        .split(/\r?\n/)
-        .map((line) => line.trimEnd())
-        .filter((line) => line.trim().length > 0)
-        .filter((line, index, lines) => {
-          if (index === 0) {
-            return true;
-          }
-          return line.trim() !== lines[index - 1].trim();
-        })
-        .slice(-5);
-
-      return recentLines.length > 0 ? recentLines.join("\n") : null;
+      return formatRecentAgentOutputBlocks(outputBlocks);
     } catch {
       return null;
     }
@@ -2947,21 +3213,52 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return null;
       }
 
-      const recentLines = outputBlocks
-        .reverse()
-        .join("\n\n")
-        .split(/\r?\n/)
-        .map((line) => line.trimEnd())
-        .filter((line) => line.trim().length > 0)
-        .filter((line, index, lines) => {
-          if (index === 0) {
-            return true;
-          }
-          return line.trim() !== lines[index - 1].trim();
-        })
-        .slice(-5);
+      return formatRecentAgentOutputBlocks(outputBlocks);
+    } catch {
+      return null;
+    }
+  }
 
-      return recentLines.length > 0 ? recentLines.join("\n") : null;
+  private async readKimiOutput(agentId: string): Promise<string | null> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return null;
+    }
+
+    const sessionFile = await this.findKimiSessionFile(trimmed);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const outputBlocks: string[] = [];
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(lines[index]);
+        } catch {
+          continue;
+        }
+
+        const text = extractKimiRecordText(entry);
+        if (text) {
+          outputBlocks.push(text);
+        }
+
+        if (outputBlocks.length >= 3) {
+          break;
+        }
+      }
+
+      if (outputBlocks.length === 0) {
+        return null;
+      }
+
+      return formatRecentAgentOutputBlocks(outputBlocks);
     } catch {
       return null;
     }
@@ -3041,6 +3338,48 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return null;
   }
 
+  private async readKimiSessionCwd(agentId: string): Promise<string | null> {
+    const sessionFile = await this.findKimiSessionFile(agentId);
+    if (!sessionFile) {
+      return null;
+    }
+
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home) {
+      return null;
+    }
+
+    const indexPath = path.join(home, ".kimi-code", "session_index.jsonl");
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(indexPath));
+      const lines = Buffer.from(raw).toString("utf8").split(/\r?\n/);
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index]?.trim();
+        if (!line) {
+          continue;
+        }
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const record = entry as { sessionId?: unknown; workDir?: unknown };
+        if (
+          record.sessionId === agentId
+          && typeof record.workDir === "string"
+          && record.workDir.trim()
+        ) {
+          return record.workDir.trim();
+        }
+      }
+    } catch {
+      // fall through to the session directory below.
+    }
+
+    return path.dirname(path.dirname(path.dirname(sessionFile)));
+  }
+
   private async detectAgentKindFromSessions(
     agentId: string
   ): Promise<AgentKind | null> {
@@ -3050,6 +3389,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (await this.findCodexSessionFile(agentId)) {
       return "codex";
     }
+    if (await this.findKimiSessionFile(agentId)) {
+      return "kimi";
+    }
     return null;
   }
 
@@ -3058,14 +3400,18 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (configured) {
       return configured;
     }
-    const [claude, codex] = await Promise.all([
+    const [claude, codex, kimi] = await Promise.all([
       this.canExecuteTool(this.getClaudeExecutableSetting()),
       this.canExecuteTool(this.getCodexExecutableSetting()),
+      this.canExecuteTool(this.getKimiExecutableSetting()),
     ]);
-    if (claude || !codex) {
+    if (claude || (!codex && !kimi)) {
       return "claude";
     }
-    return "codex";
+    if (codex || !kimi) {
+      return "codex";
+    }
+    return "kimi";
   }
 
   private async canExecuteTool(executable: string): Promise<boolean> {
@@ -3175,6 +3521,92 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     this.claudeSessionFiles.set(agentId, {
+      path: "",
+      lastCheckedAt: now,
+    });
+    return null;
+  }
+
+  private async findKimiSessionFile(agentId: string): Promise<string | null> {
+    const cached = this.kimiSessionFiles.get(agentId);
+    const now = Date.now();
+    if (cached && now - cached.lastCheckedAt < DETAILS_REFRESH_INTERVAL_MS) {
+      return cached.path || null;
+    }
+    if (cached === null) {
+      return null;
+    }
+
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home) {
+      this.kimiSessionFiles.set(agentId, null);
+      return null;
+    }
+
+    const indexPath = path.join(home, ".kimi-code", "session_index.jsonl");
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(indexPath));
+      const lines = Buffer.from(raw).toString("utf8").split(/\r?\n/);
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index]?.trim();
+        if (!line) {
+          continue;
+        }
+        let entry: unknown;
+        try {
+          entry = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        const record = entry as { sessionId?: unknown; sessionDir?: unknown };
+        if (record.sessionId === agentId && typeof record.sessionDir === "string") {
+          const wirePath = path.join(
+            record.sessionDir,
+            "agents",
+            "main",
+            "wire.jsonl"
+          );
+          try {
+            await vscode.workspace.fs.stat(vscode.Uri.file(wirePath));
+            this.kimiSessionFiles.set(agentId, {
+              path: wirePath,
+              lastCheckedAt: now,
+            });
+            return wirePath;
+          } catch {
+            // fall through to recursive search.
+          }
+        }
+      }
+    } catch {
+      // fall through to recursive search.
+    }
+
+    const root = path.join(home, ".kimi-code", "sessions");
+    try {
+      const command = `Get-ChildItem -Path '${escapePowerShellSingleQuotedString(root)}' -Recurse -File -Filter 'wire.jsonl' | Where-Object { $_.FullName -like '*${agentId}*' } | Select-Object -First 1 -ExpandProperty FullName`;
+      const result = await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-Command", command],
+        {
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+      const found = String(result.stdout || "").trim();
+      if (found) {
+        this.kimiSessionFiles.set(agentId, {
+          path: found,
+          lastCheckedAt: now,
+        });
+        return found;
+      }
+    } catch {
+      // fall through to the cached miss below
+    }
+
+    this.kimiSessionFiles.set(agentId, {
       path: "",
       lastCheckedAt: now,
     });
@@ -4036,8 +4468,48 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       font-family: var(--display);
       font-size: 13px;
       line-height: 1.6;
-      white-space: pre-wrap;
       word-break: break-word;
+    }
+    .codex-output-text p,
+    .codex-output-text ul,
+    .codex-output-text ol,
+    .codex-output-text blockquote,
+    .codex-output-text pre {
+      margin: 0 0 10px;
+    }
+    .codex-output-text > :last-child {
+      margin-bottom: 0;
+    }
+    .codex-output-text ul,
+    .codex-output-text ol {
+      padding-left: 22px;
+    }
+    .codex-output-text li {
+      margin: 4px 0;
+    }
+    .codex-output-text blockquote {
+      border-left: 3px solid var(--accent);
+      color: var(--muted);
+      padding-left: 10px;
+    }
+    .codex-output-text code {
+      font-family: var(--mono);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 1px 4px;
+    }
+    .codex-output-text pre {
+      overflow: auto;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .codex-output-text pre code {
+      border: 0;
+      padding: 0;
+      background: transparent;
     }
     .drop-target {
       outline: 2px dashed var(--accent);
@@ -4199,7 +4671,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerPanelEl.innerHTML = \`
           <div>
             <div class="runner-panel-title">No local runner script found</div>
-            <p class="runner-panel-text">Initialize runner support: create tasks/, move this .kanban there, and add runner.py beside it.</p>
+            <p class="runner-panel-text">Initialize runner support: create tasks/, add runner.py at the runner root, and seed projects/context files.</p>
             \${messageHtml}
             \${requirementsHtml}
           </div>
@@ -4236,19 +4708,32 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (!agentCountEl) {
         return;
       }
-      const count = runnerStatus?.running ? activeAgentCount() : 0;
-      if (count < 1) {
+      if (!runnerStatus?.running) {
         agentCountEl.hidden = true;
         agentCountEl.textContent = "";
         agentCountEl.removeAttribute?.("aria-label");
         return;
       }
-      const label = count === 1 ? "1 active" : \`\${count} active\`;
-      const title = count === 1 ? "1 active agent" : \`\${count} active agents\`;
+      const count = activeAgentCount();
+      const label = count === 1 ? "1 running agent" : \`\${count} running agents\`;
+      const title = label;
       agentCountEl.hidden = false;
       agentCountEl.textContent = label;
       agentCountEl.setAttribute("aria-label", title);
       agentCountEl.setAttribute("title", title);
+    };
+
+    const activeAgentSummary = () => {
+      const count = runnerStatus?.running ? activeAgentCount() : 0;
+      if (count < 1) {
+        return "";
+      }
+      return count === 1 ? "1 running agent" : \`\${count} running agents\`;
+    };
+
+    const withActiveAgentSummary = (text) => {
+      const summary = activeAgentSummary();
+      return summary ? \`\${text} · \${summary}\` : text;
     };
 
     const clampDetailsPaneWidth = (value) => {
@@ -4400,6 +4885,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (normalized === "codex" || normalized === "agent:codex") {
         return "codex";
       }
+      if (normalized === "kimi" || normalized === "agent:kimi") {
+        return "kimi";
+      }
+      return null;
+    };
+
+    const getAgentKindFromId = (value) => {
+      const normalized = String(value || "").trim().toLowerCase();
+      if (/^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
+        return "kimi";
+      }
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
+        return null;
+      }
+      const version = normalized[14];
+      if (version === "7") {
+        return "codex";
+      }
+      if (version === "4") {
+        return "claude";
+      }
       return null;
     };
 
@@ -4414,7 +4920,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
 
     const getAgentKind = (card) => {
-      return normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
+      return getAgentKindFromId(getPropertyValue(card, "Agent"))
+        || normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
         || getAgentKindFromTags(card);
     };
 
@@ -4425,6 +4932,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (kind === "codex") {
         return "Codex Output";
+      }
+      if (kind === "kimi") {
+        return "Kimi Output";
       }
       return "Agent Output";
     };
@@ -4479,6 +4989,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       agentOutputCache.set(agentId, {
         state: "loading",
         text: cached?.text || "",
+        html: cached?.html || "",
         agentKind: cached?.agentKind || agentKind,
         refreshedAt: cached?.refreshedAt || 0,
       });
@@ -4529,24 +5040,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (cached.state === "loading") {
         return \`
           <h2 class="details-section-title">\${escapeHtml(title)}</h2>
-          <pre class="codex-output-text">\${escapeHtml(cached.text || "Loading...")}</pre>
+          <div class="codex-output-text agent-output-text">\${escapeHtml(cached.text || "Loading...")}</div>
         \`;
       }
       if (cached.state !== "ready" || !cached.text) {
         return "";
       }
-      const text = String(cached.text)
-        .split(/\\r?\\n/)
-        .filter((line, index, lines) => {
-          if (index === 0) {
-            return true;
-          }
-          return line.trim() !== lines[index - 1].trim();
-        })
-        .join("\\n");
+      const html = cached.html || escapeHtml(String(cached.text)).replace(/\\r?\\n/g, "<br />");
       return \`
         <h2 class="details-section-title">\${escapeHtml(title)}</h2>
-        <pre class="codex-output-text">\${escapeHtml(text)}</pre>
+        <div class="codex-output-text agent-output-text">\${html}</div>
       \`;
     };
 
@@ -4567,6 +5070,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       vscode.postMessage({
         type: "requestCardDetails",
         cardUri: card.uri,
+        updatedAt: card.updatedAt,
       });
     };
 
@@ -4761,22 +5265,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const totalCards = countCards(boardColumns);
       const visibleCards = countCards(visibleColumns);
       if (searchMetaEl) {
+        let metaText = "";
         if (!activeFilter) {
-          searchMetaEl.textContent = totalCards === 1 ? "1 card" : \`\${totalCards} cards\`;
+          metaText = totalCards === 1 ? "1 card" : \`\${totalCards} cards\`;
         } else if (!visibleCards && activeQuery && !activeTagFilter) {
-          searchMetaEl.textContent = \`No cards match "\${searchQuery.trim()}".\`;
+          metaText = \`No cards match "\${searchQuery.trim()}".\`;
         } else if (!visibleCards && activeTagFilter === NO_TAG_FILTER && !activeQuery) {
-          searchMetaEl.textContent = "No cards without tags.";
+          metaText = "No cards without tags.";
         } else if (!visibleCards && activeTagFilter && !activeQuery) {
-          searchMetaEl.textContent = \`No cards match tag "\${activeTagFilter}".\`;
+          metaText = \`No cards match tag "\${activeTagFilter}".\`;
         } else if (!visibleCards) {
-          searchMetaEl.textContent = "No cards match the current filters.";
+          metaText = "No cards match the current filters.";
         } else {
           const matchingColumns = (visibleColumns || []).filter((column) => column.cards.length > 0).length;
           const columnLabel = matchingColumns === 1 ? "column" : "columns";
-          searchMetaEl.textContent =
+          metaText =
             \`\${visibleCards} of \${totalCards} cards shown in \${matchingColumns} \${columnLabel}. Cards can be moved to other columns while filtering.\`;
         }
+        searchMetaEl.textContent = withActiveAgentSummary(metaText);
       }
       if (searchClearEl) {
         searchClearEl.hidden = !activeFilter;
@@ -4918,6 +5424,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return null;
     };
 
+    const findCardByFileName = (board, fileName) => {
+      const normalized = String(fileName || "").toLowerCase();
+      if (!normalized) return null;
+      const matches = [];
+      for (const column of board?.columns || []) {
+        for (const card of column.cards || []) {
+          if (String(card?.fileName || "").toLowerCase() === normalized) {
+            matches.push(card);
+          }
+        }
+      }
+      return matches.length === 1 ? matches[0] : null;
+    };
+
     const findCardColumnId = (board, uri) => {
       for (const column of board?.columns || []) {
         for (const card of column.cards || []) {
@@ -4948,7 +5468,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         renderDetailsPlaceholder("Select a card to view details.");
         return;
       }
-      const updated = findCard(lastBoard, selectedCard.uri);
+      const updated = findCard(lastBoard, selectedCard.uri)
+        || findCardByFileName(lastBoard, selectedCard.fileName);
       if (!updated) {
         selectedCard = null;
         renderDetailsPlaceholder("Select a card to view details.");
@@ -5387,6 +5908,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       vscode.postMessage({
         type: "toggleTaskCheckbox",
         cardUri: selectedCard.uri,
+        updatedAt: selectedCard.updatedAt,
         taskIndex,
         checked: Boolean(target.checked),
       });
@@ -5483,6 +6005,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerCreatePending = false;
         renderRunnerPanel();
         renderActiveAgentCount();
+        if (lastBoard) {
+          refreshBoard();
+        }
       }
       if (message?.type === "gitStatus") {
         const repoPath = String(message?.path || "").trim();
@@ -5502,8 +6027,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const agentKind = normalizeAgentKind(message?.agentKind)
             || normalizeAgentKind(cached?.agentKind);
           agentOutputCache.set(agentId, message?.output
-            ? { state: "ready", text: String(message.output), agentKind, refreshedAt: Date.now() }
-            : { state: "missing", text: "", agentKind, refreshedAt: Date.now() });
+            ? {
+                state: "ready",
+                text: String(message.output),
+                html: String(message.outputHtml || ""),
+                agentKind,
+                refreshedAt: Date.now(),
+              }
+            : {
+                state: "missing",
+                text: "",
+                html: "",
+                agentKind,
+                refreshedAt: Date.now(),
+              });
         }
         if (selectedCard && message?.cardUri === selectedCard.uri) {
           renderDetails(selectedCard);
@@ -5511,15 +6048,30 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "cardDetails") {
         const cardUri = String(message?.cardUri || "").trim();
+        const currentCardUri = String(message?.currentCardUri || cardUri).trim();
+        const requestedUpdatedAt = Number(message?.requestedUpdatedAt);
+        const actualUpdatedAt = Number(message?.updatedAt || 0);
+        const detailEntry = {
+          state: "ready",
+          bodyHtml: String(message?.bodyHtml || ""),
+          bodyLineCount: Number(message?.bodyLineCount || 0),
+          updatedAt: Number.isFinite(requestedUpdatedAt) && requestedUpdatedAt > 0
+            ? requestedUpdatedAt
+            : actualUpdatedAt,
+        };
         if (cardUri) {
-          cardDetailsCache.set(cardUri, {
-            state: "ready",
-            bodyHtml: String(message?.bodyHtml || ""),
-            bodyLineCount: Number(message?.bodyLineCount || 0),
-            updatedAt: Number(message?.updatedAt || 0),
+          cardDetailsCache.set(cardUri, detailEntry);
+        }
+        if (currentCardUri && currentCardUri !== cardUri) {
+          cardDetailsCache.set(currentCardUri, {
+            ...detailEntry,
+            updatedAt: actualUpdatedAt,
           });
         }
-        if (selectedCard && message?.cardUri === selectedCard.uri) {
+        if (
+          selectedCard &&
+          (message?.cardUri === selectedCard.uri || currentCardUri === selectedCard.uri)
+        ) {
           renderDetails(selectedCard);
         }
       }
@@ -5685,6 +6237,52 @@ function renderMarkdownWithTaskLists(markdown: string): string {
   );
 }
 
+function normalizeAgentOutputMarkdown(markdown: string): string {
+  const lines = String(markdown || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd());
+  const deduped: string[] = [];
+  for (const line of lines) {
+    const previous = deduped[deduped.length - 1];
+    if (
+      line.trim().length > 0
+      && previous !== undefined
+      && previous.trim() === line.trim()
+    ) {
+      continue;
+    }
+    deduped.push(line);
+  }
+  while (deduped.length > 0 && deduped[0].trim().length === 0) {
+    deduped.shift();
+  }
+  while (deduped.length > 0 && deduped[deduped.length - 1].trim().length === 0) {
+    deduped.pop();
+  }
+  return deduped.join("\n");
+}
+
+function formatRecentAgentOutputBlocks(blocks: string[]): string | null {
+  const recentBlocks = [...blocks]
+    .reverse()
+    .map(normalizeAgentOutputMarkdown)
+    .filter((block) => block.trim().length > 0)
+    .filter((block, index, normalizedBlocks) => {
+      if (index === 0) {
+        return true;
+      }
+      return block.trim() !== normalizedBlocks[index - 1].trim();
+    })
+    .slice(-3);
+  return recentBlocks.length > 0 ? recentBlocks.join("\n\n") : null;
+}
+
+function renderAgentOutputMarkdown(markdown: string): string {
+  const normalized = normalizeAgentOutputMarkdown(markdown);
+  return normalized ? agentOutputMd.render(normalized) : "";
+}
+
 function normalizeAgentKindValue(value: unknown): AgentKind | null {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (normalized === "claude" || normalized === "agent:claude") {
@@ -5692,6 +6290,35 @@ function normalizeAgentKindValue(value: unknown): AgentKind | null {
   }
   if (normalized === "codex" || normalized === "agent:codex") {
     return "codex";
+  }
+  if (normalized === "kimi" || normalized === "agent:kimi") {
+    return "kimi";
+  }
+  return null;
+}
+
+function agentKindFromAgentId(value: unknown): AgentKind | null {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (
+    /^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      normalized
+    )
+  ) {
+    return "kimi";
+  }
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+      normalized
+    )
+  ) {
+    return null;
+  }
+  const version = normalized[14];
+  if (version === "7") {
+    return "codex";
+  }
+  if (version === "4") {
+    return "claude";
   }
   return null;
 }
@@ -5741,6 +6368,67 @@ function extractClaudeContentText(content: unknown): string {
       if (
         typeof record.text === "string"
         && (!record.type || String(record.type).toLowerCase() === "text")
+      ) {
+        return record.text.trim();
+      }
+      return "";
+    })
+    .filter((item) => item.length > 0)
+    .join("\n\n")
+    .trim();
+}
+
+function extractKimiRecordText(entry: unknown): string {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const record = entry as {
+    role?: unknown;
+    content?: unknown;
+    type?: unknown;
+    event?: unknown;
+    message?: unknown;
+  };
+  if (String(record.role || "").toLowerCase() === "assistant") {
+    return extractKimiContentText(record.content);
+  }
+  const type = String(record.type || "").toLowerCase();
+  if (type === "context.append_loop_event") {
+    const event = record.event as { part?: unknown } | undefined;
+    const part = event?.part as { type?: unknown; text?: unknown } | undefined;
+    if (
+      part
+      && String(part.type || "").toLowerCase() === "text"
+      && typeof part.text === "string"
+    ) {
+      return part.text.trim();
+    }
+  }
+  if (type === "context.append_message") {
+    const message = record.message as { role?: unknown; content?: unknown } | undefined;
+    if (String(message?.role || "").toLowerCase() === "assistant") {
+      return extractKimiContentText(message?.content);
+    }
+  }
+  return "";
+}
+
+function extractKimiContentText(content: unknown): string {
+  if (typeof content === "string") {
+    return content.trim();
+  }
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  return content
+    .map((item) => {
+      if (!item || typeof item !== "object") {
+        return "";
+      }
+      const record = item as { type?: unknown; text?: unknown };
+      if (
+        typeof record.text === "string"
+        && String(record.type || "text").toLowerCase() === "text"
       ) {
         return record.text.trim();
       }

@@ -50,15 +50,15 @@ It also supports the nested runner layout:
 
 ## Task Format
 
-Each task is a Markdown file. `runner.py` manages `Agent:`, `Agent Kind:`, and `Repo:`; keep them present even if blank.
+Each task is a Markdown file. `runner.py` manages `Agent:` and `Repo:`; keep them present even if blank.
 
 ```md
 # Title
 
 Tags: claude
 Project: nm
+Model: claude/sonnet/max
 Agent:
-Agent Kind:
 Repo:
 
 ## Description
@@ -72,9 +72,10 @@ Short description of the work.
 Behavior:
 
 - `Project:` picks the repo alias from `projects.md`. Use `Project: blank` or `Project: -` for an empty workspace that is moved to `trash/` when the task is done.
-- `Tags:` can select an agent per card. Supported markers include `claude`, `codex`, `agent:claude`, and `agent:codex`.
+- `Tags:` can select an agent per card. Supported markers include `claude`, `codex`, `kimi`, `agent:claude`, `agent:codex`, and `agent:kimi`.
+- `Model:` can choose the initial model for a new session. Use `agent/model` or `agent/model/effort`, for example `Model: codex/gpt-5.6-terra/max`. Codex maps effort to `model_reasoning_effort`, Claude maps effort to `--effort`, and Kimi supports `agent/model` only.
 - `Agent:` stores the agent session id so a task can resume later.
-- `Agent Kind:` stores `claude` or `codex` for that session. Existing sessions keep using this stored kind even if tags or default settings change. Clear both `Agent:` and `Agent Kind:` to intentionally start over with a different agent.
+- `Agent Kind:` is tolerated for older cards. New cards can rely on the `Agent:` id format: Codex uses UUIDv7-style ids, Claude uses UUIDv4-style ids, and Kimi uses `session_<uuid>` ids. Clear `Agent:` if you intentionally want a card to start a fresh session with a different agent.
 - `Repo:` stores the repo working-copy path or cache path.
 - `## Comments` is for open questions, blockers, and missing context.
 - `### Report` is for completion notes, handoff details, or a short summary of what changed.
@@ -84,18 +85,20 @@ Behavior:
 Requirements:
 
 - Python 3.10+.
-- Claude Code and/or Codex CLI.
+- Claude Code, Codex CLI, and/or Kimi CLI.
 
-Auto mode prefers Claude Code when `claude` is available, then falls back to Codex when `codex` is available.
+Auto mode prefers Claude Code when `claude` is available, then falls back to Codex when `codex` is available, then falls back to Kimi when `kimi` is available.
 
-The VS Code board details pane can display recent output for both Claude and Codex sessions. Connect-agent terminals use `claude --resume <session>` for Claude cards and `codex resume <session>` for Codex cards.
+The VS Code board details pane can display recent output for Claude, Codex, and Kimi sessions. Connect-agent terminals use `claude --resume <session>` for Claude cards, `codex resume <session>` for Codex cards, and `kimi --session <session>` for Kimi cards.
 
 ```powershell
 python runner.py --root D:\board
 python runner.py --root D:\board --default-agent claude
 python runner.py --root D:\board --default-agent codex
+python runner.py --root D:\board --default-agent kimi
 python runner.py --root D:\board --claude-executable claude
 python runner.py --root D:\board --codex-executable codex
+python runner.py --root D:\board --kimi-executable kimi
 python runner.py --root D:\board --max-agents 5
 python runner.py --root D:\board --poll-seconds 10
 python runner.py --root D:\board --once
@@ -106,10 +109,11 @@ Options:
 - `--root <path>`: board root. Defaults to the current directory.
 - `--max-agents <n>`: global active-agent limit. Default `5`.
 - `--poll-seconds <n>`: full reconciliation interval. Default `10`.
-- `--default-agent <agent>`: `claude`, `codex`, `null`, or `auto`. Default is auto.
+- `--default-agent <agent>`: `claude`, `codex`, `kimi`, `null`, or `auto`. Default is auto.
 - `--claude-executable <cmd>`: Claude Code executable name or path. Default `claude`.
 - `--codex-executable <cmd>`: Codex executable name or path. Default `codex`.
-- `--codex-mode Dangerous|FullAuto`: permission mode used for Codex and mapped to the closest Claude permission mode.
+- `--kimi-executable <cmd>`: Kimi CLI executable name or path. Default `kimi`.
+- `--codex-mode Dangerous|FullAuto`: permission mode used for Codex and mapped to the closest Claude permission mode. Kimi prompt mode does not accept `--yolo` or `--auto`, so this option is not passed to Kimi.
 - `--once`: run one reconciliation pass and exit.
 
 While running continuously, the runner exposes a localhost status endpoint on a deterministic port sequence derived from the board root. The VS Code Kanban view probes that endpoint and validates the normalized root path.

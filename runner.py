@@ -25,6 +25,7 @@ from urllib.parse import quote
 IS_WINDOWS = os.name == "nt"
 ENCODING = "utf-8"
 REPOSITORY_SWEEP_INTERVAL_SECONDS = 5 * 60
+MODEL_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 
 
 class TaskStep(enum.Enum):
@@ -38,6 +39,7 @@ class TaskStep(enum.Enum):
 class AgentKind(enum.Enum):
     CLAUDE = "claude"
     CODEX = "codex"
+    KIMI = "kimi"
 
 
 class CodexMode(enum.Enum):
@@ -104,6 +106,14 @@ class AgentRunResult:
 
 
 @dataclass(frozen=True)
+class ModelSpec:
+    raw: str
+    agent_kind: AgentKind | None
+    model: str
+    effort: str | None
+
+
+@dataclass(frozen=True)
 class OrchestratorSettings:
     root_path: str
     invocation_directory: str
@@ -114,6 +124,7 @@ class OrchestratorSettings:
     default_agent: AgentKind | None
     codex_executable: str
     claude_executable: str
+    kimi_executable: str
 
     @staticmethod
     def parse(argv: Sequence[str], default_root: str) -> "OrchestratorSettings":
@@ -133,10 +144,11 @@ class OrchestratorSettings:
         parser.add_argument(
             "--default-agent",
             default=None,
-            help="Default agent kind: claude, codex, null, or auto.",
+            help="Default agent kind: claude, codex, kimi, null, or auto.",
         )
-        parser.add_argument("--codex-executable", default="codex")
-        parser.add_argument("--claude-executable", default="claude")
+        parser.add_argument("--codex-executable", default=None)
+        parser.add_argument("--claude-executable", default=None)
+        parser.add_argument("--kimi-executable", default=None)
         args = parser.parse_args(argv)
 
         if args.max_agents < 1:
@@ -144,17 +156,180 @@ class OrchestratorSettings:
         if args.poll_seconds < 1:
             raise ValueError("Poll interval must be at least 1 second.")
 
+        root_path = os.path.abspath(args.root)
+        invocation_directory = os.path.abspath(default_root)
+        vscode_settings = load_vscode_kanban_settings(root_path, invocation_directory)
+        default_agent_value = args.default_agent
+        if default_agent_value is None:
+            default_agent_value = settings_string(vscode_settings, "kanban.defaultAgent")
+        codex_executable = (
+            args.codex_executable
+            or settings_string(vscode_settings, "kanban.codexExecutable")
+            or "codex"
+        )
+        claude_executable = (
+            args.claude_executable
+            or settings_string(vscode_settings, "kanban.claudeExecutable")
+            or "claude"
+        )
+        kimi_executable = (
+            args.kimi_executable
+            or settings_string(vscode_settings, "kanban.kimiExecutable")
+            or "kimi"
+        )
+
         return OrchestratorSettings(
-            root_path=os.path.abspath(args.root),
-            invocation_directory=os.path.abspath(default_root),
+            root_path=root_path,
+            invocation_directory=invocation_directory,
             max_agents=args.max_agents,
             poll_interval_seconds=args.poll_seconds,
             run_once=bool(args.once),
             codex_mode=parse_codex_mode(args.codex_mode),
-            default_agent=parse_default_agent(args.default_agent),
-            codex_executable=(args.codex_executable or "codex").strip(),
-            claude_executable=(args.claude_executable or "claude").strip(),
+            default_agent=parse_default_agent(default_agent_value),
+            codex_executable=codex_executable.strip() or "codex",
+            claude_executable=claude_executable.strip() or "claude",
+            kimi_executable=kimi_executable.strip() or "kimi",
         )
+
+
+def load_vscode_kanban_settings(root_path: str, invocation_directory: str) -> dict[str, object]:
+    merged: dict[str, object] = {}
+    for settings_path in vscode_settings_paths(root_path, invocation_directory):
+        data = read_jsonc_object(settings_path)
+        if not data:
+            continue
+        for key in [
+            "kanban.defaultAgent",
+            "kanban.codexExecutable",
+            "kanban.claudeExecutable",
+            "kanban.kimiExecutable",
+        ]:
+            if key in data:
+                merged[key] = data[key]
+    return merged
+
+
+def vscode_settings_paths(root_path: str, invocation_directory: str) -> list[str]:
+    candidates: list[str] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        for product in ["Code", "Code - Insiders", "VSCodium"]:
+            candidates.append(os.path.join(appdata, product, "User", "settings.json"))
+    for folder in [invocation_directory, root_path]:
+        candidates.append(os.path.join(folder, ".vscode", "settings.json"))
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = normalize_path(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(candidate)
+    return result
+
+
+def read_jsonc_object(path: str) -> dict[str, object] | None:
+    try:
+        with open(path, "r", encoding=ENCODING) as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    try:
+        data = json.loads(remove_json_trailing_commas(strip_jsonc_comments(text)))
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def strip_jsonc_comments(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+        if char == "/" and index + 1 < len(text):
+            next_char = text[index + 1]
+            if next_char == "/":
+                result.extend("  ")
+                index += 2
+                while index < len(text) and text[index] not in "\r\n":
+                    result.append(" ")
+                    index += 1
+                continue
+            if next_char == "*":
+                result.extend("  ")
+                index += 2
+                while index + 1 < len(text) and not (
+                    text[index] == "*" and text[index + 1] == "/"
+                ):
+                    result.append(text[index] if text[index] in "\r\n" else " ")
+                    index += 1
+                if index + 1 < len(text):
+                    result.extend("  ")
+                    index += 2
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def remove_json_trailing_commas(text: str) -> str:
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if in_string:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            result.append(char)
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < len(text) and text[lookahead].isspace():
+                lookahead += 1
+            if lookahead < len(text) and text[lookahead] in "}]":
+                index += 1
+                continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
+def settings_string(settings: dict[str, object], key: str) -> str | None:
+    value = settings.get(key)
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped if stripped else None
 
 
 class BoardPaths:
@@ -171,6 +346,8 @@ class BoardPaths:
         self.logs_root = os.path.join(self.root, "logs")
         self.gitignore_path = os.path.join(self.root, ".gitignore")
         self.context_path = os.path.join(self.root, "context.md")
+        self.knowledge_root = os.path.join(self.root, "knowledge")
+        self.knowledge_readme_path = os.path.join(self.knowledge_root, "README.md")
         self.projects_map_path = os.path.join(self.root, "projects.md")
         self.kanban_marker_path = root_kanban_marker if self.uses_root_board else nested_kanban_marker
         self.task_template_path = os.path.join(self.tasks_root, "template.md")
@@ -261,6 +438,7 @@ class TaskOrchestrator:
             )
             self.log.info(f"Codex executable: {self.settings.codex_executable}")
             self.log.info(f"Claude executable: {self.settings.claude_executable}")
+            self.log.info(f"Kimi executable: {self.settings.kimi_executable}")
             self.log.info(f"Max agents: {self.settings.max_agents}")
 
             if self.settings.run_once:
@@ -320,22 +498,23 @@ class TaskOrchestrator:
                     continue
 
                 if not card.project_alias.strip():
-                    self.block_task_for_issue(
-                        card,
-                        "Missing `Project:` field. Create the task with `Project:` set to an alias from projects.md, or use `Project: blank` / `Project: -` for an empty workspace.",
+                    card = card.with_updated_project_alias(
+                        ProjectAliases.BLANK_WORKSPACE_ALIAS
                     )
-                    continue
+                    self.log.info(
+                        f"Defaulted missing Project to `{card.project_alias}` for task: {card.path}"
+                    )
 
-                if ProjectAliases.is_blank(card.project_alias):
-                    assignment = ProjectAssignment.blank()
-                elif card.project_alias in project_map:
+                if card.project_alias in project_map:
                     assignment = ProjectAssignment.repository(
                         card.project_alias, project_map[card.project_alias]
                     )
+                elif ProjectAliases.is_blank(card.project_alias):
+                    assignment = ProjectAssignment.blank()
                 else:
                     self.block_task_for_issue(
                         card,
-                        f"Unknown project alias `{card.project_alias}` in projects.md. Use an alias from projects.md, or use `Project: blank` / `Project: -` for an empty workspace.",
+                        f"Unknown project alias `{card.project_alias}` in projects.md. Use an alias from projects.md, or use `Project: -` for an empty workspace.",
                     )
                     continue
 
@@ -346,6 +525,7 @@ class TaskOrchestrator:
     def ensure_board_scaffold(self) -> None:
         os.makedirs(self.paths.root, exist_ok=True)
         os.makedirs(self.paths.tasks_root, exist_ok=True)
+        os.makedirs(self.paths.knowledge_root, exist_ok=True)
         should_seed_kanban = self.should_seed_kanban_config(self.paths.kanban_marker_path)
         for directory in self.paths.required_directories:
             os.makedirs(directory, exist_ok=True)
@@ -363,6 +543,10 @@ class TaskOrchestrator:
         self.ensure_file_exists(
             self.paths.context_path,
             BoardTemplates.resolve_context_template(self.settings.invocation_directory),
+        )
+        self.ensure_file_exists(
+            self.paths.knowledge_readme_path,
+            BoardTemplates.resolve_knowledge_readme_template(self.settings.invocation_directory),
         )
         self.ensure_file_exists(
             self.paths.task_template_path,
@@ -553,7 +737,6 @@ class TaskOrchestrator:
 
         try:
             agent_kind = self.agent_resolver.select_agent_kind(doing_card)
-            doing_card = doing_card.with_updated_agent_kind(agent_kind)
         except Exception as exc:
             self.block_task_for_issue(doing_card, str(exc))
             return
@@ -886,7 +1069,13 @@ class WorkspaceMoveBridge:
         self._move_entry(source_path, destination_path, "file", os.path.isfile)
 
     def move_directory(self, source_path: str, destination_path: str) -> None:
-        self._move_entry(source_path, destination_path, "directory", os.path.isdir)
+        if path_equals(source_path, destination_path):
+            return
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        os.rename(source_path, destination_path)
+        self.log.info(
+            f"Moved directory via direct filesystem rename: `{source_path}` -> `{destination_path}`"
+        )
 
     def _move_entry(
         self,
@@ -1067,33 +1256,57 @@ class AgentResolver:
 
     def select_agent_kind(self, card: "TaskCard") -> AgentKind:
         stored_agent = agent_kind_from_value(card.agent_kind_value)
-        if card.agent_id and stored_agent:
-            self.ensure_agent_available(stored_agent)
-            return stored_agent
+        id_agent = agent_kind_from_agent_id(card.agent_id)
+        if card.agent_id:
+            resume_agent = id_agent or stored_agent
+            if resume_agent:
+                self.ensure_agent_available(resume_agent)
+                return resume_agent
 
+        model_spec = card.model_spec
         tagged_agent = agent_kind_from_tags(card.tags)
         if tagged_agent:
+            self.ensure_model_matches_agent(model_spec, tagged_agent, "Tags")
             self.ensure_agent_available(tagged_agent)
             self.log.info(f"Task `{card.path}` selected agent from tag: {tagged_agent.value}")
             return tagged_agent
         if stored_agent:
+            self.ensure_model_matches_agent(model_spec, stored_agent, "Agent Kind")
             self.ensure_agent_available(stored_agent)
             return stored_agent
+        if model_spec and model_spec.agent_kind:
+            self.ensure_agent_available(model_spec.agent_kind)
+            self.log.info(
+                f"Task `{card.path}` selected agent from Model: {model_spec.agent_kind.value}"
+            )
+            return model_spec.agent_kind
         if self.settings.default_agent:
             self.ensure_agent_available(self.settings.default_agent)
             return self.settings.default_agent
         return self.detect_default_agent()
 
+    def ensure_model_matches_agent(
+        self,
+        model_spec: ModelSpec | None,
+        agent_kind: AgentKind,
+        source: str,
+    ) -> None:
+        if model_spec and model_spec.agent_kind and model_spec.agent_kind != agent_kind:
+            raise ValueError(
+                f"`Model: {model_spec.raw}` requests `{model_spec.agent_kind.value}`, "
+                f"but `{source}` selects `{agent_kind.value}`."
+            )
+
     def detect_default_agent(self) -> AgentKind:
         if self._auto_agent:
             return self._auto_agent
-        for kind in [AgentKind.CLAUDE, AgentKind.CODEX]:
+        for kind in [AgentKind.CLAUDE, AgentKind.CODEX, AgentKind.KIMI]:
             if self.is_agent_available(kind):
                 self._auto_agent = kind
                 self.log.info(f"Auto-detected default agent: {kind.value}")
                 return kind
         raise FileNotFoundError(
-            "No supported agent executable was found. Install Claude Code or Codex, or configure `kanban.defaultAgent` and the matching executable setting."
+            "No supported agent executable was found. Install Claude Code, Codex, or Kimi CLI, or configure `kanban.defaultAgent` and the matching executable setting."
         )
 
     def ensure_agent_available(self, kind: AgentKind) -> None:
@@ -1113,6 +1326,8 @@ class AgentResolver:
     def executable_for(self, kind: AgentKind) -> str:
         if kind == AgentKind.CLAUDE:
             return self.settings.claude_executable
+        if kind == AgentKind.KIMI:
+            return self.settings.kimi_executable
         return self.settings.codex_executable
 
 
@@ -1128,6 +1343,8 @@ class AgentRunner:
     ) -> "AgentRunner":
         if kind == AgentKind.CLAUDE:
             return ClaudeRunner(settings, paths, log)
+        if kind == AgentKind.KIMI:
+            return KimiRunner(settings, paths, log)
         return CodexRunner(settings, paths, log)
 
     def run(
@@ -1147,12 +1364,21 @@ class AgentRunner:
         parse_line: Callable[[str, dict[str, str]], None],
         label: str,
         on_session_started: Callable[[str], None] | None,
+        write_prompt_to_stdin: bool = True,
+        redacted_arg_indexes: set[int] | None = None,
+        discover_session_id: Callable[[], str | None] | None = None,
+        session_discovery_timeout_seconds: float = 30.0,
     ) -> AgentRunResult:
-        self.log.info(f"Starting {label}: {' '.join(quote_arg(arg) for arg in args)}")
+        redacted = redacted_arg_indexes or set()
+        log_args = [
+            "<prompt>" if index in redacted else arg
+            for index, arg in enumerate(args)
+        ]
+        self.log.info(f"Starting {label}: {' '.join(quote_arg(arg) for arg in log_args)}")
         process = subprocess.Popen(
             args,
             cwd=repo_path,
-            stdin=subprocess.PIPE,
+            stdin=subprocess.PIPE if write_prompt_to_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -1163,25 +1389,36 @@ class AgentRunner:
         stderr_lines: list[str] = []
         state = {"session_id": "", "final_agent_message": ""}
         session_reported = False
+        session_lock = threading.Lock()
 
-        assert process.stdin is not None
-        process.stdin.write(prompt)
-        process.stdin.flush()
-        process.stdin.close()
+        def report_session_id(session_id: str) -> None:
+            nonlocal session_reported
+            if not session_id:
+                return
+            with session_lock:
+                if not state.get("session_id"):
+                    state["session_id"] = session_id
+                if session_reported:
+                    return
+                session_reported = True
+            if on_session_started:
+                on_session_started(session_id)
+
+        if write_prompt_to_stdin:
+            assert process.stdin is not None
+            process.stdin.write(prompt)
+            process.stdin.flush()
+            process.stdin.close()
 
         assert process.stdout is not None
         assert process.stderr is not None
 
         def read_stdout() -> None:
-            nonlocal session_reported
             for raw_line in process.stdout:
                 line = raw_line.rstrip("\r\n")
                 stdout_lines.append(line)
                 parse_line(line, state)
-                session_id = state.get("session_id", "")
-                if session_id and not session_reported and on_session_started:
-                    session_reported = True
-                    on_session_started(session_id)
+                report_session_id(state.get("session_id", ""))
 
         def read_stderr() -> None:
             for raw_line in process.stderr:
@@ -1189,13 +1426,41 @@ class AgentRunner:
                 stderr_lines.append(line)
                 self.log.warn(f"{label} stderr: {line}")
 
+        discovery_stop = threading.Event()
+
+        def discover_session() -> None:
+            deadline = time.monotonic() + session_discovery_timeout_seconds
+            while (
+                discover_session_id
+                and not discovery_stop.is_set()
+                and time.monotonic() < deadline
+            ):
+                if state.get("session_id"):
+                    return
+                session_id = discover_session_id()
+                if session_id:
+                    report_session_id(session_id)
+                    return
+                discovery_stop.wait(0.5)
+
         stdout_thread = threading.Thread(target=read_stdout)
         stderr_thread = threading.Thread(target=read_stderr)
+        discovery_thread: threading.Thread | None = None
         stdout_thread.start()
         stderr_thread.start()
+        if discover_session_id:
+            discovery_thread = threading.Thread(
+                target=discover_session,
+                name=f"{label}-session-discovery",
+                daemon=True,
+            )
+            discovery_thread.start()
         exit_code = process.wait()
         stdout_thread.join()
         stderr_thread.join()
+        discovery_stop.set()
+        if discovery_thread:
+            discovery_thread.join(timeout=1)
 
         for line in stdout_lines[-10:]:
             self.log.info(f"{label} stdout: {line}")
@@ -1220,6 +1485,7 @@ class CodexRunner(AgentRunner):
         executable = ToolPaths.resolve_executable(
             self.settings.codex_executable, AgentKind.CODEX
         )
+        model_spec = None if card.agent_id else card.model_spec
         if card.agent_id:
             args = [
                 executable,
@@ -1234,6 +1500,7 @@ class CodexRunner(AgentRunner):
             args = [
                 executable,
                 "exec",
+                *codex_model_arguments(model_spec),
                 "--json",
                 "-C",
                 repo_path,
@@ -1258,6 +1525,7 @@ class ClaudeRunner(AgentRunner):
         executable = ToolPaths.resolve_executable(
             self.settings.claude_executable, AgentKind.CLAUDE
         )
+        model_spec = None if card.agent_id else card.model_spec
         args = [
             executable,
             "--print",
@@ -1268,12 +1536,57 @@ class ClaudeRunner(AgentRunner):
             "text",
             "--add-dir",
             self.paths.root,
+            *claude_model_arguments(model_spec),
             *claude_permission_arguments(self.settings.codex_mode),
         ]
         if card.agent_id:
             args.extend(["--resume", card.agent_id])
         return self._run_process(
             args, repo_path, prompt, parse_claude_json_line, "Claude", on_session_started
+        )
+
+
+class KimiRunner(AgentRunner):
+    def run(
+        self,
+        card: "TaskCard",
+        repo_path: str,
+        prompt: str,
+        on_session_started: Callable[[str], None] | None,
+    ) -> AgentRunResult:
+        executable = ToolPaths.resolve_executable(
+            self.settings.kimi_executable, AgentKind.KIMI
+        )
+        model_spec = None if card.agent_id else card.model_spec
+        existing_session_ids = KimiSessions.session_ids_for_workdir(repo_path)
+        args = [
+            executable,
+            *kimi_model_arguments(model_spec),
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
+            "--add-dir",
+            self.paths.root,
+        ]
+        if card.agent_id:
+            args.extend(["--session", card.agent_id])
+        return self._run_process(
+            args,
+            repo_path,
+            prompt,
+            parse_kimi_json_line,
+            "Kimi",
+            on_session_started,
+            write_prompt_to_stdin=False,
+            redacted_arg_indexes={args.index(prompt)},
+            discover_session_id=(
+                None
+                if card.agent_id
+                else lambda: KimiSessions.find_new_session_id_for_workdir(
+                    repo_path, existing_session_ids
+                )
+            ),
         )
 
 
@@ -1366,6 +1679,7 @@ class TaskCard:
         self.project_alias = self.get_metadata_value("Project") or ""
         self.agent_id = self.get_metadata_value("Agent")
         self.repo_path = self.get_metadata_value("Repo")
+        self.model_value = self.get_metadata_value("Model")
         self.tags = parse_tags(self.get_metadata_value("Tags"))
         self.comments_body = self.get_section_body("Comments")
         if not self.comments_body.strip():
@@ -1402,6 +1716,10 @@ class TaskCard:
     def agent_kind_value(self) -> str | None:
         return self.get_metadata_value("Agent Kind") or self.get_metadata_value("AgentKind")
 
+    @property
+    def model_spec(self) -> ModelSpec | None:
+        return parse_model_spec(self.model_value)
+
     def get_section_body(self, heading: str, level: int = 2) -> str:
         return get_section_body(self.content, heading, level)
 
@@ -1410,14 +1728,15 @@ class TaskCard:
     ) -> "TaskCard":
         updated = ensure_task_template(self.content)
         updated = set_metadata_value(updated, "Agent", agent_id)
-        if agent_kind:
-            updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
     def with_updated_agent_kind(self, agent_kind: AgentKind) -> "TaskCard":
+        return self
+
+    def with_updated_project_alias(self, project_alias: str) -> "TaskCard":
         updated = ensure_task_template(self.content)
-        updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
+        updated = set_metadata_value(updated, "Project", project_alias)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
@@ -1473,7 +1792,7 @@ Requirements:
 - Follow `{{working directory}}/context.md` for task-card conventions, question formatting, and report handling.
 - Work only inside the repository path and the task file.
 - If the repository path is not a Git repository, treat it as an empty task workspace.
-- Do not change `Project:`, `Agent:`, `Agent Kind:`, or `Repo:` lines.
+- Do not change `Project:`, `Model:`, `Agent:`, or `Repo:` lines.
 - Keep `## Comments` and `### Report` aligned with the current state.
 - Do not move the task file between folders; `runner.py` does that.
 
@@ -1578,7 +1897,7 @@ class ProjectAliases:
 class BoardTemplates:
     @staticmethod
     def projects_template() -> str:
-        return "# alias = https://github.com/org/repo\n"
+        return "blank = https://github.com/flcl42/blank.git\n"
 
     @staticmethod
     def default_gitignore_template() -> str:
@@ -1586,44 +1905,19 @@ class BoardTemplates:
 
     @staticmethod
     def default_context_template() -> str:
-        return """# Task Agent Context
+        return """# Context
 
-Read this file, the `{working directory}/README.md`, and the task file before doing any work.
+- Read the task card and this file before starting.
+- Keep work inside the assigned repository and task file.
+- Check `knowledge/README.md` for shared board notes.
+- Put completion notes in the task report.
+"""
 
-## General rules
+    @staticmethod
+    def default_knowledge_readme_template() -> str:
+        return """# Knowledge
 
-- Work only inside the assigned repository/workspace path and the task file.
-- Don't push anything unless explicitly asked.
-- Don't commit unless explicitly asked.
-- If you do commit, use a short informative message without a prefix like `fix` or `chore`.
-- Keep task markdown tidy.
-- Read `{working directory}/knowledge/README.md` and check whether any linked reference is relevant to the task.
-- Confirm you use up to date branches, pull if needed.
-- Use default branch like master or main (stash changes if present, nothing should be there, checkout the branch, pull), if specific one is not mentioned.
-- If a cached repo contains uncommitted changes, stash them all so no changes interfere with new task. Mention it in the task.
-- When asked to checkout a branch or merge another branch, use most recent state available at remote by default, unless asked to use local branch.
-
-## Task file conventions
-
-- Keep `## Description` as the durable task record.
-- When a question is resolved, fold the answer into `## Description` and trim stale items from `## Comments`.
-- Use `## Comments` only for open questions, blockers, or missing context.
-- Every non-empty line in `## Comments` must start with `> `.
-- Separate unrelated comment topics with a line that is exactly `===`.
-- Use `### Report` for completion notes, handoff details, or a concise summary of what changed.
-- Leave `## Comments` empty when the task is not blocked and no user input is needed.
-- Interpret cited comments (`> ...`) as yours; if they do not make sense, ignore them.
-- Improve markdown.
-
-## Final message
-
-- End with exactly one status block.
-- If blocked:
-`ORCHESTRATOR_STATUS: BLOCKED`
-`ORCHESTRATOR_SUMMARY: <one sentence>`
-- If done:
-`ORCHESTRATOR_STATUS: DONE`
-`ORCHESTRATOR_SUMMARY: <one sentence>`
+Add durable board notes, links, and project references here.
 """
 
     @staticmethod
@@ -1632,8 +1926,10 @@ Read this file, the `{working directory}/README.md`, and the task file before do
 
 Tags: 
 Project: {{CURSOR}}
+Model: 
 
 ## Description
+
 
 """
 
@@ -1641,6 +1937,14 @@ Project: {{CURSOR}}
     def resolve_context_template(invocation_directory: str) -> str:
         return read_seed_file(
             invocation_directory, "context.md", BoardTemplates.default_context_template()
+        )
+
+    @staticmethod
+    def resolve_knowledge_readme_template(invocation_directory: str) -> str:
+        return read_seed_file(
+            invocation_directory,
+            os.path.join("knowledge", "README.md"),
+            BoardTemplates.default_knowledge_readme_template(),
         )
 
     @staticmethod
@@ -1695,6 +1999,13 @@ class ToolPaths:
                     os.path.join(home, ".codex", ".sandbox-bin", "codex"),
                 ]
             )
+        if kind == AgentKind.KIMI and executable.lower() == "kimi" and home:
+            candidates.extend(
+                [
+                    os.path.join(home, ".kimi-code", "bin", "kimi.exe"),
+                    os.path.join(home, ".kimi-code", "bin", "kimi"),
+                ]
+            )
 
         seen: set[str] = set()
         for candidate in candidates:
@@ -1707,6 +2018,65 @@ class ToolPaths:
         raise FileNotFoundError(
             f"Unable to locate configured {kind.value} executable `{executable}` on PATH or at the configured path."
         )
+
+
+class KimiSessions:
+    @staticmethod
+    def index_path() -> str:
+        return os.path.join(str(Path.home()), ".kimi-code", "session_index.jsonl")
+
+    @staticmethod
+    def session_ids_for_workdir(workdir: str) -> set[str]:
+        session_ids: set[str] = set()
+        normalized_workdir = normalize_path(workdir)
+        for entry in KimiSessions._read_index():
+            session_id = KimiSessions._session_id_for_entry(entry, normalized_workdir)
+            if session_id:
+                session_ids.add(session_id)
+        return session_ids
+
+    @staticmethod
+    def find_new_session_id_for_workdir(
+        workdir: str, existing_session_ids: set[str]
+    ) -> str | None:
+        normalized_workdir = normalize_path(workdir)
+        for entry in reversed(KimiSessions._read_index()):
+            session_id = KimiSessions._session_id_for_entry(entry, normalized_workdir)
+            if session_id and session_id not in existing_session_ids:
+                return session_id
+        return None
+
+    @staticmethod
+    def _session_id_for_entry(entry: dict[str, object], normalized_workdir: str) -> str | None:
+        session_id = entry.get("sessionId")
+        workdir = entry.get("workDir")
+        if not isinstance(session_id, str) or not isinstance(workdir, str):
+            return None
+        session_id = session_id.strip()
+        if agent_kind_from_agent_id(session_id) != AgentKind.KIMI:
+            return None
+        if normalize_path(workdir) != normalized_workdir:
+            return None
+        return session_id
+
+    @staticmethod
+    def _read_index() -> list[dict[str, object]]:
+        path = KimiSessions.index_path()
+        if not os.path.exists(path):
+            return []
+        entries: list[dict[str, object]] = []
+        try:
+            with open(path, "r", encoding=ENCODING, errors="replace") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(entry, dict):
+                        entries.append(entry)
+        except OSError:
+            return []
+        return entries
 
 
 def parse_codex_mode(value: str) -> CodexMode:
@@ -1728,7 +2098,9 @@ def parse_default_agent(value: str | None) -> AgentKind | None:
         return AgentKind.CLAUDE
     if normalized == "codex":
         return AgentKind.CODEX
-    raise ValueError("Default agent must be claude, codex, null, or auto.")
+    if normalized == "kimi":
+        return AgentKind.KIMI
+    raise ValueError("Default agent must be claude, codex, kimi, null, or auto.")
 
 
 def agent_kind_from_value(value: str | None) -> AgentKind | None:
@@ -1739,6 +2111,64 @@ def agent_kind_from_value(value: str | None) -> AgentKind | None:
         return AgentKind.CLAUDE
     if normalized in {"codex", "agent:codex", "agent=codex"}:
         return AgentKind.CODEX
+    if normalized in {"kimi", "agent:kimi", "agent=kimi"}:
+        return AgentKind.KIMI
+    return None
+
+
+def parse_model_spec(value: str | None) -> ModelSpec | None:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+
+    parts = [part.strip() for part in raw.split("/")]
+    if any(not part for part in parts):
+        raise ValueError(f"`Model: {raw}` contains an empty segment.")
+
+    agent_kind = agent_kind_from_value(parts[0])
+    if not agent_kind:
+        return ModelSpec(raw=raw, agent_kind=None, model=raw, effort=None)
+
+    if len(parts) not in {2, 3}:
+        raise ValueError(
+            f"`Model: {raw}` must use `agent/model` or `agent/model/effort`."
+        )
+    effort = normalize_model_effort(parts[2]) if len(parts) == 3 else None
+    return ModelSpec(raw=raw, agent_kind=agent_kind, model=parts[1], effort=effort)
+
+
+def normalize_model_effort(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in MODEL_EFFORT_LEVELS:
+        raise ValueError(
+            f"Unsupported model effort `{value}`. Use one of: "
+            + ", ".join(sorted(MODEL_EFFORT_LEVELS))
+            + "."
+        )
+    return normalized
+
+
+def agent_kind_from_agent_id(value: str | None) -> AgentKind | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if re.fullmatch(
+        r"session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        normalized,
+    ):
+        return AgentKind.KIMI
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        normalized,
+    ):
+        return None
+    version = normalized[14]
+    if version == "7":
+        return AgentKind.CODEX
+    if version == "4":
+        return AgentKind.CLAUDE
     return None
 
 
@@ -1762,12 +2192,24 @@ def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
         "use:codex",
         "use-codex",
     }
+    kimi_markers = {
+        "kimi",
+        "agent:kimi",
+        "agent=kimi",
+        "ai:kimi",
+        "runner:kimi",
+        "use:kimi",
+        "use-kimi",
+    }
     has_claude = bool(normalized_tags & claude_markers)
     has_codex = bool(normalized_tags & codex_markers)
-    if has_claude and not has_codex:
+    has_kimi = bool(normalized_tags & kimi_markers)
+    if has_claude and not has_codex and not has_kimi:
         return AgentKind.CLAUDE
-    if has_codex and not has_claude:
+    if has_codex and not has_claude and not has_kimi:
         return AgentKind.CODEX
+    if has_kimi and not has_claude and not has_codex:
+        return AgentKind.KIMI
     return None
 
 
@@ -1783,6 +2225,34 @@ def parse_tags(value: str | None) -> list[str]:
 
 def normalize_tag(value: str) -> str:
     return value.strip().lstrip("#").lower()
+
+
+def codex_model_arguments(model_spec: ModelSpec | None) -> list[str]:
+    if not model_spec:
+        return []
+    args = ["--model", model_spec.model]
+    if model_spec.effort:
+        args.extend(["-c", f'model_reasoning_effort="{model_spec.effort}"'])
+    return args
+
+
+def claude_model_arguments(model_spec: ModelSpec | None) -> list[str]:
+    if not model_spec:
+        return []
+    args = ["--model", model_spec.model]
+    if model_spec.effort:
+        args.extend(["--effort", model_spec.effort])
+    return args
+
+
+def kimi_model_arguments(model_spec: ModelSpec | None) -> list[str]:
+    if not model_spec:
+        return []
+    if model_spec.effort:
+        raise ValueError(
+            f"`Model: {model_spec.raw}` sets effort `{model_spec.effort}`, but Kimi CLI only supports model selection."
+        )
+    return ["--model", model_spec.model]
 
 
 def codex_mode_arguments(mode: CodexMode) -> list[str]:
@@ -1840,8 +2310,28 @@ def parse_claude_json_line(line: str, state: dict[str, str]) -> None:
     if event_type == "assistant":
         message = payload.get("message")
         text = extract_claude_message_text(message)
-        if text:
-            state["final_agent_message"] = text
+    if text:
+        state["final_agent_message"] = text
+
+
+def parse_kimi_json_line(line: str, state: dict[str, str]) -> None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        if line.strip():
+            state["final_agent_message"] = line
+        return
+
+    session_id = (
+        find_nested_string(payload, "session_id")
+        or find_nested_string(payload, "sessionId")
+    )
+    if session_id and agent_kind_from_agent_id(session_id) == AgentKind.KIMI:
+        state["session_id"] = session_id
+
+    role = str(payload.get("role", "")).lower()
+    if role == "assistant" and isinstance(payload.get("content"), str):
+        state["final_agent_message"] = str(payload.get("content") or "")
 
 
 def find_nested_string(value: object, key: str) -> str | None:
@@ -1890,8 +2380,8 @@ def get_section_body(content: str, heading: str, level: int = 2) -> str:
 def ensure_task_template(content: str) -> str:
     updated = content
     updated = ensure_metadata_line(updated, "Project")
+    updated = ensure_metadata_line(updated, "Model")
     updated = ensure_metadata_line(updated, "Agent")
-    updated = ensure_metadata_line(updated, "Agent Kind")
     updated = ensure_metadata_line(updated, "Repo")
     updated = migrate_legacy_sections(updated)
     updated = ensure_section(updated, "Description")

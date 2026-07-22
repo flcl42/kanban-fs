@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
   "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional agent runner.",
-  "version": "1.0.29",
+  "version": "1.0.31",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -157,13 +157,15 @@
             "--codex-executable",
             "${codexExecutable}",
             "--claude-executable",
-            "${claudeExecutable}"
+            "${claudeExecutable}",
+            "--kimi-executable",
+            "${kimiExecutable}"
           ],
           "items": {
             "type": "string"
           },
           "scope": "application",
-          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, ${defaultAgent}, ${codexExecutable}, and ${claudeExecutable}."
+          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, ${defaultAgent}, ${codexExecutable}, ${claudeExecutable}, and ${kimiExecutable}."
         },
         "kanban.defaultAgent": {
           "type": [
@@ -174,10 +176,11 @@
           "enum": [
             null,
             "claude",
-            "codex"
+            "codex",
+            "kimi"
           ],
           "scope": "application",
-          "description": "Default agent for runner tasks. When null, the runner auto-detects Claude first and then Codex. Task tags such as claude, codex, agent:claude, or agent:codex override this per card."
+          "description": "Default agent for runner tasks. When null, the runner auto-detects Claude first, then Codex, then Kimi. Task tags such as claude, codex, kimi, agent:claude, agent:codex, or agent:kimi override this per card."
         },
         "kanban.codexExecutable": {
           "type": "string",
@@ -190,6 +193,12 @@
           "default": "claude",
           "scope": "application",
           "description": "Claude Code executable used by the Kanban runner and Claude resume-agent terminals."
+        },
+        "kanban.kimiExecutable": {
+          "type": "string",
+          "default": "kimi",
+          "scope": "application",
+          "description": "Kimi CLI executable used by the Kanban runner and Kimi resume-agent terminals."
         }
       }
     }

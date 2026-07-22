@@ -53,8 +53,11 @@ export function normalizePropertyValue(value: string): string {
 }
 
 export function isGuidValue(value: string): boolean {
+  const normalized = normalizePropertyValue(value);
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-    normalizePropertyValue(value)
+    normalized
+  ) || /^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+    normalized
   );
 }
 

@@ -84,6 +84,11 @@ assert.deepEqual(getTaskPropertyAction("Link", "https://example.com/task"), {
   title: "Open",
   value: "https://example.com/task",
 });
+assert.deepEqual(getTaskPropertyAction("Agent", "session_1d11f261-5711-42ff-8a3a-fb7146ec5988"), {
+  command: "resumeAgent",
+  title: "Connect",
+  value: "session_1d11f261-5711-42ff-8a3a-fb7146ec5988",
+});
 assert.deepEqual(getTaskPropertyAction("Project", "D:\\"), {
   command: "openPath",
   title: "Terminal",
