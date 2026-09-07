@@ -7,6 +7,7 @@ import datetime as dt
 import enum
 import hashlib
 import json
+import ntpath
 import os
 import re
 import shutil
@@ -18,14 +19,20 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Literal, Sequence
 from urllib.parse import quote
 
 
 IS_WINDOWS = os.name == "nt"
 ENCODING = "utf-8"
 REPOSITORY_SWEEP_INTERVAL_SECONDS = 5 * 60
-MODEL_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+GIT_COMMAND_TIMEOUT_SECONDS = 120
+MODEL_EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+MANUAL_AGENT_VALUE: Literal["manual"] = "manual"
+
+
+class ShutdownRequested(RuntimeError):
+    pass
 
 
 class TaskStep(enum.Enum):
@@ -40,6 +47,11 @@ class AgentKind(enum.Enum):
     CLAUDE = "claude"
     CODEX = "codex"
     KIMI = "kimi"
+    DEEPSEEK = "deepseek"
+    OPENCODE = "opencode"
+
+
+DefaultAgentSelection = AgentKind | Literal["manual"] | None
 
 
 class CodexMode(enum.Enum):
@@ -121,10 +133,13 @@ class OrchestratorSettings:
     poll_interval_seconds: int
     run_once: bool
     codex_mode: CodexMode
-    default_agent: AgentKind | None
+    default_agent: DefaultAgentSelection
+    default_models: dict[AgentKind, ModelSpec]
     codex_executable: str
     claude_executable: str
     kimi_executable: str
+    deepseek_executable: str
+    opencode_executable: str
 
     @staticmethod
     def parse(argv: Sequence[str], default_root: str) -> "OrchestratorSettings":
@@ -144,11 +159,13 @@ class OrchestratorSettings:
         parser.add_argument(
             "--default-agent",
             default=None,
-            help="Default agent kind: claude, codex, kimi, null, or auto.",
+            help="Default agent kind: auto, claude, codex, opencode, kimi, deepseek, or manual.",
         )
         parser.add_argument("--codex-executable", default=None)
         parser.add_argument("--claude-executable", default=None)
         parser.add_argument("--kimi-executable", default=None)
+        parser.add_argument("--deepseek-executable", default=None)
+        parser.add_argument("--opencode-executable", default=None)
         args = parser.parse_args(argv)
 
         if args.max_agents < 1:
@@ -177,6 +194,21 @@ class OrchestratorSettings:
             or settings_string(vscode_settings, "kanban.kimiExecutable")
             or "kimi"
         )
+        deepseek_executable = (
+            args.deepseek_executable
+            or settings_string(vscode_settings, "kanban.deepseekExecutable")
+            or "deepcode"
+        )
+        opencode_executable = (
+            args.opencode_executable
+            or settings_string(vscode_settings, "kanban.opencodeExecutable")
+            or "opencode"
+        )
+        default_models = parse_default_model_settings(
+            settings_object(vscode_settings, "kanban.defaultModels"),
+            "kanban.defaultModels",
+        )
+        default_models.update(read_board_default_models(root_path))
 
         return OrchestratorSettings(
             root_path=root_path,
@@ -186,9 +218,12 @@ class OrchestratorSettings:
             run_once=bool(args.once),
             codex_mode=parse_codex_mode(args.codex_mode),
             default_agent=parse_default_agent(default_agent_value),
+            default_models=default_models,
             codex_executable=codex_executable.strip() or "codex",
             claude_executable=claude_executable.strip() or "claude",
             kimi_executable=kimi_executable.strip() or "kimi",
+            deepseek_executable=deepseek_executable.strip() or "deepcode",
+            opencode_executable=opencode_executable.strip() or "opencode",
         )
 
 
@@ -200,9 +235,12 @@ def load_vscode_kanban_settings(root_path: str, invocation_directory: str) -> di
             continue
         for key in [
             "kanban.defaultAgent",
+            "kanban.defaultModels",
             "kanban.codexExecutable",
             "kanban.claudeExecutable",
             "kanban.kimiExecutable",
+            "kanban.deepseekExecutable",
+            "kanban.opencodeExecutable",
         ]:
             if key in data:
                 merged[key] = data[key]
@@ -332,6 +370,11 @@ def settings_string(settings: dict[str, object], key: str) -> str | None:
     return stripped if stripped else None
 
 
+def settings_object(settings: dict[str, object], key: str) -> dict[str, object] | None:
+    value = settings.get(key)
+    return value if isinstance(value, dict) else None
+
+
 class BoardPaths:
     def __init__(self, root: str) -> None:
         self.root = os.path.abspath(root)
@@ -394,7 +437,17 @@ class LogSink:
         timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] {level} {message}"
         with self._lock:
-            print(line, flush=True)
+            try:
+                print(line, flush=True)
+            except UnicodeEncodeError:
+                encoding = getattr(sys.stdout, "encoding", None) or ENCODING
+                try:
+                    sys.stdout.buffer.write(
+                        (line + "\n").encode(encoding, errors="replace")
+                    )
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             with open(self.path, "a", encoding=ENCODING, newline="") as handle:
                 handle.write(line + "\n")
 
@@ -415,6 +468,7 @@ class TaskOrchestrator:
         self.stop_event = threading.Event()
         self.signal_event = threading.Event()
         self.last_repository_sweep = 0.0
+        self.requeued_done_comment_fingerprints: dict[str, str] = {}
         self.agent_resolver = AgentResolver(settings, self.log)
         self.agent_threads: list[threading.Thread] = []
 
@@ -433,12 +487,24 @@ class TaskOrchestrator:
             self.log.info(f"Board root: {self.paths.root}")
             self.log.info(f"Codex mode: {self.settings.codex_mode.value}")
             self.log.info(
-                "Default agent: "
-                + (self.settings.default_agent.value if self.settings.default_agent else "auto")
+                f"Default agent: {format_default_agent(self.settings.default_agent)}"
             )
             self.log.info(f"Codex executable: {self.settings.codex_executable}")
             self.log.info(f"Claude executable: {self.settings.claude_executable}")
             self.log.info(f"Kimi executable: {self.settings.kimi_executable}")
+            self.log.info(f"DeepSeek executable: {self.settings.deepseek_executable}")
+            self.log.info(f"opencode executable: {self.settings.opencode_executable}")
+            if self.settings.default_models:
+                self.log.info(
+            "Default models: "
+            + ", ".join(
+                f"{kind.value}={model.raw}"
+                        for kind, model in sorted(
+                            self.settings.default_models.items(),
+                            key=lambda item: item[0].value,
+                        )
+                    )
+                )
             self.log.info(f"Max agents: {self.settings.max_agents}")
 
             if self.settings.run_once:
@@ -446,7 +512,8 @@ class TaskOrchestrator:
                 self._join_agent_threads()
                 return
 
-            self.status_server.start()
+            if not self.status_server.start():
+                return
             self.signal_scan()
             self.log.info("Watching for task and project map changes. Press Ctrl+C to stop.")
             self.scan_loop()
@@ -495,6 +562,13 @@ class TaskOrchestrator:
 
                 card = self.try_load_task_card(task_path, TaskStep.BACKLOG)
                 if card is None:
+                    continue
+
+                try:
+                    if self.agent_resolver.should_manage_manually(card):
+                        continue
+                except ValueError as exc:
+                    self.block_task_for_issue(card, str(exc))
                     continue
 
                 if not card.project_alias.strip():
@@ -707,6 +781,17 @@ class TaskOrchestrator:
             card = self.try_load_task_card(task_path, TaskStep.DONE)
             if not card or not card.has_meaningful_comments:
                 continue
+            normalized_task_path = normalize_path(task_path)
+            comments_fingerprint = card.comments_fingerprint
+            if (
+                self.requeued_done_comment_fingerprints.get(normalized_task_path)
+                == comments_fingerprint
+            ):
+                self.log.info(
+                    f"Done task still has unchanged Comments after requeue, leaving it done: {task_path}"
+                )
+                continue
+            self.requeued_done_comment_fingerprints[normalized_task_path] = comments_fingerprint
             backlog_path = self.move_task(card, TaskStep.BACKLOG)
             self.log.info(f"Requeued done task because Comments is non-empty: {backlog_path}")
             self.signal_scan()
@@ -721,18 +806,38 @@ class TaskOrchestrator:
     def start_or_resume_task(
         self, backlog_card: "TaskCard", assignment: ProjectAssignment
     ) -> None:
+        if self.stop_event.is_set():
+            return
         try:
             self.log.info(
                 f"Provisioning repository for task before moving it to doing: {backlog_card.path}"
             )
             repo_path = self.ensure_working_repository(backlog_card, assignment)
+        except ShutdownRequested:
+            self.log.info(
+                f"Shutdown requested; leaving task in backlog after interrupted provisioning: {backlog_card.path}"
+            )
+            return
         except Exception as exc:
             self.log.error(f"Repository provisioning failed for `{backlog_card.path}`: {exc}")
             self.block_task_for_issue(backlog_card, f"Repository provisioning failed: {exc}")
             return
 
+        if self.stop_event.is_set():
+            self.log.info(
+                f"Shutdown requested; leaving task in backlog after repository provisioning: {backlog_card.path}"
+            )
+            return
+
         doing_path = self.move_task(backlog_card, TaskStep.DOING)
         doing_card = TaskCard.load(doing_path, TaskStep.DOING, self.paths)
+        if self.stop_event.is_set():
+            restored_path = self.move_task(doing_card, TaskStep.BACKLOG)
+            self.log.info(
+                f"Shutdown requested after moving task to doing; restored task to backlog: {restored_path}"
+            )
+            return
+
         doing_card = doing_card.with_updated_repo_path(repo_path)
 
         try:
@@ -811,13 +916,13 @@ class TaskOrchestrator:
                     )
                     try:
                         self.workspace_mover.move_directory(recorded_path, restored_path)
-                        GitCli.refresh(restored_path, self.log)
+                        GitCli.refresh(restored_path, self.log, self.stop_event)
                         return restored_path
                     except (OSError, shutil.Error) as exc:
                         self.log.warn(
                             f"Skipped recorded cached repo because it is locked or inaccessible: {recorded_path} -> {restored_path}. {exc}"
                         )
-                GitCli.refresh(recorded_path, self.log)
+                GitCli.refresh(recorded_path, self.log, self.stop_event)
                 return recorded_path
 
         if assignment.uses_blank_workspace:
@@ -838,7 +943,7 @@ class TaskOrchestrator:
                 )
                 try:
                     self.workspace_mover.move_directory(reusable_repo, restored_path)
-                    GitCli.refresh(restored_path, self.log)
+                    GitCli.refresh(restored_path, self.log, self.stop_event)
                     return restored_path
                 except (OSError, shutil.Error) as exc:
                     skipped_cache_count += 1
@@ -853,7 +958,7 @@ class TaskOrchestrator:
         os.makedirs(repo_base_dir, exist_ok=True)
         repo_path = make_unique_directory_path(repo_base_dir, preferred_repo_folder_name)
         self.log.info(f"Cloning fresh repository for task `{card.path}` into `{repo_path}`.")
-        GitCli.clone(assignment.repo_url or "", repo_path, self.log)
+        GitCli.clone(assignment.repo_url or "", repo_path, self.log, self.stop_event)
         return repo_path
 
     def enumerate_reusable_cache_repositories(self, cache_project_dir: str) -> list[str]:
@@ -890,12 +995,19 @@ class TaskOrchestrator:
             done_path = self.move_task(card, TaskStep.DONE)
             self.log.info(f"Task completed: {done_path}")
             self.notifications.show("Task complete", os.path.basename(done_path), done_path)
-            self.trash_completed_blank_workspace(
-                TaskCard.load(done_path, TaskStep.DONE, self.paths)
-            )
+            done_card = self.try_load_task_card(done_path, TaskStep.DONE)
+            if done_card:
+                self.trash_completed_blank_workspace(done_card)
             return
 
         if status == AgentOutcome.BLOCKED:
+            blocked_summary = PromptFactory.parse_summary(result.final_agent_message)
+            if blocked_summary:
+                reloaded = TaskCard.load(card.path, TaskStep.DOING, self.paths)
+                if not reloaded.has_meaningful_comments:
+                    card = reloaded.append_comment_topic(
+                        f"[{agent_kind.value}] {blocked_summary}"
+                    )
             blocked_path = self.move_task(card, TaskStep.BLOCKED)
             self.log.info(f"Task blocked: {blocked_path}")
             self.notifications.show("Task blocked", os.path.basename(blocked_path), blocked_path)
@@ -1093,18 +1205,41 @@ class WorkspaceMoveBridge:
                 f"Moved {entry_type} via VS Code extension: `{source_path}` -> `{destination_path}`"
             )
             return
-        if result == "asked" and not exists(source_path) and exists(destination_path):
+        if result == "asked" and self._wait_for_move_completion(
+            source_path, destination_path, exists
+        ):
             self.log.info(
                 f"Moved {entry_type} via VS Code extension (verified): `{source_path}` -> `{destination_path}`"
             )
             return
 
         os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-        shutil.move(source_path, destination_path)
+        try:
+            shutil.move(source_path, destination_path)
+        except (OSError, shutil.Error):
+            if result == "asked" and not exists(source_path) and exists(destination_path):
+                self.log.info(
+                    f"Moved {entry_type} via VS Code extension (late verified): `{source_path}` -> `{destination_path}`"
+                )
+                return
+            raise
         fallback_reason = "extension asked, no successful response" if result == "asked" else "extension not reached"
         self.log.info(
             f"Moved {entry_type} via direct filesystem move ({fallback_reason}): `{source_path}` -> `{destination_path}`"
         )
+
+    def _wait_for_move_completion(
+        self,
+        source_path: str,
+        destination_path: str,
+        exists: Callable[[str], bool],
+    ) -> bool:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if not exists(source_path) and exists(destination_path):
+                return True
+            time.sleep(0.05)
+        return not exists(source_path) and exists(destination_path)
 
     def _try_move_via_extension(
         self, source_path: str, destination_path: str, entry_type: str
@@ -1185,13 +1320,16 @@ class RunnerStatusServer:
         self.thread: threading.Thread | None = None
         self.port = 0
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self.socket is not None:
-            return
+            return True
         for port in candidate_status_ports(self.root_path):
             try:
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+                else:
+                    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 listener.bind(("127.0.0.1", port))
                 listener.listen()
                 listener.settimeout(0.5)
@@ -1200,13 +1338,43 @@ class RunnerStatusServer:
                 self.thread = threading.Thread(target=self._accept_loop, daemon=True)
                 self.thread.start()
                 self.log.info(f"Runner status endpoint listening on 127.0.0.1:{port}")
-                return
+                return True
             except OSError:
+                existing = self._read_existing_status(port)
+                if (
+                    existing
+                    and existing.get("kind") == "kanban-runner-status"
+                    and existing.get("normalizedRootPath") == self.normalized_root_path
+                ):
+                    existing_pid = existing.get("processId")
+                    self.log.warn(
+                        f"Runner for `{self.root_path}` is already listening on 127.0.0.1:{port}"
+                        + (f" (pid {existing_pid})" if existing_pid else "")
+                        + "; exiting duplicate runner."
+                    )
+                    return False
                 try:
                     listener.close()
                 except Exception:
                     pass
         self.log.warn("Failed to start runner status endpoint; all candidate localhost ports are in use.")
+        return True
+
+    def _read_existing_status(self, port: int) -> dict[str, object] | None:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.25) as client:
+                client.settimeout(0.5)
+                data = client.recv(4096).decode(ENCODING, "replace").strip()
+        except OSError:
+            return None
+        if not data:
+            return None
+        line = data.splitlines()[0]
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1254,11 +1422,40 @@ class AgentResolver:
         self.log = log
         self._auto_agent: AgentKind | None = None
 
+    def should_manage_manually(self, card: "TaskCard") -> bool:
+        if has_manual_agent_tag(card.tags):
+            return True
+        if self.settings.default_agent != MANUAL_AGENT_VALUE:
+            return False
+        if card.agent_id:
+            return False
+        if agent_kind_from_value(card.agent_kind_value):
+            return False
+        if agent_kind_from_tags(card.tags):
+            return False
+        model_spec = card.model_spec
+        return not bool(model_spec and model_spec.agent_kind)
+
     def select_agent_kind(self, card: "TaskCard") -> AgentKind:
+        if has_manual_agent_tag(card.tags):
+            raise ValueError(
+                "Task is tagged manual/human, so it is user-managed and should not be assigned to an agent."
+            )
         stored_agent = agent_kind_from_value(card.agent_kind_value)
         id_agent = agent_kind_from_agent_id(card.agent_id)
         if card.agent_id:
-            resume_agent = id_agent or stored_agent
+            if id_agent in {AgentKind.CODEX, AgentKind.KIMI, AgentKind.OPENCODE}:
+                resume_agent = id_agent
+            elif stored_agent:
+                resume_agent = stored_agent
+            elif (
+                id_agent == AgentKind.CLAUDE
+                and card.repo_path
+                and DeepCodeSessions.session_file(card.repo_path, card.agent_id)
+            ):
+                resume_agent = AgentKind.DEEPSEEK
+            else:
+                resume_agent = id_agent
             if resume_agent:
                 self.ensure_agent_available(resume_agent)
                 return resume_agent
@@ -1280,6 +1477,10 @@ class AgentResolver:
                 f"Task `{card.path}` selected agent from Model: {model_spec.agent_kind.value}"
             )
             return model_spec.agent_kind
+        if self.settings.default_agent == MANUAL_AGENT_VALUE:
+            raise ValueError(
+                "Default agent is manual. Add an agent tag or an agent-prefixed Model: value to let the runner manage this task."
+            )
         if self.settings.default_agent:
             self.ensure_agent_available(self.settings.default_agent)
             return self.settings.default_agent
@@ -1300,13 +1501,19 @@ class AgentResolver:
     def detect_default_agent(self) -> AgentKind:
         if self._auto_agent:
             return self._auto_agent
-        for kind in [AgentKind.CLAUDE, AgentKind.CODEX, AgentKind.KIMI]:
+        for kind in [
+            AgentKind.CLAUDE,
+            AgentKind.CODEX,
+            AgentKind.OPENCODE,
+            AgentKind.KIMI,
+            AgentKind.DEEPSEEK,
+        ]:
             if self.is_agent_available(kind):
                 self._auto_agent = kind
                 self.log.info(f"Auto-detected default agent: {kind.value}")
                 return kind
         raise FileNotFoundError(
-            "No supported agent executable was found. Install Claude Code, Codex, or Kimi CLI, or configure `kanban.defaultAgent` and the matching executable setting."
+            "No supported agent executable was found. Install Claude Code, Codex, opencode, Kimi CLI, or Deep Code, or configure `kanban.defaultAgent` and the matching executable setting."
         )
 
     def ensure_agent_available(self, kind: AgentKind) -> None:
@@ -1328,6 +1535,10 @@ class AgentResolver:
             return self.settings.claude_executable
         if kind == AgentKind.KIMI:
             return self.settings.kimi_executable
+        if kind == AgentKind.DEEPSEEK:
+            return self.settings.deepseek_executable
+        if kind == AgentKind.OPENCODE:
+            return self.settings.opencode_executable
         return self.settings.codex_executable
 
 
@@ -1345,6 +1556,10 @@ class AgentRunner:
             return ClaudeRunner(settings, paths, log)
         if kind == AgentKind.KIMI:
             return KimiRunner(settings, paths, log)
+        if kind == AgentKind.DEEPSEEK:
+            return DeepSeekRunner(settings, paths, log)
+        if kind == AgentKind.OPENCODE:
+            return OpencodeRunner(settings, paths, log)
         return CodexRunner(settings, paths, log)
 
     def run(
@@ -1355,6 +1570,11 @@ class AgentRunner:
         on_session_started: Callable[[str], None] | None,
     ) -> AgentRunResult:
         raise NotImplementedError
+
+    def model_spec_for(self, card: "TaskCard", agent_kind: AgentKind) -> ModelSpec | None:
+        if card.agent_id:
+            return None
+        return card.model_spec or self.settings.default_models.get(agent_kind)
 
     def _run_process(
         self,
@@ -1368,6 +1588,7 @@ class AgentRunner:
         redacted_arg_indexes: set[int] | None = None,
         discover_session_id: Callable[[], str | None] | None = None,
         session_discovery_timeout_seconds: float = 30.0,
+        env_overrides: dict[str, str] | None = None,
     ) -> AgentRunResult:
         redacted = redacted_arg_indexes or set()
         log_args = [
@@ -1378,6 +1599,7 @@ class AgentRunner:
         process = subprocess.Popen(
             args,
             cwd=repo_path,
+            env={**os.environ, **env_overrides} if env_overrides else None,
             stdin=subprocess.PIPE if write_prompt_to_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1442,6 +1664,17 @@ class AgentRunner:
                     report_session_id(session_id)
                     return
                 discovery_stop.wait(0.5)
+            if (
+                discover_session_id
+                and not discovery_stop.is_set()
+                and not state.get("session_id")
+                and process.poll() is None
+            ):
+                self.log.warn(
+                    f"{label} did not report a session id within "
+                    f"{session_discovery_timeout_seconds:g} seconds; terminating it so the task can be retried."
+                )
+                terminate_process_tree(process.pid)
 
         stdout_thread = threading.Thread(target=read_stdout)
         stderr_thread = threading.Thread(target=read_stderr)
@@ -1485,7 +1718,7 @@ class CodexRunner(AgentRunner):
         executable = ToolPaths.resolve_executable(
             self.settings.codex_executable, AgentKind.CODEX
         )
-        model_spec = None if card.agent_id else card.model_spec
+        model_spec = self.model_spec_for(card, AgentKind.CODEX)
         if card.agent_id:
             args = [
                 executable,
@@ -1525,7 +1758,7 @@ class ClaudeRunner(AgentRunner):
         executable = ToolPaths.resolve_executable(
             self.settings.claude_executable, AgentKind.CLAUDE
         )
-        model_spec = None if card.agent_id else card.model_spec
+        model_spec = self.model_spec_for(card, AgentKind.CLAUDE)
         args = [
             executable,
             "--print",
@@ -1557,8 +1790,10 @@ class KimiRunner(AgentRunner):
         executable = ToolPaths.resolve_executable(
             self.settings.kimi_executable, AgentKind.KIMI
         )
-        model_spec = None if card.agent_id else card.model_spec
+        model_spec = self.model_spec_for(card, AgentKind.KIMI)
         existing_session_ids = KimiSessions.session_ids_for_workdir(repo_path)
+        self.ensure_kimi_workspace_trusted(repo_path)
+        self.ensure_kimi_workspace_trusted(self.paths.root)
         args = [
             executable,
             *kimi_model_arguments(model_spec),
@@ -1587,6 +1822,341 @@ class KimiRunner(AgentRunner):
                     repo_path, existing_session_ids
                 )
             ),
+            env_overrides=kimi_environment(model_spec),
+        )
+
+    def ensure_kimi_workspace_trusted(self, work_dir: str) -> None:
+        try:
+            trust_kimi_workspace(work_dir)
+        except OSError as exc:
+            self.log.warn(f"Could not pre-trust Kimi workspace `{work_dir}`: {exc}")
+
+
+class OpencodeRunner(AgentRunner):
+    def run(
+        self,
+        card: "TaskCard",
+        repo_path: str,
+        prompt: str,
+        on_session_started: Callable[[str], None] | None,
+    ) -> AgentRunResult:
+        executable = ToolPaths.resolve_executable(
+            self.settings.opencode_executable, AgentKind.OPENCODE
+        )
+        model_spec = card.model_spec or (
+            None if card.agent_id else self.settings.default_models.get(AgentKind.OPENCODE)
+        )
+        existing_session_ids = OpencodeSessions.session_ids_for_workdir(
+            executable, repo_path
+        )
+        prompt_file = os.path.join(
+            repo_path, f".kanban-runner-prompt-{hash_path(card.path)}.md"
+        )
+        write_text(prompt_file, prompt)
+        exclude_local_git_path(repo_path, ".kanban-runner-prompt-*.md")
+        prompt_arg = (
+            f"Read and follow the attached runner prompt file `{prompt_file}`. "
+            "It contains the kanban task file content, board root, repository path, README, and context. "
+            "Do not ask what the task is or where runner.py, the board, task file, or repository are; read that file first. "
+            "Do not modify the prompt file."
+        )
+        args = [
+            executable,
+            "run",
+            "--format",
+            "json",
+            "--dir",
+            repo_path,
+            "-f",
+            prompt_file,
+            *opencode_model_arguments(model_spec),
+            *opencode_permission_arguments(self.settings.codex_mode),
+        ]
+        if card.agent_id:
+            args.extend(["--session", card.agent_id])
+        else:
+            args.extend(["--title", task_title(card)])
+        args.append(prompt_arg)
+        try:
+            result = self._run_process(
+                args,
+                repo_path,
+                prompt_arg,
+                parse_opencode_json_line,
+                "opencode",
+                on_session_started,
+                write_prompt_to_stdin=False,
+                redacted_arg_indexes={args.index(prompt_arg)},
+                discover_session_id=(
+                    None
+                    if card.agent_id
+                    else lambda: OpencodeSessions.find_new_session_id_for_workdir(
+                        executable, repo_path, existing_session_ids
+                    )
+                ),
+            )
+        finally:
+            try:
+                os.remove(prompt_file)
+            except OSError:
+                pass
+        if result.final_agent_message:
+            return result
+
+        session_id = result.session_id or card.agent_id
+        final_message = OpencodeSessions.final_assistant_message(executable, session_id)
+        if not final_message:
+            return result
+        return AgentRunResult(
+            result.exit_code,
+            result.session_id,
+            final_message,
+            result.stdout_lines,
+            result.stderr_lines,
+        )
+
+
+class DeepSeekRunner(AgentRunner):
+    def run(
+        self,
+        card: "TaskCard",
+        repo_path: str,
+        prompt: str,
+        on_session_started: Callable[[str], None] | None,
+    ) -> AgentRunResult:
+        executable = ToolPaths.resolve_executable(
+            self.settings.deepseek_executable, AgentKind.DEEPSEEK
+        )
+        model_spec = self.model_spec_for(card, AgentKind.DEEPSEEK)
+        existing_session_ids = DeepCodeSessions.session_ids_for_workdir(repo_path)
+        prompt_file = os.path.join(
+            repo_path, f".kanban-runner-prompt-{hash_path(card.path)}.md"
+        )
+        write_text(prompt_file, prompt)
+        exclude_local_git_path(repo_path, ".kanban-runner-prompt-*.md")
+        prompt_arg = (
+            f"Read and follow the full runner prompt in `{prompt_file}`. "
+            "It contains the kanban task file content, board root, repository path, README, and context. "
+            "Do not ask what the task is or where runner.py, the board, task file, or repository are; read that file first. "
+            "Do not modify the prompt file."
+        )
+        if card.agent_id:
+            args = [executable, "--resume", card.agent_id, "-p", prompt_arg]
+        else:
+            args = [executable, "-p", prompt_arg]
+        try:
+            result = self._run_deepcode_pty_process(
+                args,
+                repo_path,
+                prompt_arg,
+                parse_deepcode_line,
+                "DeepSeek",
+                on_session_started,
+                redacted_arg_indexes={args.index(prompt_arg)},
+                discover_session_id=(
+                    None
+                    if card.agent_id
+                    else lambda: DeepCodeSessions.find_new_session_id_for_workdir(
+                        repo_path, existing_session_ids
+                    )
+                ),
+                env_overrides=deepseek_model_environment(model_spec),
+                initial_session_id=card.agent_id or "",
+            )
+        finally:
+            try:
+                os.remove(prompt_file)
+            except OSError:
+                pass
+        if result.final_agent_message:
+            return result
+
+        session_id = result.session_id or card.agent_id
+        final_message = DeepCodeSessions.final_assistant_message(repo_path, session_id)
+        if not final_message:
+            return result
+        return AgentRunResult(
+            result.exit_code,
+            result.session_id,
+            final_message,
+            result.stdout_lines,
+            result.stderr_lines,
+        )
+
+    def _run_deepcode_pty_process(
+        self,
+        args: list[str],
+        repo_path: str,
+        prompt: str,
+        parse_line: Callable[[str, dict[str, str]], None],
+        label: str,
+        on_session_started: Callable[[str], None] | None,
+        redacted_arg_indexes: set[int] | None = None,
+        discover_session_id: Callable[[], str | None] | None = None,
+        env_overrides: dict[str, str] | None = None,
+        initial_session_id: str = "",
+    ) -> AgentRunResult:
+        if not IS_WINDOWS:
+            raise RuntimeError("Deep Code runner support currently requires Windows pywinpty.")
+        try:
+            from winpty import PtyProcess
+        except ImportError as exc:
+            raise RuntimeError(
+                "Deep Code requires a TTY. Install pywinpty for runner support: python -m pip install pywinpty"
+            ) from exc
+
+        redacted = redacted_arg_indexes or set()
+        log_args = [
+            "<prompt>" if index in redacted else arg
+            for index, arg in enumerate(args)
+        ]
+        self.log.info(f"Starting {label}: {' '.join(quote_arg(arg) for arg in log_args)}")
+        env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
+
+        process = PtyProcess.spawn(args, cwd=repo_path, env=env, dimensions=(40, 140))
+        stdout_lines: list[str] = []
+        stderr_lines: list[str] = []
+        state = {"session_id": initial_session_id, "final_agent_message": ""}
+        session_reported = False
+        session_lock = threading.Lock()
+        output_lock = threading.Lock()
+        stop_reader = threading.Event()
+
+        def report_session_id(session_id: str) -> None:
+            nonlocal session_reported
+            if not session_id:
+                return
+            with session_lock:
+                if not state.get("session_id"):
+                    state["session_id"] = session_id
+                if session_reported:
+                    return
+                session_reported = True
+            if on_session_started:
+                on_session_started(session_id)
+
+        if initial_session_id:
+            report_session_id(initial_session_id)
+
+        def read_pty_output() -> None:
+            pending = ""
+            while process.isalive() and not stop_reader.is_set():
+                try:
+                    chunk = process.read(4096)
+                except Exception as exc:
+                    if process.isalive() and not stop_reader.is_set():
+                        stderr_lines.append(str(exc))
+                    break
+                if not chunk:
+                    continue
+                text = strip_ansi(chunk).replace("\r", "\n")
+                pending += text
+                parts = pending.split("\n")
+                pending = parts.pop() if parts else ""
+                with output_lock:
+                    for raw_line in parts:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        stdout_lines.append(line)
+            if pending.strip():
+                line = pending.strip()
+                with output_lock:
+                    stdout_lines.append(line)
+
+        output_thread = threading.Thread(
+            target=read_pty_output,
+            name=f"{label}-pty-output",
+            daemon=True,
+        )
+        output_thread.start()
+
+        completed = False
+        completed_with_status = False
+        failed = False
+        try:
+            while process.isalive():
+                if discover_session_id and not state.get("session_id"):
+                    report_session_id(discover_session_id() or "")
+                session_id = state.get("session_id", "")
+                if session_id:
+                    final_message = DeepCodeSessions.final_assistant_record_message(
+                        repo_path, session_id
+                    )
+                    if final_message:
+                        state["final_agent_message"] = final_message
+                    session_status = DeepCodeSessions.session_status(repo_path, session_id)
+                    if session_status in {"completed", "failed", "interrupted"}:
+                        completed = True
+                        failed = session_status == "failed"
+                    elif session_status == "waiting_for_user":
+                        questions = DeepCodeSessions.pending_user_questions(
+                            repo_path, session_id
+                        )
+                        question_summary = "; ".join(questions)
+                        if not question_summary:
+                            question_summary = "Deep Code asked for user input."
+                        state["final_agent_message"] = (
+                            "ORCHESTRATOR_STATUS: BLOCKED\n"
+                            f"ORCHESTRATOR_SUMMARY: Deep Code asked for user input: {question_summary}"
+                        )
+                        completed = True
+                        completed_with_status = True
+                        self.log.warn(
+                            f"{label} entered waiting_for_user: {question_summary}"
+                        )
+                        break
+                parsed_status = PromptFactory.parse_status(
+                    state.get("final_agent_message", "")
+                )
+                if session_id and parsed_status != AgentOutcome.UNKNOWN:
+                    completed = True
+                    completed_with_status = True
+                    self.log.info(
+                        f"{label} wrote a parseable orchestrator status; terminating Deep Code TUI."
+                    )
+                    break
+                if completed:
+                    self.log.info(
+                        f"{label} session reached terminal state; terminating Deep Code TUI."
+                    )
+                    break
+                time.sleep(0.5)
+        finally:
+            if completed and process.isalive():
+                try:
+                    process.terminate(force=True)
+                except Exception as exc:
+                    stderr_lines.append(f"Failed to terminate Deep Code PTY: {exc}")
+            stop_reader.set()
+
+        if process.isalive():
+            try:
+                exit_code = process.wait()
+            except Exception:
+                exit_code = process.exitstatus
+        else:
+            exit_code = process.exitstatus
+            if exit_code is None:
+                try:
+                    exit_code = process.wait()
+                except Exception:
+                    exit_code = 0 if completed_with_status else 1
+        output_thread.join(timeout=2)
+
+        for line in stdout_lines[-10:]:
+            self.log.info(f"{label} stdout: {line}")
+        for line in stderr_lines:
+            self.log.warn(f"{label} stderr: {line}")
+
+        return AgentRunResult(
+            0 if completed and not failed else int(exit_code or 0),
+            state.get("session_id", ""),
+            state.get("final_agent_message", ""),
+            stdout_lines,
+            stderr_lines,
         )
 
 
@@ -1694,8 +2264,19 @@ class TaskCard:
         return has_meaningful_body(self.comments_body)
 
     @property
+    def comments_fingerprint(self) -> str:
+        normalized_comments = normalize_comment_body(self.comments_body)
+        return hashlib.sha256(
+            normalized_comments.encode(ENCODING, errors="replace")
+        ).hexdigest()
+
+    @property
     def is_confirmed(self) -> bool:
         return self.step == TaskStep.CONFIRMED
+
+    @property
+    def is_manual(self) -> bool:
+        return has_manual_agent_tag(self.tags)
 
     @staticmethod
     def load(path: str, step: TaskStep, paths: BoardPaths) -> "TaskCard":
@@ -1723,11 +2304,19 @@ class TaskCard:
     def get_section_body(self, heading: str, level: int = 2) -> str:
         return get_section_body(self.content, heading, level)
 
+    def current_template_content(self) -> str:
+        try:
+            return ensure_task_template(read_text(self.path))
+        except OSError:
+            return ensure_task_template(self.content)
+
     def with_updated_agent_id(
         self, agent_id: str, agent_kind: AgentKind | None = None
     ) -> "TaskCard":
-        updated = ensure_task_template(self.content)
+        updated = self.current_template_content()
         updated = set_metadata_value(updated, "Agent", agent_id)
+        if agent_kind == AgentKind.DEEPSEEK:
+            updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
@@ -1735,19 +2324,19 @@ class TaskCard:
         return self
 
     def with_updated_project_alias(self, project_alias: str) -> "TaskCard":
-        updated = ensure_task_template(self.content)
+        updated = self.current_template_content()
         updated = set_metadata_value(updated, "Project", project_alias)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
     def with_updated_repo_path(self, repo_path: str) -> "TaskCard":
-        updated = ensure_task_template(self.content)
+        updated = self.current_template_content()
         updated = set_metadata_value(updated, "Repo", repo_path)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
 
     def append_comment_topic(self, note: str) -> "TaskCard":
-        updated = ensure_task_template(self.content)
+        updated = self.current_template_content()
         existing = get_section_body(updated, "Comments")
         topic = format_comment_topic(note)
         new_comments = topic if not existing.strip() else existing.rstrip() + "\n===\n" + topic
@@ -1759,8 +2348,19 @@ class TaskCard:
         write_text(self.path, content)
 
 
+def read_prompt_file_excerpt(path: str, max_chars: int) -> str:
+    try:
+        content = read_text(path)
+    except Exception as exc:
+        return f"(Could not read `{path}` before launch: {exc})"
+    if len(content) <= max_chars:
+        return content
+    return content[:max_chars].rstrip() + "\n\n[runner.py truncated this file excerpt]"
+
+
 class PromptFactory:
     status_regex = re.compile(r"^ORCHESTRATOR_STATUS:\s*(BLOCKED|DONE)\s*$", re.I | re.M)
+    summary_regex = re.compile(r"^ORCHESTRATOR_SUMMARY:\s*(.+?)\s*$", re.I | re.M)
 
     @staticmethod
     def build(
@@ -1777,6 +2377,9 @@ class PromptFactory:
         )
         readme_path = os.path.join(board_root, "README.md")
         context_path = os.path.join(board_root, "context.md")
+        task_content = read_prompt_file_excerpt(task_path, 30_000)
+        readme_content = read_prompt_file_excerpt(readme_path, 12_000)
+        context_content = read_prompt_file_excerpt(context_path, 12_000)
         return f"""You are handling a kanban task for a local `runner.py` board.
 
 Agent kind: {agent_kind.value}
@@ -1792,9 +2395,31 @@ Requirements:
 - Follow `{{working directory}}/context.md` for task-card conventions, question formatting, and report handling.
 - Work only inside the repository path and the task file.
 - If the repository path is not a Git repository, treat it as an empty task workspace.
+- If the repository workspace is empty, that is expected for blank tasks and is not a reason to ask a question.
 - Do not change `Project:`, `Model:`, `Agent:`, or `Repo:` lines.
 - Keep `## Comments` and `### Report` aligned with the current state.
 - Do not move the task file between folders; `runner.py` does that.
+- Do not ask where the board, runner, task file, repository, README, or context file is; those exact paths are listed above.
+- Do not use AskUserQuestion for information that is already present in the task file, board README, shared context, or the paths above.
+- If task-specific information is truly missing and you cannot continue, write the missing question in `## Comments` and finish with `ORCHESTRATOR_STATUS: BLOCKED`.
+
+The current task file content is included here so you do not need to ask what the task is:
+
+--- BEGIN TASK FILE ---
+{task_content}
+--- END TASK FILE ---
+
+The board README content is included here:
+
+--- BEGIN BOARD README ---
+{readme_content}
+--- END BOARD README ---
+
+The shared context content is included here:
+
+--- BEGIN SHARED CONTEXT ---
+{context_content}
+--- END SHARED CONTEXT ---
 
 Lifecycle instruction:
 - {action}
@@ -1822,35 +2447,114 @@ The final status block must be present exactly once.
             return AgentOutcome.DONE
         return AgentOutcome.UNKNOWN
 
+    @staticmethod
+    def parse_summary(message: str) -> str:
+        match = PromptFactory.summary_regex.search(message)
+        return match.group(1).strip() if match else ""
+
 
 class GitCli:
     @staticmethod
-    def clone(repo_url: str, destination: str, log: LogSink) -> None:
+    def clone(
+        repo_url: str,
+        destination: str,
+        log: LogSink,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         os.makedirs(os.path.dirname(destination), exist_ok=True)
-        GitCli._run(["clone", repo_url, destination], log)
+        GitCli._run(["clone", repo_url, destination], log, stop_event=stop_event)
 
     @staticmethod
-    def refresh(repo_path: str, log: LogSink) -> None:
+    def refresh(
+        repo_path: str,
+        log: LogSink,
+        stop_event: threading.Event | None = None,
+    ) -> None:
         if not os.path.isdir(os.path.join(repo_path, ".git")):
             return
-        GitCli._run(["-C", repo_path, "fetch", "--all", "--prune"], log, tolerate_failure=True)
-        GitCli._run(["-C", repo_path, "pull", "--ff-only"], log, tolerate_failure=True)
+        GitCli._run(
+            ["-C", repo_path, "fetch", "--all", "--prune"],
+            log,
+            tolerate_failure=True,
+            stop_event=stop_event,
+        )
+        if stop_event is not None and stop_event.is_set():
+            raise ShutdownRequested("shutdown requested during git refresh")
+        GitCli._run(
+            ["-C", repo_path, "pull", "--ff-only"],
+            log,
+            tolerate_failure=True,
+            stop_event=stop_event,
+        )
 
     @staticmethod
-    def _run(arguments: list[str], log: LogSink, tolerate_failure: bool = False) -> None:
-        process = subprocess.run(
-            ["git", *arguments],
+    def _run(
+        arguments: list[str],
+        log: LogSink,
+        tolerate_failure: bool = False,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise ShutdownRequested("shutdown requested before git command")
+
+        command = ["git", *arguments]
+        git_env = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+        }
+        process = subprocess.Popen(
+            command,
+            env=git_env,
             text=True,
             encoding=ENCODING,
             errors="replace",
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-        if process.stdout.strip():
-            log.info(process.stdout.strip())
-        if process.stderr.strip():
-            log.warn(process.stderr.strip())
+        deadline = time.monotonic() + GIT_COMMAND_TIMEOUT_SECONDS
+        while process.poll() is None:
+            if stop_event is not None and stop_event.is_set():
+                terminate_process_tree(process.pid)
+                stdout, stderr = GitCli._communicate_after_terminate(process)
+                GitCli._log_output(stdout, stderr, log)
+                log.info(
+                    f"Terminated git {' '.join(arguments)} because shutdown was requested."
+                )
+                raise ShutdownRequested("shutdown requested during git command")
+            if time.monotonic() >= deadline:
+                terminate_process_tree(process.pid)
+                stdout, stderr = GitCli._communicate_after_terminate(process)
+                GitCli._log_output(stdout, stderr, log)
+                if not tolerate_failure:
+                    raise RuntimeError(
+                        f"git {' '.join(arguments)} timed out after {GIT_COMMAND_TIMEOUT_SECONDS} seconds"
+                    )
+                log.warn(
+                    f"git {' '.join(arguments)} timed out after {GIT_COMMAND_TIMEOUT_SECONDS} seconds"
+                )
+                return
+            time.sleep(0.2)
+
+        stdout, stderr = process.communicate()
+        GitCli._log_output(stdout, stderr, log)
         if process.returncode != 0 and not tolerate_failure:
             raise RuntimeError(f"git {' '.join(arguments)} failed with exit code {process.returncode}")
+
+    @staticmethod
+    def _communicate_after_terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
+        try:
+            return process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process.pid)
+            return process.communicate()
+
+    @staticmethod
+    def _log_output(stdout: str | None, stderr: str | None, log: LogSink) -> None:
+        if stdout and stdout.strip():
+            log.info(stdout.strip())
+        if stderr and stderr.strip():
+            log.warn(stderr.strip())
 
 
 class ProjectMap(dict[str, str]):
@@ -1963,7 +2667,15 @@ Model:
 
     @staticmethod
     def create_kanban_config(folders: Iterable[KanbanFolder]) -> str:
-        lines = ["folders:"]
+        lines = [
+            "defaultModels:",
+            '  codex: ""',
+            '  claude: ""',
+            '  kimi: ""',
+            '  deepseek: ""',
+            '  opencode: ""',
+            "folders:",
+        ]
         for folder in folders:
             lines.append(f"  {folder.name}: {folder.name}")
         lines.extend([
@@ -2006,6 +2718,11 @@ class ToolPaths:
                     os.path.join(home, ".kimi-code", "bin", "kimi"),
                 ]
             )
+        if kind == AgentKind.OPENCODE and executable.lower() in {"opencode", "oc"}:
+            alternate = "opencode" if executable.lower() == "oc" else "oc"
+            found = shutil.which(alternate)
+            if found:
+                candidates.append(found)
 
         seen: set[str] = set()
         for candidate in candidates:
@@ -2079,6 +2796,245 @@ class KimiSessions:
         return entries
 
 
+class DeepCodeSessions:
+    @staticmethod
+    def project_dir(workdir: str) -> str:
+        return os.path.join(str(Path.home()), ".deepcode", "projects", deepcode_project_code(workdir))
+
+    @staticmethod
+    def index_path(workdir: str) -> str:
+        return os.path.join(DeepCodeSessions.project_dir(workdir), "sessions-index.json")
+
+    @staticmethod
+    def session_ids_for_workdir(workdir: str) -> set[str]:
+        return {
+            session_id
+            for session_id in (
+                DeepCodeSessions._session_id_for_entry(entry)
+                for entry in DeepCodeSessions._read_index(workdir)
+            )
+            if session_id
+        }
+
+    @staticmethod
+    def find_new_session_id_for_workdir(
+        workdir: str, existing_session_ids: set[str]
+    ) -> str | None:
+        for entry in reversed(DeepCodeSessions._read_index(workdir)):
+            session_id = DeepCodeSessions._session_id_for_entry(entry)
+            if session_id and session_id not in existing_session_ids:
+                return session_id
+        return None
+
+    @staticmethod
+    def session_file(workdir: str, session_id: str | None) -> str | None:
+        if not is_deepcode_session_id(session_id):
+            return None
+        path = os.path.join(DeepCodeSessions.project_dir(workdir), f"{session_id}.jsonl")
+        return path if os.path.isfile(path) else None
+
+    @staticmethod
+    def final_assistant_message(workdir: str, session_id: str | None) -> str:
+        text = DeepCodeSessions.final_assistant_record_message(workdir, session_id)
+        if text:
+            return text
+
+        for entry in reversed(DeepCodeSessions._read_index(workdir)):
+            if DeepCodeSessions._session_id_for_entry(entry) != session_id:
+                continue
+            reply = entry.get("assistantReply")
+            if isinstance(reply, str) and reply.strip():
+                return reply.strip()
+        return ""
+
+    @staticmethod
+    def final_assistant_record_message(workdir: str, session_id: str | None) -> str:
+        session_file = DeepCodeSessions.session_file(workdir, session_id)
+        if not session_file:
+            return ""
+        try:
+            with open(session_file, "r", encoding=ENCODING, errors="replace") as handle:
+                lines = [line for line in handle if line.strip()]
+            for line in reversed(lines):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                text = extract_deepcode_message_text(entry)
+                if text:
+                    return text
+        except OSError:
+            return ""
+        return ""
+
+    @staticmethod
+    def pending_user_questions(workdir: str, session_id: str | None) -> list[str]:
+        session_file = DeepCodeSessions.session_file(workdir, session_id)
+        if not session_file:
+            return []
+        try:
+            with open(session_file, "r", encoding=ENCODING, errors="replace") as handle:
+                lines = [line for line in handle if line.strip()]
+            for line in reversed(lines):
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                questions = extract_deepcode_user_questions(entry)
+                if questions:
+                    return questions
+        except OSError:
+            return []
+        return []
+
+    @staticmethod
+    def session_status(workdir: str, session_id: str | None) -> str:
+        if not session_id:
+            return ""
+        for entry in reversed(DeepCodeSessions._read_index(workdir)):
+            if DeepCodeSessions._session_id_for_entry(entry) != session_id:
+                continue
+            return str(entry.get("status") or "").strip().lower()
+        return ""
+
+    @staticmethod
+    def _session_id_for_entry(entry: dict[str, object]) -> str | None:
+        session_id = entry.get("id")
+        if not isinstance(session_id, str):
+            return None
+        session_id = session_id.strip()
+        if not is_deepcode_session_id(session_id):
+            return None
+        return session_id
+
+    @staticmethod
+    def _read_index(workdir: str) -> list[dict[str, object]]:
+        path = DeepCodeSessions.index_path(workdir)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path, "r", encoding=ENCODING, errors="replace") as handle:
+                parsed = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return []
+        entries = parsed.get("entries") if isinstance(parsed, dict) else None
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+
+class OpencodeSessions:
+    @staticmethod
+    def session_ids_for_workdir(executable: str, workdir: str) -> set[str]:
+        normalized_workdir = normalize_path(workdir)
+        return {
+            session_id
+            for session_id in (
+                OpencodeSessions._session_id_for_entry(entry, normalized_workdir)
+                for entry in OpencodeSessions._list_sessions(executable)
+            )
+            if session_id
+        }
+
+    @staticmethod
+    def find_new_session_id_for_workdir(
+        executable: str, workdir: str, existing_session_ids: set[str]
+    ) -> str | None:
+        normalized_workdir = normalize_path(workdir)
+        for entry in reversed(OpencodeSessions._list_sessions(executable)):
+            session_id = OpencodeSessions._session_id_for_entry(entry, normalized_workdir)
+            if session_id and session_id not in existing_session_ids:
+                return session_id
+        return None
+
+    @staticmethod
+    def session_directory(executable: str, session_id: str | None) -> str | None:
+        if not is_opencode_session_id(session_id):
+            return None
+        for entry in reversed(OpencodeSessions._list_sessions(executable)):
+            if str(entry.get("id") or "").strip() != session_id:
+                continue
+            directory = entry.get("directory")
+            if isinstance(directory, str) and directory.strip():
+                return directory.strip()
+        return None
+
+    @staticmethod
+    def final_assistant_message(executable: str, session_id: str | None) -> str:
+        if not is_opencode_session_id(session_id):
+            return ""
+        exported = OpencodeSessions._export_session(executable, session_id or "")
+        if not exported:
+            return ""
+        return extract_opencode_export_assistant_message(exported)
+
+    @staticmethod
+    def _session_id_for_entry(
+        entry: dict[str, object], normalized_workdir: str | None = None
+    ) -> str | None:
+        session_id = entry.get("id")
+        if not isinstance(session_id, str) or not is_opencode_session_id(session_id):
+            return None
+        if normalized_workdir is None:
+            return session_id.strip()
+        directory = entry.get("directory")
+        if not isinstance(directory, str):
+            return None
+        if normalize_path(directory) != normalized_workdir:
+            return None
+        return session_id.strip()
+
+    @staticmethod
+    def _list_sessions(executable: str) -> list[dict[str, object]]:
+        try:
+            result = subprocess.run(
+                [
+                    executable,
+                    "session",
+                    "list",
+                    "--format",
+                    "json",
+                    "--max-count",
+                    "200",
+                ],
+                text=True,
+                encoding=ENCODING,
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        parsed = parse_first_json_value(result.stdout)
+        if isinstance(parsed, list):
+            return [entry for entry in parsed if isinstance(entry, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+        return []
+
+    @staticmethod
+    def _export_session(executable: str, session_id: str) -> dict[str, object] | None:
+        try:
+            result = subprocess.run(
+                [executable, "export", session_id],
+                text=True,
+                encoding=ENCODING,
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        parsed = parse_first_json_value(result.stdout)
+        return parsed if isinstance(parsed, dict) else None
+
+
 def parse_codex_mode(value: str) -> CodexMode:
     normalized = value.strip().replace("-", "").replace("_", "").lower()
     if normalized == "dangerous":
@@ -2088,19 +3044,35 @@ def parse_codex_mode(value: str) -> CodexMode:
     raise ValueError(f"Unsupported Codex mode: {value}")
 
 
-def parse_default_agent(value: str | None) -> AgentKind | None:
+def parse_default_agent(value: str | None) -> DefaultAgentSelection:
     if value is None:
         return None
     normalized = value.strip().lower()
     if normalized in {"", "null", "none", "auto", "detect"}:
         return None
+    if normalized in {"manual", "human"}:
+        return MANUAL_AGENT_VALUE
     if normalized == "claude":
         return AgentKind.CLAUDE
     if normalized == "codex":
         return AgentKind.CODEX
     if normalized == "kimi":
         return AgentKind.KIMI
-    raise ValueError("Default agent must be claude, codex, kimi, null, or auto.")
+    if normalized in {"deepseek", "deepcode", "ds"}:
+        return AgentKind.DEEPSEEK
+    if normalized in {"opencode", "oc"}:
+        return AgentKind.OPENCODE
+    raise ValueError(
+        "Default agent must be auto, claude, codex, opencode, kimi, deepseek, or manual."
+    )
+
+
+def format_default_agent(value: DefaultAgentSelection) -> str:
+    if value is None:
+        return "auto"
+    if isinstance(value, AgentKind):
+        return value.value
+    return value
 
 
 def agent_kind_from_value(value: str | None) -> AgentKind | None:
@@ -2113,6 +3085,27 @@ def agent_kind_from_value(value: str | None) -> AgentKind | None:
         return AgentKind.CODEX
     if normalized in {"kimi", "agent:kimi", "agent=kimi"}:
         return AgentKind.KIMI
+    if normalized in {
+        "opencode",
+        "oc",
+        "agent:opencode",
+        "agent=opencode",
+        "agent:oc",
+        "agent=oc",
+    }:
+        return AgentKind.OPENCODE
+    if normalized in {
+        "deepseek",
+        "deepcode",
+        "ds",
+        "agent:deepseek",
+        "agent=deepseek",
+        "agent:deepcode",
+        "agent=deepcode",
+        "agent:ds",
+        "agent=ds",
+    }:
+        return AgentKind.DEEPSEEK
     return None
 
 
@@ -2131,12 +3124,144 @@ def parse_model_spec(value: str | None) -> ModelSpec | None:
     if not agent_kind:
         return ModelSpec(raw=raw, agent_kind=None, model=raw, effort=None)
 
-    if len(parts) not in {2, 3}:
+    if len(parts) < 2:
         raise ValueError(
             f"`Model: {raw}` must use `agent/model` or `agent/model/effort`."
         )
-    effort = normalize_model_effort(parts[2]) if len(parts) == 3 else None
-    return ModelSpec(raw=raw, agent_kind=agent_kind, model=parts[1], effort=effort)
+    model_parts = parts[1:]
+    effort = None
+    if len(model_parts) > 1 and model_parts[-1].strip().lower() in MODEL_EFFORT_LEVELS:
+        effort = normalize_model_effort(model_parts[-1])
+        model_parts = model_parts[:-1]
+    model = "/".join(model_parts)
+    if not model.strip():
+        raise ValueError(f"`Model: {raw}` contains an empty model segment.")
+    return ModelSpec(raw=raw, agent_kind=agent_kind, model=model, effort=effort)
+
+
+def parse_default_model_settings(
+    values: dict[str, object] | None, source: str
+) -> dict[AgentKind, ModelSpec]:
+    if not values:
+        return {}
+
+    parsed: dict[AgentKind, ModelSpec] = {}
+    for key, value in values.items():
+        agent_kind = agent_kind_from_value(key)
+        if not agent_kind:
+            continue
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            parsed[agent_kind] = parse_agent_default_model(agent_kind, value)
+        except ValueError as exc:
+            raise ValueError(f"Invalid {source}.{key}: {exc}") from exc
+    return parsed
+
+
+def parse_agent_default_model(agent_kind: AgentKind, value: str) -> ModelSpec:
+    raw = value.strip()
+    parts = [part.strip() for part in raw.split("/")]
+    if any(not part for part in parts):
+        raise ValueError(f"`{raw}` contains an empty segment.")
+
+    explicit_agent = agent_kind_from_value(parts[0])
+    if explicit_agent:
+        spec = parse_model_spec(raw)
+        if spec is None or spec.agent_kind != agent_kind:
+            raise ValueError(
+                f"`{raw}` selects `{explicit_agent.value}`, but this default belongs to `{agent_kind.value}`."
+            )
+        return spec
+
+    effort = None
+    model = raw
+    if len(parts) > 1 and parts[-1].strip().lower() in MODEL_EFFORT_LEVELS:
+        effort = normalize_model_effort(parts[-1])
+        model = "/".join(parts[:-1])
+        if not model.strip():
+            raise ValueError(f"`{raw}` contains an empty model segment.")
+    return ModelSpec(
+        raw=f"{agent_kind.value}/{raw}",
+        agent_kind=agent_kind,
+        model=model,
+        effort=effort,
+    )
+
+
+def read_board_default_models(root_path: str) -> dict[AgentKind, ModelSpec]:
+    marker_path = BoardPaths(root_path).kanban_marker_path
+    if not os.path.exists(marker_path):
+        return {}
+    try:
+        with open(marker_path, "r", encoding=ENCODING, errors="replace") as handle:
+            values = parse_kanban_default_models(handle.read())
+    except OSError:
+        return {}
+    return parse_default_model_settings(values, f"{marker_path}:defaultModels")
+
+
+def parse_kanban_default_models(content: str) -> dict[str, object]:
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        if match.group(1) not in {
+            "defaultModels",
+            "defaultAgentModels",
+            "agentDefaultModels",
+        }:
+            continue
+        inline_value = strip_yaml_comment(match.group(2)).strip()
+        if inline_value:
+            return {}
+        return parse_indented_string_map(lines[index + 1 :])
+    return {}
+
+
+def parse_indented_string_map(lines: list[str]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent == 0:
+            break
+        match = re.match(r"^\s+([A-Za-z][A-Za-z0-9_-]*)\s*:\s*(.*)$", line)
+        if not match:
+            continue
+        value = strip_yaml_comment(match.group(2)).strip()
+        result[match.group(1)] = unquote_yaml_scalar(value)
+    return result
+
+
+def strip_yaml_comment(value: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if in_double and char == "\\":
+            escaped = True
+            continue
+        if char == "'" and not in_double:
+            in_single = not in_single
+            continue
+        if char == '"' and not in_single:
+            in_double = not in_double
+            continue
+        if char == "#" and not in_single and not in_double:
+            return value[:index]
+    return value
+
+
+def unquote_yaml_scalar(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
 
 
 def normalize_model_effort(value: str) -> str:
@@ -2154,6 +3279,8 @@ def agent_kind_from_agent_id(value: str | None) -> AgentKind | None:
     if value is None:
         return None
     normalized = value.strip().lower()
+    if is_opencode_session_id(normalized):
+        return AgentKind.OPENCODE
     if re.fullmatch(
         r"session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         normalized,
@@ -2170,6 +3297,23 @@ def agent_kind_from_agent_id(value: str | None) -> AgentKind | None:
     if version == "4":
         return AgentKind.CLAUDE
     return None
+
+
+def is_deepcode_session_id(value: str | None) -> bool:
+    if value is None:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            value.strip().lower(),
+        )
+    )
+
+
+def is_opencode_session_id(value: str | None) -> bool:
+    if value is None:
+        return False
+    return bool(re.fullmatch(r"ses_[a-z0-9]+", value.strip(), re.I))
 
 
 def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
@@ -2201,16 +3345,85 @@ def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
         "use:kimi",
         "use-kimi",
     }
+    opencode_markers = {
+        "opencode",
+        "oc",
+        "agent:opencode",
+        "agent=opencode",
+        "agent:oc",
+        "agent=oc",
+        "ai:opencode",
+        "ai:oc",
+        "runner:opencode",
+        "runner:oc",
+        "use:opencode",
+        "use:oc",
+        "use-opencode",
+        "use-oc",
+    }
+    deepseek_markers = {
+        "deepseek",
+        "deepcode",
+        "ds",
+        "agent:deepseek",
+        "agent=deepseek",
+        "agent:deepcode",
+        "agent=deepcode",
+        "agent:ds",
+        "agent=ds",
+        "ai:deepseek",
+        "ai:deepcode",
+        "ai:ds",
+        "runner:deepseek",
+        "runner:deepcode",
+        "runner:ds",
+        "use:deepseek",
+        "use:deepcode",
+        "use:ds",
+        "use-deepseek",
+        "use-deepcode",
+        "use-ds",
+    }
     has_claude = bool(normalized_tags & claude_markers)
     has_codex = bool(normalized_tags & codex_markers)
     has_kimi = bool(normalized_tags & kimi_markers)
-    if has_claude and not has_codex and not has_kimi:
+    has_opencode = bool(normalized_tags & opencode_markers)
+    has_deepseek = bool(normalized_tags & deepseek_markers)
+    if has_claude and not has_codex and not has_kimi and not has_opencode and not has_deepseek:
         return AgentKind.CLAUDE
-    if has_codex and not has_claude and not has_kimi:
+    if has_codex and not has_claude and not has_kimi and not has_opencode and not has_deepseek:
         return AgentKind.CODEX
-    if has_kimi and not has_claude and not has_codex:
+    if has_kimi and not has_claude and not has_codex and not has_opencode and not has_deepseek:
         return AgentKind.KIMI
+    if has_opencode and not has_claude and not has_codex and not has_kimi and not has_deepseek:
+        return AgentKind.OPENCODE
+    if has_deepseek and not has_claude and not has_codex and not has_kimi and not has_opencode:
+        return AgentKind.DEEPSEEK
     return None
+
+
+def has_manual_agent_tag(tags: Sequence[str]) -> bool:
+    normalized_tags = {normalize_tag(tag) for tag in tags}
+    manual_markers = {
+        "manual",
+        "human",
+        "agent:manual",
+        "agent=manual",
+        "agent:human",
+        "agent=human",
+        "ai:manual",
+        "ai:human",
+        "runner:manual",
+        "runner:human",
+        "use:manual",
+        "use:human",
+        "use-manual",
+        "use-human",
+        "no-agent",
+        "noagent",
+        "user-managed",
+    }
+    return bool(normalized_tags & manual_markers)
 
 
 def parse_tags(value: str | None) -> list[str]:
@@ -2225,6 +3438,26 @@ def parse_tags(value: str | None) -> list[str]:
 
 def normalize_tag(value: str) -> str:
     return value.strip().lstrip("#").lower()
+
+
+def deepcode_project_code(project_root: str) -> str:
+    legacy_code = project_root.replace("\\", "-").replace("/", "-").replace(":", "")
+    if len(legacy_code) <= 64:
+        return legacy_code
+    normalized_root = os.path.abspath(project_root)
+    hash_input = normalized_root.lower() if IS_WINDOWS else normalized_root
+    digest = hashlib.sha256(hash_input.encode(ENCODING)).hexdigest()[:16]
+    prefix_limit = 64 - 16 - 1
+    prefix = sanitize_deepcode_project_code_part(os.path.basename(normalized_root))[
+        :prefix_limit
+    ].rstrip("-.")
+    return f"{prefix or 'project'}-{digest}"
+
+
+def sanitize_deepcode_project_code_part(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "-", value)
+    sanitized = re.sub(r"-+", "-", sanitized)
+    return sanitized.strip("-.")
 
 
 def codex_model_arguments(model_spec: ModelSpec | None) -> list[str]:
@@ -2248,11 +3481,128 @@ def claude_model_arguments(model_spec: ModelSpec | None) -> list[str]:
 def kimi_model_arguments(model_spec: ModelSpec | None) -> list[str]:
     if not model_spec:
         return []
+    return ["--model", resolve_kimi_model_alias(model_spec.model)]
+
+
+def kimi_environment(model_spec: ModelSpec | None) -> dict[str, str]:
+    if not model_spec or not model_spec.effort:
+        return {}
+    return {"KIMI_MODEL_THINKING_EFFORT": model_spec.effort}
+
+
+def resolve_kimi_model_alias(model: str) -> str:
+    aliases = configured_kimi_model_aliases()
+    if not aliases:
+        return model
+    by_lower = {alias.lower(): alias for alias in aliases}
+    existing = by_lower.get(model.lower())
+    if existing:
+        return existing
+    if "/" not in model:
+        kimi_code_alias = by_lower.get(f"kimi-code/{model}".lower())
+        if kimi_code_alias:
+            return kimi_code_alias
+        suffix_matches = [
+            alias for alias in aliases if alias.lower().endswith("/" + model.lower())
+        ]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+    return model
+
+
+def configured_kimi_model_aliases() -> list[str]:
+    config_path = Path(kimi_home_path()) / "config.toml"
+    try:
+        content = read_text(str(config_path))
+    except OSError:
+        return []
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for line in content.replace("\r\n", "\n").split("\n"):
+        match = re.match(r'^\s*\[models\."([^"]+)"\]\s*$', line)
+        if not match:
+            match = re.match(r"^\s*\[models\.([^\]\s]+)\]\s*$", line)
+        if not match:
+            continue
+        alias = match.group(1).strip()
+        normalized = alias.lower()
+        if alias and normalized not in seen:
+            seen.add(normalized)
+            aliases.append(alias)
+    return aliases
+
+
+def trust_kimi_workspace(work_dir: str) -> None:
+    expanded = os.path.expanduser(os.path.expandvars(work_dir))
+    root = ntpath.abspath(expanded) if is_windows_absolute_path(expanded) else os.path.abspath(expanded)
+    key = encode_kimi_workdir_key(root)
+    trust_dir = os.path.join(kimi_home_path(), "workspace-trust")
+    os.makedirs(trust_dir, exist_ok=True)
+    trust_path = os.path.join(trust_dir, key)
+    if os.path.exists(trust_path):
+        return
+    payload = {
+        "root": root,
+        "trustedAt": int(time.time() * 1000),
+    }
+    write_text(trust_path, json.dumps(payload, separators=(",", ":")))
+
+
+def kimi_home_path() -> str:
+    configured_home = os.environ.get("KIMI_CODE_HOME", "").strip()
+    if configured_home:
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(configured_home)))
+    return os.path.join(str(Path.home()), ".kimi-code")
+
+
+def encode_kimi_workdir_key(work_dir: str) -> str:
+    normalized = normalize_kimi_workdir(work_dir)
+    name = normalized.replace("\\", "/").split("/")[-1] or normalized
+    slug = slugify_kimi_workdir_name(name)
+    digest = hashlib.sha256(normalized.encode(ENCODING)).hexdigest()[:12]
+    return f"wd_{slug}_{digest}"
+
+
+def normalize_kimi_workdir(work_dir: str) -> str:
+    if is_windows_absolute_path(work_dir):
+        normalized = ntpath.abspath(work_dir).replace("\\", "/")
+    else:
+        normalized = os.path.abspath(work_dir).replace("\\", "/")
+    if len(normalized) > 3:
+        normalized = normalized.rstrip("/")
+    return normalized
+
+
+def is_windows_absolute_path(value: str) -> bool:
+    return bool(re.match(r"^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)", value))
+
+
+def slugify_kimi_workdir_name(name: str) -> str:
+    slug = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")[:40].strip("-")
+    return slug if slug and slug not in {".", ".."} else "workspace"
+
+
+def deepseek_model_environment(model_spec: ModelSpec | None) -> dict[str, str]:
+    if not model_spec:
+        return {}
+    env = {"DEEPCODE_MODEL": model_spec.model}
     if model_spec.effort:
-        raise ValueError(
-            f"`Model: {model_spec.raw}` sets effort `{model_spec.effort}`, but Kimi CLI only supports model selection."
-        )
-    return ["--model", model_spec.model]
+        if model_spec.effort not in {"high", "max"}:
+            raise ValueError(
+                f"`Model: {model_spec.raw}` sets effort `{model_spec.effort}`, but Deep Code supports only high or max reasoning effort."
+            )
+        env["DEEPCODE_THINKING_ENABLED"] = "true"
+        env["DEEPCODE_REASONING_EFFORT"] = model_spec.effort
+    return env
+
+
+def opencode_model_arguments(model_spec: ModelSpec | None) -> list[str]:
+    if not model_spec:
+        return []
+    args = ["--model", model_spec.model]
+    if model_spec.effort:
+        args.extend(["--variant", model_spec.effort])
+    return args
 
 
 def codex_mode_arguments(mode: CodexMode) -> list[str]:
@@ -2268,6 +3618,12 @@ def claude_permission_arguments(mode: CodexMode) -> list[str]:
         return ["--permission-mode", "bypassPermissions"]
     if mode == CodexMode.FULL_AUTO:
         return ["--permission-mode", "auto"]
+    raise ValueError(f"Unsupported Codex mode: {mode}")
+
+
+def opencode_permission_arguments(mode: CodexMode) -> list[str]:
+    if mode in {CodexMode.DANGEROUS, CodexMode.FULL_AUTO}:
+        return ["--auto"]
     raise ValueError(f"Unsupported Codex mode: {mode}")
 
 
@@ -2307,6 +3663,7 @@ def parse_claude_json_line(line: str, state: dict[str, str]) -> None:
         if isinstance(result, str):
             state["final_agent_message"] = result
             return
+    text = ""
     if event_type == "assistant":
         message = payload.get("message")
         text = extract_claude_message_text(message)
@@ -2332,6 +3689,92 @@ def parse_kimi_json_line(line: str, state: dict[str, str]) -> None:
     role = str(payload.get("role", "")).lower()
     if role == "assistant" and isinstance(payload.get("content"), str):
         state["final_agent_message"] = str(payload.get("content") or "")
+
+
+def parse_opencode_json_line(line: str, state: dict[str, str]) -> None:
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        if "ORCHESTRATOR_STATUS:" in line:
+            state["final_agent_message"] = line
+        return
+
+    session_id = (
+        find_nested_string(payload, "sessionID")
+        or find_nested_string(payload, "sessionId")
+        or find_nested_string(payload, "session_id")
+    )
+    if session_id and is_opencode_session_id(session_id):
+        state["session_id"] = session_id
+
+    text = extract_opencode_message_text(payload)
+    if text:
+        state["final_agent_message"] = text
+
+
+def parse_deepcode_line(line: str, state: dict[str, str]) -> None:
+    text = strip_ansi(line).strip()
+    if not text:
+        return
+    session_match = re.search(
+        r"deepcode\s+(?:--resume|-r)\s+([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})",
+        text,
+        re.I,
+    )
+    if session_match:
+        state["session_id"] = session_match.group(1)
+    if "ORCHESTRATOR_STATUS:" in text:
+        state["final_agent_message"] = text
+
+
+def extract_deepcode_message_text(entry: object) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    if str(entry.get("role", "")).lower() != "assistant":
+        return ""
+    content = entry.get("content")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    message_params = entry.get("messageParams")
+    if isinstance(message_params, dict):
+        reasoning = message_params.get("reasoning_content")
+        if isinstance(reasoning, str) and "ORCHESTRATOR_STATUS:" in reasoning:
+            return reasoning.strip()
+    return ""
+
+
+def extract_deepcode_user_questions(entry: object) -> list[str]:
+    if not isinstance(entry, dict):
+        return []
+    if str(entry.get("role", "")).lower() != "tool":
+        return []
+    content = entry.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return []
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict) or payload.get("awaitUserResponse") is not True:
+        return []
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("kind") != "ask_user_question":
+        return []
+    questions = metadata.get("questions")
+    if not isinstance(questions, list):
+        return []
+    result: list[str] = []
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        question = item.get("question")
+        if isinstance(question, str) and question.strip():
+            result.append(question.strip())
+    return result
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
 
 
 def find_nested_string(value: object, key: str) -> str | None:
@@ -2366,6 +3809,67 @@ def extract_claude_message_text(message: object) -> str:
                 parts.append(item["text"])
         return "\n".join(parts).strip()
     return ""
+
+
+def extract_opencode_message_text(entry: object) -> str:
+    if not isinstance(entry, dict):
+        return ""
+    role = str(
+        entry.get("role")
+        or (entry.get("info") if isinstance(entry.get("info"), dict) else {}).get("role")
+        or ""
+    ).lower()
+    if role and role != "assistant":
+        return ""
+    content = entry.get("content") or entry.get("text")
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    parts = entry.get("parts")
+    if isinstance(parts, list):
+        text_parts = [
+            str(part.get("text") or "").strip()
+            for part in parts
+            if isinstance(part, dict) and str(part.get("type") or "").lower() == "text"
+        ]
+        return "\n".join(part for part in text_parts if part).strip()
+    message = entry.get("message")
+    if isinstance(message, dict):
+        return extract_opencode_message_text(message)
+    return ""
+
+
+def extract_opencode_export_assistant_message(exported: dict[str, object]) -> str:
+    messages = exported.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        text = extract_opencode_message_text(message)
+        if text:
+            return text
+    return ""
+
+
+def parse_first_json_value(text: str) -> object | None:
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(text):
+        if char not in "[{":
+            continue
+        try:
+            value, _end = decoder.raw_decode(text[index:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def task_title(card: "TaskCard") -> str:
+    match = re.search(r"(?m)^\s*#{1,6}\s+(.+?)\s*$", card.content)
+    if match:
+        title = match.group(1).strip()
+        if title:
+            return title[:120]
+    fallback = os.path.splitext(os.path.basename(card.path))[0].replace("-", " ").strip()
+    return fallback[:120] if fallback else "Kanban task"
 
 
 def get_section_body(content: str, heading: str, level: int = 2) -> str:
@@ -2504,6 +4008,11 @@ def has_meaningful_body(body: str) -> bool:
     return False
 
 
+def normalize_comment_body(body: str) -> str:
+    lines = [line.rstrip() for line in body.replace("\r\n", "\n").split("\n")]
+    return "\n".join(lines).strip()
+
+
 def read_seed_file(invocation_directory: str, relative_path: str, fallback: str) -> str:
     candidate = os.path.join(invocation_directory, relative_path)
     if os.path.exists(candidate):
@@ -2520,6 +4029,45 @@ def write_text(path: str, content: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding=ENCODING, newline="\n") as handle:
         handle.write(content)
+
+
+def terminate_process_tree(process_id: int) -> None:
+    if process_id <= 0:
+        return
+    if IS_WINDOWS:
+        subprocess.run(
+            ["taskkill", "/PID", str(process_id), "/T", "/F"],
+            text=True,
+            encoding=ENCODING,
+            errors="replace",
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    try:
+        process = subprocess.Popen(["kill", "-TERM", str(process_id)])
+        process.wait(timeout=1)
+    except Exception:
+        pass
+
+
+def exclude_local_git_path(repo_path: str, pattern: str) -> None:
+    exclude_path = os.path.join(repo_path, ".git", "info", "exclude")
+    if not os.path.isfile(exclude_path):
+        return
+    try:
+        existing = read_text(exclude_path)
+    except OSError:
+        return
+    lines = [line.strip() for line in existing.splitlines()]
+    if pattern in lines:
+        return
+    suffix = "" if existing.endswith(("\n", "\r")) or not existing else "\n"
+    try:
+        with open(exclude_path, "a", encoding=ENCODING, newline="\n") as handle:
+            handle.write(f"{suffix}{pattern}\n")
+    except OSError:
+        pass
 
 
 def make_unique_directory_path(parent_directory: str, desired_name: str) -> str:
@@ -2540,9 +4088,16 @@ def make_unique_file_path(desired_path: str) -> str:
         return desired_path
     directory = os.path.dirname(desired_path)
     file_name, extension = os.path.splitext(os.path.basename(desired_path))
+    suffix_match = re.match(r"^(.+)-(\d+)$", file_name)
+    suffix_width = 0
     counter = 2
+    if suffix_match:
+        file_name = suffix_match.group(1)
+        suffix_width = len(suffix_match.group(2))
+        counter = int(suffix_match.group(2)) + 1
     while True:
-        candidate = os.path.join(directory, f"{file_name}-{counter}{extension}")
+        suffix = str(counter).zfill(suffix_width) if suffix_width > 1 else str(counter)
+        candidate = os.path.join(directory, f"{file_name}-{suffix}{extension}")
         if not os.path.exists(candidate):
             return candidate
         counter += 1

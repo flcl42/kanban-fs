@@ -41,6 +41,11 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /--deepseek-executable/,
+  "runner should expose a CLI option for choosing the Deep Code executable"
+);
+assert.match(
+  runnerSource,
   /--default-agent/,
   "runner should expose a CLI option for choosing the default agent"
 );
@@ -51,13 +56,33 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /kanban\.defaultModels/,
+  "direct runner starts should read VS Code default model settings"
+);
+assert.match(
+  runnerSource,
+  /default_models: dict\[AgentKind, ModelSpec\]/,
+  "runner settings should carry per-agent default model specs"
+);
+assert.match(
+  runnerSource,
+  /read_board_default_models/,
+  "runner should read board .kanban defaultModels"
+);
+assert.match(
+  runnerSource,
+  /def model_spec_for[\s\S]*card\.model_spec or self\.settings\.default_models\.get/,
+  "runner should fall back to default models when a new card has no Model property"
+);
+assert.match(
+  runnerSource,
   /\.vscode"[\s\S]*"settings\.json"/,
   "direct runner starts should consider workspace VS Code settings"
 );
 assert.match(
   runnerSource,
-  /for kind in \[AgentKind\.CLAUDE, AgentKind\.CODEX, AgentKind\.KIMI\]/,
-  "runner should auto-detect Claude before Codex before Kimi"
+  /AgentKind\.CLAUDE,[\s\S]*AgentKind\.CODEX,[\s\S]*AgentKind\.OPENCODE,[\s\S]*AgentKind\.KIMI,[\s\S]*AgentKind\.DEEPSEEK/,
+  "runner should auto-detect Claude before Codex before opencode before Kimi before DeepSeek"
 );
 assert.match(
   runnerSource,
@@ -75,6 +100,31 @@ assert.match(
   "extension should infer agent kind from session id format"
 );
 assert.match(
+  source,
+  /provider\.resumeAgent\(String\(agentId\), ticketTitle, agentKind, repoPath\)/,
+  "Connect CodeLens commands should pass task context into agent resume"
+);
+assert.match(
+  source,
+  /arguments:\s*action\.command === "resumeAgent"[\s\S]*action\.ticketTitle[\s\S]*action\.agentKind[\s\S]*action\.repoPath/,
+  "Connect CodeLens actions should carry title, agent kind, and repo path"
+);
+assert.match(
+  source,
+  /detectAgentKindFromSessions\(trimmed, repoCwd\)/,
+  "agent resume should use repo-aware session detection before id fallback"
+);
+assert.match(
+  source,
+  /idKind === "claude"[\s\S]*configuredDefaultKind === "deepseek"/,
+  "ambiguous v4 session ids should allow DeepSeek defaults before Claude fallback"
+);
+assert.match(
+  source,
+  /findDeepSeekSessionFileForWorkdir[\s\S]*deepcodeProjectCode\(workdir\)/,
+  "DeepSeek session detection should check the task repository session path directly"
+);
+assert.match(
   runnerSource,
   /class ClaudeRunner[\s\S]*"--print"[\s\S]*"--verbose"[\s\S]*"--output-format"[\s\S]*"stream-json"/,
   "Claude stream-json runs should include --verbose because current Claude CLI requires it"
@@ -83,6 +133,16 @@ assert.match(
   runnerSource,
   /class KimiRunner[\s\S]*"-p"[\s\S]*"--output-format"[\s\S]*"stream-json"[\s\S]*"--session"/,
   "Kimi stream-json runs should use prompt mode and session resume"
+);
+assert.match(
+  runnerSource,
+  /class DeepSeekRunner[\s\S]*"--resume"[\s\S]*"-p"[\s\S]*parse_deepcode_line/,
+  "DeepSeek runs should use Deep Code prompt mode and session resume"
+);
+assert.match(
+  runnerSource,
+  /from winpty import PtyProcess/,
+  "DeepSeek runner should launch Deep Code through a PTY because Deep Code requires a TTY"
 );
 assert.match(
   runnerSource,
@@ -96,6 +156,11 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /MODEL_EFFORT_LEVELS\s*=\s*\{[^}]*"ultra"/,
+  "runner should accept ultra model effort"
+);
+assert.match(
+  runnerSource,
   /claude_model_arguments[\s\S]*"--effort"/,
   "Claude model effort should map to --effort"
 );
@@ -103,6 +168,16 @@ assert.match(
   runnerSource,
   /kimi_model_arguments[\s\S]*"--model"/,
   "Kimi model selection should map to --model"
+);
+assert.match(
+  runnerSource,
+  /deepseek_model_environment[\s\S]*DEEPCODE_MODEL[\s\S]*DEEPCODE_REASONING_EFFORT/,
+  "DeepSeek model selection should map to Deep Code environment settings"
+);
+assert.match(
+  runnerSource,
+  /parsed_status != AgentOutcome\.UNKNOWN/,
+  "DeepSeek PTY completion should not treat an empty or unknown status as complete"
 );
 assert.match(
   runnerSource,

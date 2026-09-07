@@ -3,7 +3,7 @@ import * as net from "net";
 import * as vscode from "vscode";
 import { execFile, spawn } from "child_process";
 import { createHash } from "crypto";
-import { existsSync } from "fs";
+import { existsSync, readFileSync } from "fs";
 import { promisify } from "util";
 import MarkdownIt from "markdown-it";
 import {
@@ -11,10 +11,15 @@ import {
   buildFolderConfigMap,
   createEmptyBoardConfig,
   isIgnoredFolder,
+  isTopCard,
+  moveTopCardInSet,
   normalizeLineEndings,
   orderColumnsByConfig,
   parseBoardConfig,
+  reconcileTopCardsWithColumns,
   serializeBoardConfig,
+  setTopCardInSet,
+  setTopCardsInConfigData,
   type BoardConfig,
 } from "./board-config";
 import {
@@ -37,6 +42,12 @@ import {
   CARD_TEMPLATE_FILE_NAME,
   resolveCursorPlaceholder,
 } from "./new-card";
+import {
+  DEFAULT_MODEL_VALUE_COMPLETION_VALUES,
+  getMatchingModelValueCompletions,
+  getModelValueCompletionContext,
+} from "./model-completions";
+import { makeUniqueFileName, slugifyFileName } from "./file-names";
 
 type CardProperty = TaskProperty & {
   action: TaskPropertyAction | null;
@@ -51,6 +62,7 @@ type Card = {
   properties: CardProperty[];
   tags: string[];
   priority: number | null;
+  top: boolean;
   createdAt: number;
   updatedAt: number;
 };
@@ -71,8 +83,33 @@ type EditContext = {
   docs: Map<string, vscode.TextDocument>;
 };
 
+type TopCardConfigMutation =
+  | {
+      type: "set";
+      columnId: string;
+      fileName: string;
+      top: boolean;
+    }
+  | {
+      type: "delete";
+      columnId: string;
+      fileName: string;
+    }
+  | {
+      type: "move";
+      sourceColumnId: string;
+      sourceFileName: string;
+      targetColumnId: string;
+      targetFileName: string;
+    };
+
 type CodexSessionFile = {
   path: string;
+  lastCheckedAt: number;
+};
+
+type OpencodeSessionInfo = {
+  directory: string;
   lastCheckedAt: number;
 };
 
@@ -104,7 +141,7 @@ type RunnerStatusProbe = {
   activeAgentCount?: number;
 };
 
-type AgentKind = "claude" | "codex" | "kimi";
+type AgentKind = "claude" | "codex" | "kimi" | "deepseek" | "opencode";
 type WorkspaceMoveCallback = (
   root: string,
   sourcePath: string,
@@ -132,21 +169,29 @@ const CREATE_EMPTY_BOARD_COMMAND = "kanban.createEmptyBoard";
 const CREATE_BOARD_WITH_COLUMNS_COMMAND = "kanban.createBoardWithColumns";
 const CREATE_BOARD_WITH_RUNNER_COMMAND = "kanban.createBoardWithRunner";
 const INITIALIZE_RUNNER_COMMAND = "kanban.initializeRunner";
+const INITIALIZE_TEMPLATE_COMMAND = "kanban.initializeTemplate";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
+const DETAILS_PANE_VISIBLE_SETTING = "detailsPane.visible";
 const RUNNER_PANEL_ENABLED_SETTING = "runnerPanel.enabled";
 const RUNNER_COMMAND_SETTING = "runner.command";
 const RUNNER_ARGS_SETTING = "runner.args";
 const DEFAULT_AGENT_SETTING = "defaultAgent";
+const DEFAULT_MODELS_SETTING = "defaultModels";
+const MODEL_COMPLETIONS_SETTING = "modelCompletions";
 const CODEX_EXECUTABLE_SETTING = "codexExecutable";
 const CLAUDE_EXECUTABLE_SETTING = "claudeExecutable";
 const KIMI_EXECUTABLE_SETTING = "kimiExecutable";
+const DEEPSEEK_EXECUTABLE_SETTING = "deepseekExecutable";
+const OPENCODE_EXECUTABLE_SETTING = "opencodeExecutable";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
 const DEFAULT_CODEX_EXECUTABLE = "codex";
 const DEFAULT_CLAUDE_EXECUTABLE = "claude";
 const DEFAULT_KIMI_EXECUTABLE = "kimi";
+const DEFAULT_DEEPSEEK_EXECUTABLE = "deepcode";
+const DEFAULT_OPENCODE_EXECUTABLE = "opencode";
 const RUNNER_STATUS_REFRESH_MS = 10_000;
 const BOARD_DISK_REFRESH_MS = 10_000;
 const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
@@ -159,6 +204,9 @@ const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
 const CLAUDE_INSTALL_URL = "https://docs.anthropic.com/en/docs/claude-code";
 const KIMI_INSTALL_URL = "https://moonshotai.github.io/kimi-code/";
+const DEEPSEEK_INSTALL_URL = "https://api-docs.deepseek.com/quick_start/agent_integrations/deepcode/";
+const OPENCODE_INSTALL_URL = "https://opencode.ai/";
+const PYWINPTY_INSTALL_URL = "https://pypi.org/project/pywinpty/";
 const PYTHON_INSTALL_URL = "https://www.python.org/downloads/";
 const KANBAN_FILE_NAME = ".kanban";
 const RUNNER_SCRIPT_NAME = "runner.py";
@@ -181,6 +229,10 @@ const DEFAULT_RUNNER_ARGS = [
   "${claudeExecutable}",
   "--kimi-executable",
   "${kimiExecutable}",
+  "--deepseek-executable",
+  "${deepseekExecutable}",
+  "--opencode-executable",
+  "${opencodeExecutable}",
 ];
 const DEFAULT_PROJECTS_MAP_TEXT = "blank = https://github.com/flcl42/blank.git\n";
 const DEFAULT_TASK_TEMPLATE_TEXT = `# {{TITLE}}
@@ -213,8 +265,14 @@ export function activate(context: vscode.ExtensionContext) {
   );
   context.subscriptions.push(
     workspaceMoveServer,
-    vscode.commands.registerCommand(RESUME_AGENT_COMMAND, async (agentId: string) =>
-      provider.resumeAgent(String(agentId))
+    vscode.commands.registerCommand(
+      RESUME_AGENT_COMMAND,
+      async (
+        agentId: string,
+        ticketTitle?: unknown,
+        agentKind?: unknown,
+        repoPath?: unknown
+      ) => provider.resumeAgent(String(agentId), ticketTitle, agentKind, repoPath)
     ),
     vscode.commands.registerCommand(OPEN_PATH_COMMAND, async (targetPath: string) =>
       provider.openPathInTerminal(String(targetPath))
@@ -240,15 +298,113 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(INITIALIZE_RUNNER_COMMAND, async (target?: vscode.Uri) =>
       provider.initializeRunner(target)
     ),
+    vscode.commands.registerCommand(INITIALIZE_TEMPLATE_COMMAND, async (target?: vscode.Uri) =>
+      provider.initializeTemplate(target)
+    ),
     vscode.window.registerCustomEditorProvider("kanban.board", provider, {
       webviewOptions: { retainContextWhenHidden: true },
       supportsMultipleEditorsPerDocument: false,
     }),
-    vscode.languages.registerCodeLensProvider({ language: "markdown" }, taskActionProvider)
+    vscode.languages.registerCodeLensProvider({ language: "markdown" }, taskActionProvider),
+    vscode.languages.registerCompletionItemProvider(
+      [{ language: "markdown" }, { language: "kanban" }],
+      new ModelValueCompletionProvider(),
+      ":",
+      " ",
+      "/"
+    )
   );
 }
 
 export function deactivate() {}
+
+class ModelValueCompletionProvider implements vscode.CompletionItemProvider {
+  provideCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position
+  ): vscode.ProviderResult<vscode.CompletionItem[]> {
+    const lineText = document.lineAt(position.line).text;
+    const completionContext = getModelValueCompletionContext(
+      lineText,
+      position.character
+    );
+    if (!completionContext) {
+      return undefined;
+    }
+
+    const range = new vscode.Range(
+      position.line,
+      completionContext.valueStart,
+      position.line,
+      completionContext.valueEnd
+    );
+
+    return getMatchingModelValueCompletions(
+      completionContext.prefix,
+      this.getConfiguredModelCompletions(document.uri)
+    ).map((completion) => {
+        const item = new vscode.CompletionItem(
+          completion.label,
+          completion.kind === "snippet"
+            ? vscode.CompletionItemKind.Snippet
+            : vscode.CompletionItemKind.Value
+        );
+        item.insertText =
+          completion.kind === "snippet"
+            ? new vscode.SnippetString(completion.insertText)
+            : completion.insertText;
+        item.range = range;
+        item.detail = completion.detail;
+        item.documentation = completion.documentation;
+        item.sortText = completion.sortText;
+        return item;
+      });
+  }
+
+  private getConfiguredModelCompletions(resource: vscode.Uri): string[] {
+    const configured = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
+      .get<unknown>(MODEL_COMPLETIONS_SETTING);
+    const configuredValues = Array.isArray(configured)
+      ? configured
+          .filter((value): value is string => typeof value === "string")
+          .map((value) => value.trim())
+          .filter(Boolean)
+      : DEFAULT_MODEL_VALUE_COMPLETION_VALUES;
+    return [
+      ...configuredValues,
+      ...this.getDefaultModelCompletionValues(resource),
+    ];
+  }
+
+  private getDefaultModelCompletionValues(resource: vscode.Uri): string[] {
+    const configured = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
+      .get<unknown>(DEFAULT_MODELS_SETTING);
+    return [
+      ...defaultModelValuesFromObject(configured),
+      ...this.getBoardDefaultModelCompletionValues(resource),
+    ];
+  }
+
+  private getBoardDefaultModelCompletionValues(resource: vscode.Uri): string[] {
+    if (resource.scheme !== "file") {
+      return [];
+    }
+
+    const markerPath = findNearestKanbanMarker(resource.fsPath);
+    if (!markerPath) {
+      return [];
+    }
+
+    try {
+      const boardConfig = parseBoardConfig(readFileSync(markerPath, "utf8"));
+      return defaultModelValuesFromObject(boardConfig.defaultModels);
+    } catch {
+      return [];
+    }
+  }
+}
 
 class WorkspaceMoveServer implements vscode.Disposable {
   private readonly servers = new Map<string, net.Server>();
@@ -718,7 +874,9 @@ function toTaskActionCommand(action: TaskLinkAction): vscode.Command {
     title: action.title,
     tooltip: getTaskActionTooltip(action),
     command,
-    arguments: [action.value],
+    arguments: action.command === "resumeAgent"
+      ? [action.value, action.ticketTitle, action.agentKind, action.repoPath]
+      : [action.value],
   };
 }
 
@@ -740,6 +898,13 @@ function isMarkdownDocument(document: vscode.TextDocument): boolean {
 
 function createDefaultBoardConfigText(): string {
   return serializeBoardConfig({
+    defaultModels: {
+      codex: "",
+      claude: "",
+      kimi: "",
+      deepseek: "",
+      opencode: "",
+    },
     folders: Object.fromEntries(
       DEFAULT_BOARD_COLUMNS.map((column) => [column.id, column.name])
     ),
@@ -753,6 +918,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private readonly codexSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly claudeSessionFiles = new Map<string, CodexSessionFile | null>();
   private readonly kimiSessionFiles = new Map<string, CodexSessionFile | null>();
+  private readonly deepseekSessionFiles = new Map<string, CodexSessionFile | null>();
+  private readonly opencodeSessions = new Map<string, OpencodeSessionInfo | null>();
   private readonly runnerLaunches = new Map<string, number>();
   private readonly context: vscode.ExtensionContext;
   private readonly onDidChangeCustomDocumentEmitter =
@@ -886,6 +1053,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
   }
 
+  async initializeTemplate(target?: vscode.Uri): Promise<void> {
+    const kanbanUri = await this.resolveTemplateInitializationTarget(target);
+    if (!kanbanUri) {
+      return;
+    }
+
+    const templateUri = await this.ensureTaskTemplateFile(kanbanUri);
+    await vscode.window.showTextDocument(templateUri);
+    vscode.window.showInformationMessage(
+      `AI Kanban template initialized: ${templateUri.fsPath}`
+    );
+  }
+
   private async resolveRunnerInitializationTarget(
     target?: vscode.Uri
   ): Promise<vscode.Uri | null> {
@@ -930,6 +1110,87 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return null;
     }
     return this.ensureRunnerBoardInRoot(rootFolder);
+  }
+
+  private async resolveTemplateInitializationTarget(
+    target?: vscode.Uri
+  ): Promise<vscode.Uri | null> {
+    const directTarget = await this.resolveExistingKanbanUriFromTarget(target);
+    if (directTarget) {
+      return directTarget;
+    }
+
+    const activeTarget = await this.resolveExistingKanbanUriFromTarget(
+      vscode.window.activeTextEditor?.document.uri
+    );
+    if (activeTarget) {
+      return activeTarget;
+    }
+
+    const boards = (await vscode.workspace.findFiles(
+      `**/${KANBAN_FILE_NAME}`,
+      "**/{.git,node_modules}/**"
+    )).filter((uri) => uri.scheme === "file");
+    if (boards.length === 1) {
+      return boards[0];
+    }
+    if (boards.length > 1) {
+      const selected = await vscode.window.showQuickPick(
+        boards.map((uri) => ({
+          label: vscode.workspace.asRelativePath(uri, false),
+          description: uri.fsPath,
+          uri,
+        })),
+        {
+          title: "Select a board to initialize a task template",
+          placeHolder: "Select .kanban",
+        }
+      );
+      return selected?.uri ?? null;
+    }
+
+    const rootFolder = await this.pickBoardFolder(
+      "Select a folder containing an AI Kanban board"
+    );
+    if (!rootFolder) {
+      return null;
+    }
+    const folderTarget = await this.resolveExistingKanbanUriFromTarget(rootFolder);
+    if (folderTarget) {
+      return folderTarget;
+    }
+    vscode.window.showWarningMessage(
+      `No .kanban file found in ${rootFolder.fsPath} or its tasks folder.`
+    );
+    return null;
+  }
+
+  private async resolveExistingKanbanUriFromTarget(
+    target?: vscode.Uri
+  ): Promise<vscode.Uri | null> {
+    if (!target || target.scheme !== "file") {
+      return null;
+    }
+    const targetPath = target.fsPath;
+    if (path.basename(targetPath).toLowerCase() === KANBAN_FILE_NAME) {
+      return (await this.fileExists(target)) ? target : null;
+    }
+
+    const stat = await this.statUri(target);
+    if (stat?.type === vscode.FileType.Directory) {
+      const rootKanbanUri = vscode.Uri.joinPath(target, KANBAN_FILE_NAME);
+      if (await this.fileExists(rootKanbanUri)) {
+        return rootKanbanUri;
+      }
+      const tasksKanbanUri = vscode.Uri.joinPath(target, "tasks", KANBAN_FILE_NAME);
+      if (await this.fileExists(tasksKanbanUri)) {
+        return tasksKanbanUri;
+      }
+      return null;
+    }
+
+    const markerPath = findNearestKanbanMarker(targetPath);
+    return markerPath ? vscode.Uri.file(markerPath) : null;
   }
 
   private async resolveKanbanUriFromTarget(
@@ -1005,7 +1266,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     webviewPanel.webview.html = this.getHtml(
       webviewPanel.webview,
-      this.getDetailsPaneWidthSetting()
+      this.getDetailsPaneWidthSetting(),
+      this.getDetailsPaneVisibleSetting()
     );
 
     let scheduledBoardRefresh: NodeJS.Timeout | undefined;
@@ -1046,6 +1308,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         width: this.getDetailsPaneWidthSetting(),
       });
     };
+    const sendDetailsPaneVisibility = () => {
+      webviewPanel.webview.postMessage({
+        type: "detailsPaneVisibility",
+        visible: this.getDetailsPaneVisibleSetting(),
+      });
+    };
     const sendRunnerStatus = async (message?: string) => {
       const status = await this.getRunnerStatus(document.uri, message);
       webviewPanel.webview.postMessage({ type: "runnerStatus", status });
@@ -1069,6 +1337,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           )
         ) {
           sendDetailsPaneWidth();
+        }
+        if (
+          event.affectsConfiguration(
+            `${KANBAN_CONFIGURATION_SECTION}.${DETAILS_PANE_VISIBLE_SETTING}`
+          )
+        ) {
+          sendDetailsPaneVisibility();
         }
         if (
           event.affectsConfiguration(
@@ -1211,6 +1486,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await sendBoard();
         return;
       }
+      if (message?.type === "toggleTopCard" && message?.cardUri) {
+        await runBoardMutation(() =>
+          this.setCardTop(document.uri, message.cardUri, Boolean(message?.top))
+        );
+        await sendBoard();
+        return;
+      }
       if (message?.type === "deleteCard" && message?.cardUri) {
         const title = String(message?.title ?? "this ticket").trim() || "this ticket";
         const confirmed = await vscode.window.showWarningMessage(
@@ -1283,6 +1565,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           type: "runnerStatus",
           status: { enabled: false, running: false },
         });
+        return;
+      }
+      if (message?.type === "copyCardPath" && message?.cardUri) {
+        await this.copyCardPath(document.uri, String(message.cardUri));
         return;
       }
       if (message?.type === "openFile" && message?.cardUri) {
@@ -1388,6 +1674,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await this.updateDetailsPaneWidthSetting(message?.width);
         return;
       }
+      if (message?.type === "saveDetailsPaneVisibility") {
+        await this.updateDetailsPaneVisibleSetting(message?.visible);
+        return;
+      }
       if (message?.type === "openPath" && message?.path) {
         await this.openPathInTerminal(String(message.path));
         return;
@@ -1465,7 +1755,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       const columnUri = vscode.Uri.joinPath(boardFolder, name);
       const meta = await this.readColumnMeta(columnUri, name, boardConfig);
-      const cards = await this.readCards(columnUri, meta.cardPriorities);
+      const cards = await this.readCards(
+        columnUri,
+        name,
+        boardConfig,
+        meta.cardPriorities
+      );
       columns.push({
         id: name,
         name: meta.title,
@@ -1475,6 +1770,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     const orderedColumns = this.orderColumns(columns, boardConfig);
+    const reconciledTopCards = reconcileTopCardsWithColumns(
+      boardConfig.topCards,
+      orderedColumns
+    );
+    if (!areStringSetsEqual(reconciledTopCards, boardConfig.topCards)) {
+      this.applyTopCardsToColumns(orderedColumns, {
+        ...boardConfig,
+        topCards: reconciledTopCards,
+      });
+    }
     if (!this.shouldSkipBoardConfigSync(rawBoardConfig, useCachedBoardConfig)) {
       try {
         const syncedConfig = await this.syncBoardConfig(
@@ -1495,6 +1800,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     boardConfig: BoardConfig
   ): T[] {
     return orderColumnsByConfig(columns, boardConfig);
+  }
+
+  private applyTopCardsToColumns(
+    columns: { id: string; cards: Card[] }[],
+    boardConfig: BoardConfig
+  ): void {
+    for (const column of columns) {
+      for (const card of column.cards) {
+        card.top = isTopCard(boardConfig, column.id, card.fileName);
+      }
+    }
   }
 
   private async readBoardConfig(kanbanUri: vscode.Uri): Promise<BoardConfig> {
@@ -1568,6 +1884,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         priorityOverrides
       );
     }
+    const reconciledTopCards = reconcileTopCardsWithColumns(
+      boardConfig.topCards,
+      columns
+    );
+    if (!areStringSetsEqual(reconciledTopCards, boardConfig.topCards)) {
+      setTopCardsInConfigData(nextData, reconciledTopCards);
+    }
 
     const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
     const nextConfig = parseBoardConfig(serialized);
@@ -1582,6 +1905,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   private async readCards(
     columnUri: vscode.Uri,
+    columnId: string,
+    boardConfig: BoardConfig,
     cardPriorities = new Map<string, number>()
   ): Promise<Card[]> {
     const entries = await vscode.workspace.fs.readDirectory(columnUri);
@@ -1628,6 +1953,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         properties: propertiesWithActions,
         tags,
         priority: cardPriorities.get(name) ?? null,
+        top: isTopCard(boardConfig, columnId, name),
         createdAt: stat.ctime,
         updatedAt: stat.mtime,
       });
@@ -1694,6 +2020,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     return matches.length === 1 ? matches[0] : null;
+  }
+
+  private async copyCardPath(
+    kanbanUri: vscode.Uri,
+    cardUriString: string
+  ): Promise<void> {
+    const cardUri = await this.resolveCurrentCardUri(kanbanUri, cardUriString);
+    if (!cardUri) {
+      vscode.window.showWarningMessage("That ticket moved or was deleted.");
+      return;
+    }
+
+    const value = cardUri.scheme === "file" ? cardUri.fsPath : cardUri.toString();
+    await vscode.env.clipboard.writeText(value);
+    vscode.window.setStatusBarMessage(`Copied task path: ${value}`, 2500);
   }
 
   private async readCardDetails(
@@ -1817,7 +2158,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
     const columnUri = vscode.Uri.joinPath(boardFolder, columnId);
     const meta = await this.readColumnMeta(columnUri, columnId, boardConfig);
-    return this.readCards(columnUri, meta.cardPriorities);
+    return this.readCards(columnUri, columnId, boardConfig, meta.cardPriorities);
   }
 
   private async moveCard(
@@ -1835,10 +2176,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (!fileName) {
       return;
     }
-    const newUri = vscode.Uri.joinPath(targetColumnUri, fileName);
-    if (cardUri.toString() === newUri.toString()) {
+    const desiredNewUri = vscode.Uri.joinPath(targetColumnUri, fileName);
+    if (cardUri.toString() === desiredNewUri.toString()) {
       return;
     }
+    const newUri = await this.createUniqueFileUri(desiredNewUri);
+    const targetFileName = path.posix.basename(newUri.path);
     const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
     const sourceColumnId = path.posix.basename(sourceColumnUri.path);
     const boardConfig =
@@ -1867,9 +2210,72 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         { columnId: targetColumnId, orderedUris: targetOrderedUris },
         { columnId: sourceColumnId, orderedUris: sourceOrderedUris },
       ],
-      context
+      context,
+      [
+        {
+          type: "move",
+          sourceColumnId,
+          sourceFileName: fileName,
+          targetColumnId,
+          targetFileName,
+        },
+      ]
     );
     await this.applyEditContext(context);
+  }
+
+  private async setCardTop(
+    kanbanUri: vscode.Uri,
+    cardUriString: string,
+    top: boolean
+  ): Promise<void> {
+    if (!cardUriString) {
+      return;
+    }
+    const cardUri = await this.resolveCurrentCardUri(kanbanUri, cardUriString);
+    if (!cardUri) {
+      return;
+    }
+    const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
+    const sourceColumnParentUri = vscode.Uri.joinPath(sourceColumnUri, "..");
+    const fileName = path.posix.basename(cardUri.path);
+    const fileNameLower = fileName.toLowerCase();
+    if (
+      sourceColumnParentUri.toString() !== boardFolder.toString() ||
+      !fileNameLower.endsWith(".md") ||
+      fileNameLower === "folder.md" ||
+      fileNameLower === CARD_TEMPLATE_FILE_NAME.toLowerCase()
+    ) {
+      return;
+    }
+
+    const sourceColumnId = path.posix.basename(sourceColumnUri.path);
+    if (!sourceColumnId) {
+      return;
+    }
+    const boardConfig = await this.readBoardConfigForWrite(kanbanUri);
+    if (!boardConfig) {
+      return;
+    }
+
+    const nextData = { ...boardConfig.data };
+    const nextTopCards = setTopCardInSet(
+      boardConfig.topCards,
+      sourceColumnId,
+      fileName,
+      top
+    );
+    setTopCardsInConfigData(nextData, nextTopCards);
+    const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
+    const nextConfig = parseBoardConfig(serialized);
+    if (
+      normalizeLineEndings(serialized) !==
+      normalizeLineEndings(boardConfig.sourceText)
+    ) {
+      await this.applyContentEdit(kanbanUri, serialized);
+    }
+    this.boardConfigCache.set(kanbanUri.toString(), nextConfig);
   }
 
   private async deleteCard(
@@ -1883,12 +2289,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
     const sourceColumnUri = vscode.Uri.joinPath(cardUri, "..");
     const sourceColumnParentUri = vscode.Uri.joinPath(sourceColumnUri, "..");
-    const fileName = path.posix.basename(cardUri.path).toLowerCase();
+    const fileName = path.posix.basename(cardUri.path);
+    const fileNameLower = fileName.toLowerCase();
     if (
       sourceColumnParentUri.toString() !== boardFolder.toString() ||
-      !fileName.endsWith(".md") ||
-      fileName === "folder.md" ||
-      fileName === CARD_TEMPLATE_FILE_NAME.toLowerCase()
+      !fileNameLower.endsWith(".md") ||
+      fileNameLower === "folder.md" ||
+      fileNameLower === CARD_TEMPLATE_FILE_NAME.toLowerCase()
     ) {
       return;
     }
@@ -1909,7 +2316,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       await this.updateBoardCardPriorities(
         kanbanUri,
         [{ columnId: sourceColumnId, orderedUris: sourceOrderedUris }],
-        context
+        context,
+        [{ type: "delete", columnId: sourceColumnId, fileName }]
       );
     }
     await this.applyEditContext(context);
@@ -1936,20 +2344,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const safeTitle = trimmedTitle || "New ticket";
     const baseName = slugifyFileName(trimmedTitle) || "new-ticket";
     const entries = await vscode.workspace.fs.readDirectory(columnUri);
-    const existing = new Set(
-      entries
-        .filter(([, type]) => type === vscode.FileType.File)
-        .map(([name]) => name.toLowerCase())
+    const fileName = makeUniqueFileName(
+      `${baseName}.md`,
+      entries.map(([name]) => name)
     );
-
-    let fileName = `${baseName}.md`;
-    if (existing.has(fileName.toLowerCase())) {
-      let counter = 2;
-      while (existing.has(`${baseName}-${counter}.md`)) {
-        counter += 1;
-      }
-      fileName = `${baseName}-${counter}.md`;
-    }
 
     const boardConfig =
       (await this.readBoardConfigForWrite(kanbanUri)) ??
@@ -1964,15 +2362,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const content = buildNewCardContent(safeTitle, templateContent);
     await this.ensureFile(fileUri);
     await this.applyContentEdit(fileUri, content);
-    await this.updateBoardCardPriorities(kanbanUri, [
-      {
-        columnId,
-        orderedUris: [
-          fileUri.toString(),
-          ...existingCards.map((card) => card.uri),
-        ],
-      },
-    ]);
+    const topCardMutations: TopCardConfigMutation[] =
+      boardConfig.topCards.size > 0
+        ? [{ type: "set", columnId, fileName, top: true }]
+        : [];
+    await this.updateBoardCardPriorities(
+      kanbanUri,
+      [
+        {
+          columnId,
+          orderedUris: [
+            fileUri.toString(),
+            ...existingCards.map((card) => card.uri),
+          ],
+        },
+      ],
+      undefined,
+      topCardMutations
+    );
   }
 
   private async readNewCardTemplate(
@@ -2007,17 +2414,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       (await this.readBoardConfigForWrite(kanbanUri)) ??
       createEmptyBoardConfig("", false);
     let movedCardUriString = cardUriString;
+    const topCardMutations: TopCardConfigMutation[] = [];
     const context = this.createEditContext();
 
     if (cardUriString && sourceColumnId && sourceColumnId !== targetColumnId) {
       const cardUri = vscode.Uri.parse(cardUriString);
       const fileName = cardUri.path.split("/").pop();
       if (fileName) {
-        const newUri = vscode.Uri.joinPath(targetColumnUri, fileName);
+        const newUri = await this.createUniqueFileUri(
+          vscode.Uri.joinPath(targetColumnUri, fileName)
+        );
+        const targetFileName = path.posix.basename(newUri.path);
         if (cardUri.toString() !== newUri.toString()) {
           await this.renameFile(cardUri, newUri, context);
         }
         movedCardUriString = newUri.toString();
+        topCardMutations.push({
+          type: "move",
+          sourceColumnId,
+          sourceFileName: fileName,
+          targetColumnId,
+          targetFileName,
+        });
       }
     }
 
@@ -2042,14 +2460,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         orderedUris: sourceOrderedUris,
       });
     }
-    await this.updateBoardCardPriorities(kanbanUri, columnUpdates, context);
+    await this.updateBoardCardPriorities(
+      kanbanUri,
+      columnUpdates,
+      context,
+      topCardMutations
+    );
     await this.applyEditContext(context);
   }
 
   private async updateBoardCardPriorities(
     kanbanUri: vscode.Uri,
     columnUpdates: { columnId: string; orderedUris: string[] }[],
-    context?: EditContext
+    context?: EditContext,
+    topCardMutations: TopCardConfigMutation[] = []
   ): Promise<void> {
     const normalizedUpdates = new Map<string, string[]>();
     for (const update of columnUpdates) {
@@ -2098,6 +2522,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         boardConfig,
         priorityOverrides
       );
+    }
+    if (topCardMutations.length > 0) {
+      let nextTopCards = new Set(boardConfig.topCards);
+      for (const mutation of topCardMutations) {
+        if (mutation.type === "set" || mutation.type === "delete") {
+          nextTopCards = setTopCardInSet(
+            nextTopCards,
+            mutation.columnId,
+            mutation.fileName,
+            mutation.type === "set" ? mutation.top : false
+          );
+          continue;
+        }
+        nextTopCards = moveTopCardInSet(
+          nextTopCards,
+          mutation.sourceColumnId,
+          mutation.sourceFileName,
+          mutation.targetColumnId,
+          mutation.targetFileName
+        );
+      }
+      setTopCardsInConfigData(nextData, nextTopCards);
     }
 
     const serialized = serializeBoardConfig(nextData, boardConfig.sourceText);
@@ -2234,22 +2680,49 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (!isTaskGuidValue(trimmed)) {
       return;
     }
-    const kind =
-      agentKindFromAgentId(trimmed)
-      ?? normalizeAgentKindValue(agentKind)
-      ?? await this.detectAgentKindFromSessions(trimmed)
-      ?? await this.detectDefaultResumeAgentKind();
     const repoCwd =
       typeof repoPath === "string"
         ? await this.resolvePathDirectory(repoPath)
         : null;
-    const sessionCwd =
-      repoCwd
-      ?? (kind === "claude"
+    const explicitKind = normalizeAgentKindValue(agentKind);
+    const sessionKind = await this.detectAgentKindFromSessions(trimmed, repoCwd);
+    const idKind = agentKindFromAgentId(trimmed);
+    const unambiguousIdKind = idKind === "codex" || idKind === "kimi"
+      ? idKind
+      : null;
+    const configuredDefaultKind = normalizeAgentKindValue(this.getDefaultAgentSetting());
+    const ambiguousUuidDefaultKind =
+      idKind === "claude"
+      && (configuredDefaultKind === "claude" || configuredDefaultKind === "deepseek")
+        ? configuredDefaultKind
+        : null;
+    const fallbackDefaultKind = idKind ? null : configuredDefaultKind;
+    const kind =
+      explicitKind
+      ?? sessionKind
+      ?? unambiguousIdKind
+      ?? ambiguousUuidDefaultKind
+      ?? idKind
+      ?? fallbackDefaultKind
+      ?? await this.detectDefaultResumeAgentKind();
+    const recordedSessionCwd =
+      kind === "claude"
         ? await this.readClaudeSessionCwd(trimmed)
         : kind === "kimi"
           ? await this.readKimiSessionCwd(trimmed)
-        : await this.readCodexSessionCwd(trimmed));
+        : kind === "deepseek"
+          ? await this.readDeepSeekSessionCwd(trimmed)
+        : kind === "opencode"
+          ? await this.readOpencodeSessionCwd(trimmed)
+        : await this.readCodexSessionCwd(trimmed);
+    const sessionCwd = recordedSessionCwd ?? repoCwd;
+    if (kind === "kimi") {
+      await Promise.all(
+        [repoCwd, sessionCwd]
+          .filter((cwd): cwd is string => typeof cwd === "string" && cwd.trim().length > 0)
+          .map((cwd) => ensureKimiWorkspaceTrusted(cwd))
+      );
+    }
     const terminal = vscode.window.createTerminal({
       name: formatAgentTerminalName(ticketTitle, trimmed),
       cwd: sessionCwd ?? undefined,
@@ -2259,6 +2732,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ? this.getClaudeExecutableSetting()
         : kind === "kimi"
           ? this.getKimiExecutableSetting()
+        : kind === "deepseek"
+          ? this.getDeepSeekExecutableSetting()
+        : kind === "opencode"
+          ? this.getOpencodeExecutableSetting()
         : this.getCodexExecutableSetting()
     );
     terminal.show(false);
@@ -2266,6 +2743,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       terminal.sendText(`${executableCommand} --resume ${trimmed}`, true);
     } else if (kind === "kimi") {
       terminal.sendText(`${executableCommand} --session ${trimmed}`, true);
+    } else if (kind === "deepseek") {
+      terminal.sendText(`${executableCommand} --resume ${trimmed}`, true);
+    } else if (kind === "opencode") {
+      terminal.sendText(`${executableCommand} --session ${trimmed} --auto`, true);
     } else {
       terminal.sendText(
         sessionCwd
@@ -2358,6 +2839,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       );
   }
 
+  private getDetailsPaneVisibleSetting(): boolean {
+    return vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<boolean>(DETAILS_PANE_VISIBLE_SETTING, true);
+  }
+
+  private async updateDetailsPaneVisibleSetting(rawVisible: unknown): Promise<void> {
+    const visible =
+      rawVisible === false ||
+      (typeof rawVisible === "string" &&
+        rawVisible.trim().toLowerCase() === "false")
+        ? false
+        : true;
+    await vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .update(
+        DETAILS_PANE_VISIBLE_SETTING,
+        visible,
+        vscode.ConfigurationTarget.Global
+      );
+  }
+
   private async updateRunnerPanelEnabledSetting(enabled: boolean): Promise<void> {
     await vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION)
@@ -2413,10 +2916,26 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return executable || DEFAULT_KIMI_EXECUTABLE;
   }
 
-  private getDefaultAgentSetting(): string {
-    const value = vscode.workspace
+  private getDeepSeekExecutableSetting(): string {
+    const executable = vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION)
-      .get<string | null>(DEFAULT_AGENT_SETTING, null);
+      .get<string>(DEEPSEEK_EXECUTABLE_SETTING, DEFAULT_DEEPSEEK_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_DEEPSEEK_EXECUTABLE;
+  }
+
+  private getOpencodeExecutableSetting(): string {
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(OPENCODE_EXECUTABLE_SETTING, DEFAULT_OPENCODE_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_OPENCODE_EXECUTABLE;
+  }
+
+  private getDefaultAgentSetting(resource?: vscode.Uri): string {
+    const value = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
+      .get<string | null>(DEFAULT_AGENT_SETTING, "auto");
     return typeof value === "string" ? value.trim().toLowerCase() : "";
   }
 
@@ -2426,14 +2945,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return [command, ...args].some((value) => value.includes("${runnerScript}"));
   }
 
-  private async getRunnerToolStatuses(): Promise<RunnerToolStatuses> {
+  private async getRunnerToolStatuses(resource?: vscode.Uri): Promise<RunnerToolStatuses> {
     const pythonStatus = await this.detectRunnerTool(
       "Python",
       this.getRunnerCommandSetting(),
       ["--version"],
       PYTHON_INSTALL_URL
     );
-    const defaultAgent = this.getDefaultAgentSetting();
+    const defaultAgent = this.getDefaultAgentSetting(resource);
+    if (defaultAgent === "manual" || defaultAgent === "human") {
+      return {
+        python: pythonStatus,
+      };
+    }
     if (defaultAgent === "claude") {
       return {
         python: pythonStatus,
@@ -2467,8 +2991,36 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ),
       };
     }
+    if (defaultAgent === "deepseek" || defaultAgent === "deepcode" || defaultAgent === "ds") {
+      return {
+        python: pythonStatus,
+        pywinpty: await this.detectRunnerTool(
+          "pywinpty",
+          "python",
+          ["-c", "import winpty; print('pywinpty ok')"],
+          PYWINPTY_INSTALL_URL
+        ),
+        deepseek: await this.detectRunnerTool(
+          "Deep Code",
+          this.getDeepSeekExecutableSetting(),
+          ["--version"],
+          DEEPSEEK_INSTALL_URL
+        ),
+      };
+    }
+    if (defaultAgent === "opencode" || defaultAgent === "oc") {
+      return {
+        python: pythonStatus,
+        opencode: await this.detectRunnerTool(
+          "opencode",
+          this.getOpencodeExecutableSetting(),
+          ["--version"],
+          OPENCODE_INSTALL_URL
+        ),
+      };
+    }
 
-    const [claudeStatus, codexStatus, kimiStatus] = await Promise.all([
+    const [claudeStatus, codexStatus, opencodeStatus, kimiStatus, deepseekStatus] = await Promise.all([
       this.detectRunnerTool(
         "Claude Code",
         this.getClaudeExecutableSetting(),
@@ -2482,26 +3034,62 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         CODEX_INSTALL_URL
       ),
       this.detectRunnerTool(
+        "opencode",
+        this.getOpencodeExecutableSetting(),
+        ["--version"],
+        OPENCODE_INSTALL_URL
+      ),
+      this.detectRunnerTool(
         "Kimi CLI",
         this.getKimiExecutableSetting(),
         ["--version"],
         KIMI_INSTALL_URL
       ),
+      this.detectRunnerTool(
+        "Deep Code",
+        this.getDeepSeekExecutableSetting(),
+        ["--version"],
+        DEEPSEEK_INSTALL_URL
+      ),
     ]);
+    const needsPywinpty =
+      !claudeStatus.installed &&
+      !codexStatus.installed &&
+      !opencodeStatus.installed &&
+      !kimiStatus.installed &&
+      deepseekStatus.installed;
+    const pywinptyStatus = needsPywinpty
+      ? await this.detectRunnerTool(
+          "pywinpty",
+          "python",
+          ["-c", "import winpty; print('pywinpty ok')"],
+          PYWINPTY_INSTALL_URL
+        )
+      : null;
     return {
       python: pythonStatus,
+      ...(pywinptyStatus ? { pywinpty: pywinptyStatus } : {}),
       agent: {
-        label: "Claude Code, Codex CLI, or Kimi CLI",
-        command: `${claudeStatus.command} / ${codexStatus.command} / ${kimiStatus.command}`,
-        installed: claudeStatus.installed || codexStatus.installed || kimiStatus.installed,
+        label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
+        command: `${claudeStatus.command} / ${codexStatus.command} / ${opencodeStatus.command} / ${kimiStatus.command} / ${deepseekStatus.command}`,
+        installed:
+          claudeStatus.installed ||
+          codexStatus.installed ||
+          opencodeStatus.installed ||
+          kimiStatus.installed ||
+          deepseekStatus.installed,
         version: claudeStatus.installed
           ? `Claude Code ${claudeStatus.version}`
           : codexStatus.installed
             ? `Codex CLI ${codexStatus.version}`
-            : kimiStatus.installed
-              ? `Kimi CLI ${kimiStatus.version}`
-            : "",
-        installUrl: CLAUDE_INSTALL_URL,
+            : opencodeStatus.installed
+              ? `opencode ${opencodeStatus.version}`
+              : kimiStatus.installed
+                ? `Kimi CLI ${kimiStatus.version}`
+                : deepseekStatus.installed
+                  ? `Deep Code ${deepseekStatus.version}`
+              : "",
+        installUrl: OPENCODE_INSTALL_URL,
       },
     };
   }
@@ -2568,7 +3156,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const paths = this.getRunnerTokenPaths(kanbanUri);
     const runnerScriptRequired = this.getRunnerScriptRequiredSetting();
     const probe = await this.probeRunnerStatus(paths.runnerRoot);
-    const requirements = enabled ? await this.getRunnerToolStatuses() : undefined;
+    const requirements = enabled ? await this.getRunnerToolStatuses(kanbanUri) : undefined;
     if (probe) {
       this.runnerLaunches.delete(normalizeMovePath(paths.runnerRoot));
       return {
@@ -2743,6 +3331,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     codexExecutable: string;
     claudeExecutable: string;
     kimiExecutable: string;
+    deepseekExecutable: string;
+    opencodeExecutable: string;
   } {
     const kanbanDir = path.dirname(kanbanUri.fsPath);
     const runnerRoot =
@@ -2764,10 +3354,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       localRunnerScript,
       runnerScript,
       workspaceFolder,
-      defaultAgent: this.getDefaultAgentSetting(),
+      defaultAgent: this.getDefaultAgentSetting(kanbanUri),
       codexExecutable: this.getCodexExecutableSetting(),
       claudeExecutable: this.getClaudeExecutableSetting(),
       kimiExecutable: this.getKimiExecutableSetting(),
+      deepseekExecutable: this.getDeepSeekExecutableSetting(),
+      opencodeExecutable: this.getOpencodeExecutableSetting(),
     };
   }
 
@@ -2786,22 +3378,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     await this.ensureRunnerSupportFiles(runnerRootUri);
     await this.ensureTaskTemplateFile(kanbanUri);
     const destination = path.join(paths.runnerRoot, RUNNER_SCRIPT_NAME);
-    if (existsSync(destination)) {
-      return { runnerPath: destination, kanbanUri };
-    }
-
     const source = this.context.asAbsolutePath(RUNNER_SCRIPT_NAME);
     const content = await vscode.workspace.fs.readFile(vscode.Uri.file(source));
-    await vscode.workspace.fs.writeFile(vscode.Uri.file(destination), content);
+    const destinationUri = vscode.Uri.file(destination);
+    const existing = await this.readExistingText(destinationUri);
+    const bundledText = Buffer.from(content).toString("utf8");
+    if (
+      existing === null ||
+      normalizeLineEndings(existing) !== normalizeLineEndings(bundledText)
+    ) {
+      await vscode.workspace.fs.writeFile(destinationUri, content);
+    }
     return { runnerPath: destination, kanbanUri };
   }
 
-  private async ensureTaskTemplateFile(kanbanUri: vscode.Uri): Promise<void> {
+  private async ensureTaskTemplateFile(kanbanUri: vscode.Uri): Promise<vscode.Uri> {
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
+    const templateUri = vscode.Uri.joinPath(boardFolder, CARD_TEMPLATE_FILE_NAME);
     await this.writeTextFileIfMissingOrEmpty(
-      vscode.Uri.joinPath(boardFolder, CARD_TEMPLATE_FILE_NAME),
+      templateUri,
       DEFAULT_TASK_TEMPLATE_TEXT
     );
+    return templateUri;
   }
 
   private async ensureRunnerSupportFiles(runnerRootUri: vscode.Uri): Promise<void> {
@@ -2958,6 +3556,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       codexExecutable: string;
       claudeExecutable: string;
       kimiExecutable: string;
+      deepseekExecutable: string;
+      opencodeExecutable: string;
     }
   ): string {
     return value
@@ -2968,7 +3568,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .replace(/\$\{defaultAgent\}/g, paths.defaultAgent)
       .replace(/\$\{codexExecutable\}/g, paths.codexExecutable)
       .replace(/\$\{claudeExecutable\}/g, paths.claudeExecutable)
-      .replace(/\$\{kimiExecutable\}/g, paths.kimiExecutable);
+      .replace(/\$\{kimiExecutable\}/g, paths.kimiExecutable)
+      .replace(/\$\{deepseekExecutable\}/g, paths.deepseekExecutable)
+      .replace(/\$\{opencodeExecutable\}/g, paths.opencodeExecutable);
   }
 
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
@@ -3054,6 +3656,30 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       };
     };
 
+    const requestedKind = normalizeAgentKindValue(agentKind);
+    if (requestedKind === "claude") {
+      return buildResult("claude", this.readClaudeOutput(trimmed));
+    }
+    if (requestedKind === "codex") {
+      return buildResult("codex", this.readCodexOutput(trimmed));
+    }
+    if (requestedKind === "kimi") {
+      return buildResult("kimi", this.readKimiOutput(trimmed));
+    }
+    if (requestedKind === "deepseek") {
+      return buildResult("deepseek", this.readDeepSeekOutput(trimmed));
+    }
+    if (requestedKind === "opencode") {
+      return buildResult("opencode", this.readOpencodeOutput(trimmed));
+    }
+
+    if (await this.findDeepSeekSessionFile(trimmed)) {
+      return buildResult("deepseek", this.readDeepSeekOutput(trimmed));
+    }
+    if (await this.findOpencodeSession(trimmed)) {
+      return buildResult("opencode", this.readOpencodeOutput(trimmed));
+    }
+
     const inferredKind = agentKindFromAgentId(trimmed);
     if (inferredKind === "claude") {
       return buildResult("claude", this.readClaudeOutput(trimmed));
@@ -3064,16 +3690,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (inferredKind === "kimi") {
       return buildResult("kimi", this.readKimiOutput(trimmed));
     }
-
-    const requestedKind = normalizeAgentKindValue(agentKind);
-    if (requestedKind === "claude") {
-      return buildResult("claude", this.readClaudeOutput(trimmed));
-    }
-    if (requestedKind === "codex") {
-      return buildResult("codex", this.readCodexOutput(trimmed));
-    }
-    if (requestedKind === "kimi") {
-      return buildResult("kimi", this.readKimiOutput(trimmed));
+    if (inferredKind === "opencode") {
+      return buildResult("opencode", this.readOpencodeOutput(trimmed));
     }
 
     if (await this.findClaudeSessionFile(trimmed)) {
@@ -3093,6 +3711,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ? this.readClaudeOutput(trimmed)
         : defaultKind === "kimi"
           ? this.readKimiOutput(trimmed)
+        : defaultKind === "deepseek"
+          ? this.readDeepSeekOutput(trimmed)
+        : defaultKind === "opencode"
+          ? this.readOpencodeOutput(trimmed)
         : this.readCodexOutput(trimmed)
     );
   }
@@ -3264,6 +3886,98 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readDeepSeekOutput(agentId: string): Promise<string | null> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return null;
+    }
+
+    const sessionFile = await this.findDeepSeekSessionFile(trimmed);
+    if (!sessionFile) {
+      return null;
+    }
+
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sessionFile));
+      const text = Buffer.from(raw).toString("utf8");
+      const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+      const outputBlocks: string[] = [];
+
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        let entry: unknown;
+        try {
+          entry = JSON.parse(lines[index]);
+        } catch {
+          continue;
+        }
+
+        const text = extractDeepCodeRecordText(entry);
+        if (text) {
+          outputBlocks.push(text);
+        }
+
+        if (outputBlocks.length >= 3) {
+          break;
+        }
+      }
+
+      if (outputBlocks.length === 0) {
+        return null;
+      }
+
+      return formatRecentAgentOutputBlocks(outputBlocks);
+    } catch {
+      return null;
+    }
+  }
+
+  private async readOpencodeOutput(agentId: string): Promise<string | null> {
+    const trimmed = normalizeTaskPropertyValue(agentId);
+    if (!isTaskGuidValue(trimmed)) {
+      return null;
+    }
+
+    if (!await this.findOpencodeSession(trimmed)) {
+      return null;
+    }
+
+    try {
+      const result = await execFileAsync(
+        this.getOpencodeExecutableSetting(),
+        ["export", trimmed],
+        {
+          windowsHide: true,
+          timeout: 15000,
+          maxBuffer: 4 * 1024 * 1024,
+          shell: process.platform === "win32",
+        }
+      );
+      const parsed = parseFirstJsonValue(String(result.stdout || ""));
+      const messages = Array.isArray((parsed as { messages?: unknown })?.messages)
+        ? (parsed as { messages: unknown[] }).messages
+        : [];
+      const outputBlocks: string[] = [];
+
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const text = extractOpencodeRecordText(messages[index]);
+        if (text) {
+          outputBlocks.push(text);
+        }
+        if (outputBlocks.length >= 3) {
+          break;
+        }
+      }
+
+      if (outputBlocks.length === 0) {
+        return null;
+      }
+
+      return formatRecentAgentOutputBlocks(outputBlocks);
+    } catch {
+      return null;
+    }
+  }
+
   private async readCodexSessionCwd(agentId: string): Promise<string | null> {
     const sessionFile = await this.findCodexSessionFile(agentId);
     if (!sessionFile) {
@@ -3380,9 +4094,60 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return path.dirname(path.dirname(path.dirname(sessionFile)));
   }
 
+  private async readDeepSeekSessionCwd(agentId: string): Promise<string | null> {
+    const sessionFile = await this.findDeepSeekSessionFile(agentId);
+    if (!sessionFile) {
+      return null;
+    }
+
+    const indexPath = path.join(path.dirname(sessionFile), "sessions-index.json");
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(indexPath));
+      const parsed = JSON.parse(Buffer.from(raw).toString("utf8"));
+      const entries = Array.isArray(parsed?.entries) ? parsed.entries : [];
+      const entry = entries.find((item: { id?: unknown }) => item?.id === agentId);
+      const originalPath =
+        typeof parsed?.originalPath === "string" ? parsed.originalPath.trim() : "";
+      const cwd = typeof entry?.cwd === "string" && entry.cwd.trim()
+        ? entry.cwd.trim()
+        : originalPath;
+      if (!cwd) {
+        return null;
+      }
+      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(cwd));
+      return stat.type === vscode.FileType.Directory ? cwd : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async readOpencodeSessionCwd(agentId: string): Promise<string | null> {
+    const session = await this.findOpencodeSession(agentId);
+    const cwd = session?.directory?.trim();
+    if (!cwd) {
+      return null;
+    }
+    try {
+      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(cwd));
+      return stat.type === vscode.FileType.Directory ? cwd : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async detectAgentKindFromSessions(
-    agentId: string
+    agentId: string,
+    repoPath?: string | null
   ): Promise<AgentKind | null> {
+    if (repoPath && await this.findDeepSeekSessionFileForWorkdir(agentId, repoPath)) {
+      return "deepseek";
+    }
+    if (await this.findDeepSeekSessionFile(agentId)) {
+      return "deepseek";
+    }
+    if (await this.findOpencodeSession(agentId)) {
+      return "opencode";
+    }
     if (await this.findClaudeSessionFile(agentId)) {
       return "claude";
     }
@@ -3395,23 +4160,61 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return null;
   }
 
+  private async findDeepSeekSessionFileForWorkdir(
+    agentId: string,
+    workdir: string
+  ): Promise<string | null> {
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home || !isTaskGuidValue(agentId)) {
+      return null;
+    }
+    const sessionFile = path.join(
+      home,
+      ".deepcode",
+      "projects",
+      deepcodeProjectCode(workdir),
+      `${agentId}.jsonl`
+    );
+    try {
+      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(sessionFile));
+      if (stat.type !== vscode.FileType.File) {
+        return null;
+      }
+      this.deepseekSessionFiles.set(agentId, {
+        path: sessionFile,
+        lastCheckedAt: Date.now(),
+      });
+      return sessionFile;
+    } catch {
+      return null;
+    }
+  }
+
   private async detectDefaultResumeAgentKind(): Promise<AgentKind> {
     const configured = normalizeAgentKindValue(this.getDefaultAgentSetting());
     if (configured) {
       return configured;
     }
-    const [claude, codex, kimi] = await Promise.all([
+    const [claude, codex, opencode, kimi, deepseek] = await Promise.all([
       this.canExecuteTool(this.getClaudeExecutableSetting()),
       this.canExecuteTool(this.getCodexExecutableSetting()),
+      this.canExecuteTool(this.getOpencodeExecutableSetting()),
       this.canExecuteTool(this.getKimiExecutableSetting()),
+      this.canExecuteTool(this.getDeepSeekExecutableSetting()),
     ]);
-    if (claude || (!codex && !kimi)) {
+    if (claude || (!codex && !opencode && !kimi && !deepseek)) {
       return "claude";
     }
-    if (codex || !kimi) {
+    if (codex || (!opencode && !kimi && !deepseek)) {
       return "codex";
     }
-    return "kimi";
+    if (opencode || (!kimi && !deepseek)) {
+      return "opencode";
+    }
+    if (kimi || !deepseek) {
+      return "kimi";
+    }
+    return "deepseek";
   }
 
   private async canExecuteTool(executable: string): Promise<boolean> {
@@ -3420,6 +4223,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         windowsHide: true,
         timeout: RUNNER_TOOL_CHECK_TIMEOUT_MS,
         maxBuffer: 1024 * 1024,
+        shell: process.platform === "win32",
       });
       return true;
     } catch {
@@ -3613,6 +4417,105 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return null;
   }
 
+  private async findDeepSeekSessionFile(agentId: string): Promise<string | null> {
+    const cached = this.deepseekSessionFiles.get(agentId);
+    const now = Date.now();
+    if (cached && now - cached.lastCheckedAt < DETAILS_REFRESH_INTERVAL_MS) {
+      return cached.path || null;
+    }
+    if (cached === null) {
+      return null;
+    }
+
+    const home = process.env.USERPROFILE || process.env.HOME;
+    if (!home) {
+      this.deepseekSessionFiles.set(agentId, null);
+      return null;
+    }
+
+    const root = path.join(home, ".deepcode", "projects");
+    try {
+      const command = `Get-ChildItem -Path '${escapePowerShellSingleQuotedString(root)}' -Recurse -File -Filter '${agentId}.jsonl' | Select-Object -First 1 -ExpandProperty FullName`;
+      const result = await execFileAsync(
+        "powershell",
+        ["-NoProfile", "-Command", command],
+        {
+          windowsHide: true,
+          timeout: 5000,
+          maxBuffer: 1024 * 1024,
+        }
+      );
+      const found = String(result.stdout || "").trim();
+      if (found) {
+        this.deepseekSessionFiles.set(agentId, {
+          path: found,
+          lastCheckedAt: now,
+        });
+        return found;
+      }
+    } catch {
+      // fall through to the cached miss below
+    }
+
+    this.deepseekSessionFiles.set(agentId, {
+      path: "",
+      lastCheckedAt: now,
+    });
+    return null;
+  }
+
+  private async findOpencodeSession(agentId: string): Promise<OpencodeSessionInfo | null> {
+    const cached = this.opencodeSessions.get(agentId);
+    const now = Date.now();
+    if (cached && now - cached.lastCheckedAt < DETAILS_REFRESH_INTERVAL_MS) {
+      return cached.directory ? cached : null;
+    }
+    if (cached === null) {
+      return null;
+    }
+    if (!isOpencodeSessionId(agentId)) {
+      this.opencodeSessions.set(agentId, null);
+      return null;
+    }
+
+    try {
+      const result = await execFileAsync(
+        this.getOpencodeExecutableSetting(),
+        ["session", "list", "--format", "json", "--max-count", "200"],
+        {
+          windowsHide: true,
+          timeout: 10000,
+          maxBuffer: 2 * 1024 * 1024,
+          shell: process.platform === "win32",
+        }
+      );
+      const parsed = parseFirstJsonValue(String(result.stdout || ""));
+      const entries = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+      const entry = entries.find((item) => {
+        return item
+          && typeof item === "object"
+          && String((item as { id?: unknown }).id || "").trim() === agentId;
+      });
+      if (!entry || typeof entry !== "object") {
+        this.opencodeSessions.set(agentId, {
+          directory: "",
+          lastCheckedAt: now,
+        });
+        return null;
+      }
+      const directory = String((entry as { directory?: unknown }).directory || "").trim();
+      const info = { directory, lastCheckedAt: now };
+      this.opencodeSessions.set(agentId, info);
+      return info;
+    } catch {
+      this.opencodeSessions.set(agentId, {
+        directory: "",
+        lastCheckedAt: now,
+      });
+      return null;
+    }
+  }
+
   private async resolveEditorCursorPlaceholder(
     editor: vscode.TextEditor | undefined
   ): Promise<void> {
@@ -3672,6 +4575,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return;
     }
     await vscode.workspace.fs.rename(oldUri, newUri, { overwrite: false });
+  }
+
+  private async createUniqueFileUri(desiredUri: vscode.Uri): Promise<vscode.Uri> {
+    const directoryUri = vscode.Uri.joinPath(desiredUri, "..");
+    const desiredFileName = path.posix.basename(desiredUri.path);
+    const entries = await vscode.workspace.fs.readDirectory(directoryUri);
+    const uniqueFileName = makeUniqueFileName(
+      desiredFileName,
+      entries.map(([name]) => name)
+    );
+    return vscode.Uri.joinPath(directoryUri, uniqueFileName);
   }
 
   private async ensureFile(
@@ -3742,7 +4656,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
   private getHtml(
     webview: vscode.Webview,
-    detailsPaneWidth: number
+    detailsPaneWidth: number,
+    detailsPaneVisible: boolean
   ): string {
     const nonce = getNonce();
     const csp = [
@@ -3870,23 +4785,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .board-tag-filter-select:focus {
       border-color: var(--vscode-focusBorder, var(--accent));
     }
-    .board-agent-count {
-      display: inline-flex;
-      align-items: center;
-      min-height: 38px;
-      padding: 0 10px;
-      border: 1px solid var(--line);
-      border-radius: 10px;
-      background: var(--surface);
-      color: var(--muted);
-      font-family: var(--mono);
-      font-size: 12px;
-      font-weight: 700;
-      white-space: nowrap;
-    }
-    .board-agent-count[hidden] {
-      display: none;
-    }
     .search-meta {
       font-family: var(--mono);
       font-size: 12px;
@@ -3908,6 +4806,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       background: var(--accent-soft);
     }
     .search-clear:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .details-pane-toggle {
+      border: 1px solid var(--line);
+      background: var(--surface);
+      color: var(--ink);
+      font-family: var(--mono);
+      font-size: 11px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .details-pane-toggle:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .details-pane-toggle:focus {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
@@ -4017,6 +4934,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .layout.resizing {
       user-select: none;
     }
+    .layout.details-hidden {
+      grid-template-columns: minmax(0, 1fr);
+    }
+    .layout.details-hidden .details,
+    .layout.details-hidden .details-resizer {
+      display: none;
+    }
     .board-scroll {
       flex: 1;
       min-height: 0;
@@ -4040,6 +4964,23 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       display: flex;
       flex-direction: column;
       gap: 10px;
+    }
+    .top-card-section,
+    .regular-card-section {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      flex: 0 0 auto;
+    }
+    .top-card-section {
+      min-height: var(--top-section-height, 0px);
+    }
+    .top-section-divider {
+      height: 2mm;
+      flex: 0 0 2mm;
+      margin: 0 -12px;
+      border: 0;
+      background: var(--bg);
     }
     .column-header {
       display: flex;
@@ -4155,6 +5096,35 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       border-color: var(--line);
       background: var(--panel);
     }
+    .card-context-menu {
+      position: fixed;
+      z-index: 20;
+      min-width: 150px;
+      padding: 5px;
+      border: 1px solid var(--vscode-menu-border, var(--line));
+      border-radius: 10px;
+      background: var(--vscode-menu-background, var(--surface));
+      color: var(--vscode-menu-foreground, var(--ink));
+      box-shadow: 0 18px 30px -18px var(--shadow);
+    }
+    .card-context-menu button {
+      display: block;
+      width: 100%;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: var(--vscode-menu-foreground, var(--ink));
+      cursor: pointer;
+      font: inherit;
+      padding: 7px 9px;
+      text-align: left;
+    }
+    .card-context-menu button:hover,
+    .card-context-menu button:focus {
+      outline: none;
+      background: var(--vscode-menu-selectionBackground, var(--accent-soft));
+      color: var(--vscode-menu-selectionForeground, var(--ink));
+    }
     .meta {
       font-family: var(--mono);
       font-size: 12px;
@@ -4251,6 +5221,54 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .details h1 {
       margin: 0;
       font-size: 22px;
+    }
+    .details-header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex: 0 0 auto;
+    }
+    .details-top-toggle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--muted);
+      cursor: pointer;
+      padding: 0;
+    }
+    .details-top-toggle:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--ink);
+    }
+    .details-top-toggle:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .details-top-toggle[aria-pressed="true"] {
+      border-color: var(--vscode-button-background, var(--accent));
+      background: var(--vscode-button-background, var(--accent));
+      color: var(--vscode-button-foreground, var(--bg));
+    }
+    .details-top-toggle[aria-pressed="true"]:hover {
+      border-color: var(--vscode-button-hoverBackground, var(--accent));
+      background: var(--vscode-button-hoverBackground, var(--accent));
+      color: var(--vscode-button-foreground, var(--bg));
+    }
+    .details-top-toggle svg {
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
     }
     .details-delete {
       display: inline-flex;
@@ -4550,7 +5568,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   </style>
 </head>
 <body>
-  <div class="layout" id="layout">
+  <div class="layout${detailsPaneVisible ? "" : " details-hidden"}" id="layout">
     <section class="board-pane">
       <div class="board-toolbar">
         <label class="board-search" for="board-search-input">
@@ -4569,8 +5587,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             <option value="">All tags</option>
           </select>
         </label>
-        <div class="board-agent-count" id="board-agent-count" title="Active agents" hidden></div>
         <button class="search-clear" id="search-clear" type="button" hidden>Clear</button>
+        <button
+          class="details-pane-toggle"
+          id="details-pane-toggle"
+          type="button"
+          aria-pressed="${detailsPaneVisible ? "true" : "false"}"
+          title="${detailsPaneVisible ? "Hide details panel" : "Show details panel"}"
+        >${detailsPaneVisible ? "Hide details" : "Show details"}</button>
         <div class="search-meta" id="search-meta"></div>
       </div>
       <div class="runner-panel" id="runner-panel" hidden></div>
@@ -4578,8 +5602,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <section class="board" id="board"></section>
       </div>
     </section>
-    <div class="details-resizer" id="details-resizer" aria-hidden="true"></div>
-    <aside class="details" id="details">
+    <div class="details-resizer" id="details-resizer" aria-hidden="true"${detailsPaneVisible ? "" : " hidden"}></div>
+    <aside class="details" id="details"${detailsPaneVisible ? "" : " hidden"}>
       <div class="empty">Select a card to view details.</div>
     </aside>
   </div>
@@ -4593,7 +5617,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const tagFilterEl = document.getElementById("board-tag-filter");
     const searchMetaEl = document.getElementById("search-meta");
     const searchClearEl = document.getElementById("search-clear");
-    const agentCountEl = document.getElementById("board-agent-count");
+    const detailsToggleEl = document.getElementById("details-pane-toggle");
     const runnerPanelEl = document.getElementById("runner-panel");
     const rootStyle = document.documentElement?.style || null;
     let selectedCard = null;
@@ -4618,7 +5642,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let draggingCard = null;
     let draggingColumn = null;
     let detailsPaneWidth = ${detailsPaneWidth};
+    let detailsPaneVisible = ${detailsPaneVisible ? "true" : "false"};
     let activeDetailsResize = null;
+    let cardContextMenuEl = null;
 
     const escapeHtml = (value) => {
       return String(value ?? "")
@@ -4704,25 +5730,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return Math.floor(value);
     };
 
-    const renderActiveAgentCount = () => {
-      if (!agentCountEl) {
-        return;
-      }
-      if (!runnerStatus?.running) {
-        agentCountEl.hidden = true;
-        agentCountEl.textContent = "";
-        agentCountEl.removeAttribute?.("aria-label");
-        return;
-      }
-      const count = activeAgentCount();
-      const label = count === 1 ? "1 running agent" : \`\${count} running agents\`;
-      const title = label;
-      agentCountEl.hidden = false;
-      agentCountEl.textContent = label;
-      agentCountEl.setAttribute("aria-label", title);
-      agentCountEl.setAttribute("title", title);
-    };
-
     const activeAgentSummary = () => {
       const count = runnerStatus?.running ? activeAgentCount() : 0;
       if (count < 1) {
@@ -4757,8 +5764,40 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return detailsPaneWidth;
     };
 
+    const normalizeDetailsPaneVisibility = (value) => {
+      if (value === false) {
+        return false;
+      }
+      if (typeof value === "string" && value.trim().toLowerCase() === "false") {
+        return false;
+      }
+      return true;
+    };
+
+    const applyDetailsPaneVisibility = (value) => {
+      detailsPaneVisible = normalizeDetailsPaneVisibility(value);
+      layoutEl?.classList?.toggle("details-hidden", !detailsPaneVisible);
+      if (detailsEl) {
+        detailsEl.hidden = !detailsPaneVisible;
+      }
+      if (detailsResizerEl) {
+        detailsResizerEl.hidden = !detailsPaneVisible;
+      }
+      if (!detailsPaneVisible) {
+        activeDetailsResize = null;
+        layoutEl?.classList?.remove("resizing");
+        detailsResizerEl?.classList?.remove("active");
+      }
+      if (detailsToggleEl) {
+        detailsToggleEl.textContent = detailsPaneVisible ? "Hide details" : "Show details";
+        detailsToggleEl.title = detailsPaneVisible ? "Hide details panel" : "Show details panel";
+        detailsToggleEl.setAttribute("aria-pressed", detailsPaneVisible ? "true" : "false");
+      }
+      return detailsPaneVisible;
+    };
+
     const canResizeDetailsPane = () => {
-      return typeof window.innerWidth !== "number" || window.innerWidth > 900;
+      return detailsPaneVisible && (typeof window.innerWidth !== "number" || window.innerWidth > 900);
     };
 
     const beginDetailsResize = (event) => {
@@ -4888,6 +5927,24 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (normalized === "kimi" || normalized === "agent:kimi") {
         return "kimi";
       }
+      if (
+        normalized === "opencode" ||
+        normalized === "oc" ||
+        normalized === "agent:opencode" ||
+        normalized === "agent:oc"
+      ) {
+        return "opencode";
+      }
+      if (
+        normalized === "deepseek" ||
+        normalized === "deepcode" ||
+        normalized === "ds" ||
+        normalized === "agent:deepseek" ||
+        normalized === "agent:deepcode" ||
+        normalized === "agent:ds"
+      ) {
+        return "deepseek";
+      }
       return null;
     };
 
@@ -4895,6 +5952,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const normalized = String(value || "").trim().toLowerCase();
       if (/^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
         return "kimi";
+      }
+      if (/^ses_[a-z0-9]+$/i.test(normalized)) {
+        return "opencode";
       }
       if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
         return null;
@@ -4920,9 +5980,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
 
     const getAgentKind = (card) => {
-      return getAgentKindFromId(getPropertyValue(card, "Agent"))
-        || normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
-        || getAgentKindFromTags(card);
+      const idKind = getAgentKindFromId(getPropertyValue(card, "Agent"));
+      if (idKind === "codex" || idKind === "kimi" || idKind === "opencode") {
+        return idKind;
+      }
+      return normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
+        || getAgentKindFromTags(card)
+        || idKind;
     };
 
     const getAgentOutputTitle = (card, cached) => {
@@ -4935,6 +5999,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (kind === "kimi") {
         return "Kimi Output";
+      }
+      if (kind === "opencode") {
+        return "opencode Output";
+      }
+      if (kind === "deepseek") {
+        return "DeepSeek Output";
       }
       return "Agent Output";
     };
@@ -5107,7 +6177,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       detailsRefreshTimer = setInterval(() => {
-        if (!selectedCard) {
+        if (!detailsPaneVisible || !selectedCard) {
           return;
         }
         refreshDetailsData(selectedCard);
@@ -5116,10 +6186,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const renderDetails = (card) => {
       if (!card) {
-        renderDetailsPlaceholder("Select a card to view details.");
+        if (detailsPaneVisible) {
+          renderDetailsPlaceholder("Select a card to view details.");
+        }
         return;
       }
       selectedCard = card;
+      if (!detailsPaneVisible) {
+        return;
+      }
       const created = new Date(card.createdAt);
       const createdLabel = created.toLocaleString();
       const createdRelative = formatRelativeTime(created);
@@ -5135,22 +6210,37 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             <h1>\${escapeHtml(card.title)}</h1>
             <div class="meta">\${metaLine}</div>
           </div>
-          <button
-            class="details-delete"
-            type="button"
-            title="Delete ticket"
-            aria-label="Delete \${escapeHtml(card.title)}"
-            data-action-type="deleteCard"
-            data-action-value="\${escapeHtml(card.uri)}"
-          >
-            <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-              <path d="M4 7h16" />
-              <path d="M10 11v6" />
-              <path d="M14 11v6" />
-              <path d="M6 7l1 14h10l1-14" />
-              <path d="M9 7V4h6v3" />
-            </svg>
-          </button>
+          <div class="details-header-actions">
+            <button
+              class="details-top-toggle"
+              type="button"
+              title="\${card.top ? "Remove from top section" : "Keep in top section"}"
+              aria-label="\${card.top ? "Remove " : "Keep "}\${escapeHtml(card.title)} \${card.top ? "from" : "in"} top section"
+              aria-pressed="\${card.top ? "true" : "false"}"
+              data-action-type="toggleTopCard"
+              data-action-value="\${escapeHtml(card.uri)}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M12 3l2.7 5.5 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.8 1-6.1-4.4-4.3 6.1-.9L12 3z" />
+              </svg>
+            </button>
+            <button
+              class="details-delete"
+              type="button"
+              title="Delete ticket"
+              aria-label="Delete \${escapeHtml(card.title)}"
+              data-action-type="deleteCard"
+              data-action-value="\${escapeHtml(card.uri)}"
+            >
+              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <path d="M4 7h16" />
+                <path d="M10 11v6" />
+                <path d="M14 11v6" />
+                <path d="M6 7l1 14h10l1-14" />
+                <path d="M9 7V4h6v3" />
+              </svg>
+            </button>
+          </div>
         </div>
         \${tagsHtml}
         \${propertiesHtml}
@@ -5173,8 +6263,35 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return String(card?.searchText || "").toLowerCase();
     };
 
+    const parseSearchQuery = (query) => {
+      const textTokens = [];
+      const tagTokens = [];
+      for (const token of String(query || "").split(/\\s+/).filter(Boolean)) {
+        if (token.startsWith("#") && token.length > 1) {
+          tagTokens.push(token.slice(1));
+        } else {
+          textTokens.push(token);
+        }
+      }
+      return {
+        text: textTokens.join(" "),
+        tags: tagTokens,
+      };
+    };
+
     const matchesSearch = (card, query) => {
-      return !query || buildCardSearchText(card).includes(query);
+      if (!query) {
+        return true;
+      }
+      const parsedQuery = parseSearchQuery(query);
+      if (parsedQuery.text && !buildCardSearchText(card).includes(parsedQuery.text)) {
+        return false;
+      }
+      if (!parsedQuery.tags.length) {
+        return true;
+      }
+      const cardTags = new Set(getCardTags(card).map((tag) => tag.toLowerCase()));
+      return parsedQuery.tags.every((tag) => cardTags.has(tag));
     };
 
     const NO_TAG_FILTER = "__kanban_no_tag__";
@@ -5291,6 +6408,87 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const getDragTypes = (event) => {
       return Array.from(event?.dataTransfer?.types || []);
+    };
+
+    const getDraggedCardSourceColumnId = (event, cardUri) => {
+      let sourceColumnId = draggingCard?.columnId;
+      if (!sourceColumnId) {
+        try {
+          const payload = JSON.parse(event?.dataTransfer?.getData(cardDragType) || "{}");
+          sourceColumnId = payload.columnId;
+        } catch {}
+      }
+      if (!sourceColumnId && cardUri) {
+        sourceColumnId = findCardColumnId(lastBoard, cardUri);
+      }
+      return sourceColumnId || null;
+    };
+
+    const getColumnCardElements = (columnEl, cardUri) => {
+      if (!columnEl || typeof columnEl.querySelectorAll !== "function") {
+        return [];
+      }
+      return Array.from(columnEl.querySelectorAll(".card[data-uri]"))
+        .filter((element) => {
+          const uri = element?.dataset?.uri;
+          return uri && uri !== cardUri;
+        })
+        .map((element) => {
+          const rect = typeof element.getBoundingClientRect === "function"
+            ? element.getBoundingClientRect()
+            : null;
+          const top = Number(rect?.top);
+          const bottom = Number(rect?.bottom ?? (Number(rect?.top) + Number(rect?.height)));
+          if (!Number.isFinite(top) || !Number.isFinite(bottom)) {
+            return null;
+          }
+          return { element, uri: element.dataset.uri, top, bottom };
+        })
+        .filter(Boolean)
+        .sort((left, right) => left.top - right.top);
+    };
+
+    const resolveColumnCardDrop = (columnEl, cardUri, clientY) => {
+      const y = Number(clientY);
+      if (!Number.isFinite(y)) {
+        return null;
+      }
+      const cardElements = getColumnCardElements(columnEl, cardUri);
+      if (!cardElements.length) {
+        return null;
+      }
+      const first = cardElements[0];
+      if (y <= first.top) {
+        return { targetUri: first.uri, position: "before", element: first.element };
+      }
+      for (let index = 0; index < cardElements.length; index++) {
+        const entry = cardElements[index];
+        const center = entry.top + (entry.bottom - entry.top) / 2;
+        if (y >= entry.top && y <= entry.bottom) {
+          return {
+            targetUri: entry.uri,
+            position: y < center ? "before" : "after",
+            element: entry.element,
+          };
+        }
+        const next = cardElements[index + 1];
+        if (next && y > entry.bottom && y < next.top) {
+          const gapCenter = entry.bottom + (next.top - entry.bottom) / 2;
+          return y < gapCenter
+            ? { targetUri: entry.uri, position: "after", element: entry.element }
+            : { targetUri: next.uri, position: "before", element: next.element };
+        }
+      }
+      return null;
+    };
+
+    const clearCardDropTargets = (columnEl) => {
+      if (!columnEl || typeof columnEl.querySelectorAll !== "function") {
+        return;
+      }
+      for (const element of Array.from(columnEl.querySelectorAll(".card-drop-target"))) {
+        element.classList.remove("card-drop-target");
+      }
     };
 
     const getCardUris = (cards) => {
@@ -5415,6 +6613,50 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       vscode.postMessage({ type: "openFile", cardUri: card.uri });
     };
 
+    const hideCardContextMenu = () => {
+      if (!cardContextMenuEl) {
+        return;
+      }
+      cardContextMenuEl.remove();
+      cardContextMenuEl = null;
+    };
+
+    const showCardContextMenu = (card, clientX, clientY) => {
+      if (!card?.uri) {
+        return;
+      }
+      hideCardContextMenu();
+      const menuEl = document.createElement("div");
+      menuEl.className = "card-context-menu";
+      menuEl.setAttribute("role", "menu");
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.setAttribute("role", "menuitem");
+      copyButton.textContent = "Copy path";
+      copyButton.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        vscode.postMessage({ type: "copyCardPath", cardUri: card.uri });
+        hideCardContextMenu();
+      });
+      menuEl.appendChild(copyButton);
+      const host = document.body || boardEl;
+      host.appendChild(menuEl);
+      const menuRect = typeof menuEl.getBoundingClientRect === "function"
+        ? menuEl.getBoundingClientRect()
+        : { width: 150, height: 40 };
+      const maxLeft = Math.max(0, Number(window.innerWidth || 0) - Number(menuRect.width || 150) - 8);
+      const maxTop = Math.max(0, Number(window.innerHeight || 0) - Number(menuRect.height || 40) - 8);
+      const left = Math.max(8, Math.min(Number(clientX || 0), maxLeft || 8));
+      const top = Math.max(8, Math.min(Number(clientY || 0), maxTop || 8));
+      menuEl.style.left = left + "px";
+      menuEl.style.top = top + "px";
+      cardContextMenuEl = menuEl;
+      if (typeof copyButton.focus === "function") {
+        copyButton.focus();
+      }
+    };
+
     const findCard = (board, uri) => {
       for (const column of board?.columns || []) {
         for (const card of column.cards || []) {
@@ -5464,6 +6706,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
 
     const syncDetails = () => {
+      if (!detailsPaneVisible) {
+        return;
+      }
       if (!selectedCard) {
         renderDetailsPlaceholder("Select a card to view details.");
         return;
@@ -5490,6 +6735,46 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       renderDetails(updated);
     };
 
+    const syncTopSectionHeights = (topSections) => {
+      if (!topSections.length) {
+        return;
+      }
+      for (const section of topSections) {
+        section.style.setProperty("--top-section-height", "0px");
+      }
+      const maxHeight = Math.max(
+        0,
+        ...topSections.map((section) => {
+          const scrollHeight = Number(section.scrollHeight || 0);
+          if (scrollHeight > 0) {
+            return scrollHeight;
+          }
+          return Number(section.getBoundingClientRect?.().height || 0);
+        })
+      );
+      const height = maxHeight > 0 ? Math.ceil(maxHeight) + "px" : "0px";
+      for (const section of topSections) {
+        section.style.setProperty("--top-section-height", height);
+      }
+    };
+
+    const scheduleTopSectionHeightSync = (topSections) => {
+      syncTopSectionHeights(topSections);
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => syncTopSectionHeights(topSections));
+      }
+    };
+
+    const formatColumnCount = (allCards, visibleCards, topCards, topMode, searchActive) => {
+      if (topMode) {
+        return \`\${topCards.length}/\${allCards.length}\`;
+      }
+      if (searchActive) {
+        return \`\${visibleCards.length}/\${allCards.length}\`;
+      }
+      return String(allCards.length);
+    };
+
     const renderBoard = (board) => {
       boardEl.innerHTML = "";
       updateTagFilterOptions(board);
@@ -5502,16 +6787,39 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const activeTagFilter = selectedTagFilter;
       const searchActive = Boolean(activeQuery || activeTagFilter);
       const visibleColumns = [];
-      const firstColumnId = board.columns[0]?.id ?? board.columns[0]?.name;
+      const columnStates = [];
+      let hasVisibleTopCards = false;
       for (const column of board.columns) {
         const columnId = column.id ?? column.name;
         const allCards = Array.isArray(column.cards) ? column.cards : [];
         const visibleCards = searchActive
           ? allCards.filter((card) => matchesActiveFilters(card, activeQuery, activeTagFilter))
           : allCards;
+        const topCards = visibleCards.filter((card) => card.top);
+        if (topCards.length > 0) {
+          hasVisibleTopCards = true;
+        }
+        const regularCards = visibleCards.filter((card) => !card.top);
         visibleColumns.push({ id: columnId, cards: visibleCards });
+        columnStates.push({
+          column,
+          columnId,
+          allCards,
+          visibleCards,
+          topCards,
+          regularCards,
+        });
+      }
+      const topSections = [];
+      const firstColumnId = board.columns[0]?.id ?? board.columns[0]?.name;
+      for (const state of columnStates) {
+        const { column, columnId, allCards, visibleCards, topCards, regularCards } = state;
+        const displayCards = hasVisibleTopCards
+          ? [...topCards, ...regularCards]
+          : visibleCards;
+        const cardsForOrder = hasVisibleTopCards ? displayCards : allCards;
         const columnEl = document.createElement("div");
-        columnEl.className = "column";
+        columnEl.className = hasVisibleTopCards ? "column top-mode" : "column";
         columnEl.dataset.column = columnId;
         const headerEl = document.createElement("div");
         headerEl.className = searchActive ? "column-header static" : "column-header";
@@ -5528,9 +6836,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
         const titleEl = document.createElement("h2");
         titleEl.className = "column-title";
-        titleEl.textContent = searchActive
-          ? \`\${column.name} (\${visibleCards.length}/\${allCards.length})\`
-          : \`\${column.name} (\${allCards.length})\`;
+        titleEl.textContent = \`\${column.name} (\${formatColumnCount(
+          allCards,
+          visibleCards,
+          topCards,
+          hasVisibleTopCards,
+          searchActive
+        )})\`;
         titleEl.addEventListener("dblclick", (event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -5560,6 +6872,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           if (acceptsColumn || acceptsCard) {
             event.preventDefault();
             columnEl.classList.add("drop-target");
+            if (acceptsCard && !searchActive) {
+              clearCardDropTargets(columnEl);
+              const cardUri = event.dataTransfer.getData("text/uri-list");
+              const placement = resolveColumnCardDrop(columnEl, cardUri, event.clientY);
+              placement?.element?.classList?.add("card-drop-target");
+            }
           }
         });
         columnEl.addEventListener("dragleave", (event) => {
@@ -5570,12 +6888,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           ) {
             return;
           }
+          clearCardDropTargets(columnEl);
           columnEl.classList.remove("drop-target");
         });
         columnEl.addEventListener("drop", (event) => {
           const types = getDragTypes(event);
           if (!searchActive && types.includes(columnDragType)) {
             event.preventDefault();
+            clearCardDropTargets(columnEl);
             columnEl.classList.remove("drop-target");
             const sourceColumnId = draggingColumn || event.dataTransfer.getData(columnDragType);
             if (!sourceColumnId || sourceColumnId === columnId) {
@@ -5592,27 +6912,39 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             return;
           }
           event.preventDefault();
+          clearCardDropTargets(columnEl);
           columnEl.classList.remove("drop-target");
           const cardUri = event.dataTransfer.getData("text/uri-list");
           if (cardUri) {
-            let sourceColumnId = draggingCard?.columnId;
-            if (!sourceColumnId) {
-              try {
-                const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
-                sourceColumnId = payload.columnId;
-              } catch {}
-            }
-            if (!sourceColumnId) {
-              sourceColumnId = findCardColumnId(lastBoard, cardUri);
-            }
-            if (searchActive && sourceColumnId === columnId) {
-              return;
-            }
+            const sourceColumnId = getDraggedCardSourceColumnId(event, cardUri);
+            const placement = !searchActive
+              ? resolveColumnCardDrop(columnEl, cardUri, event.clientY)
+              : null;
             if (sourceColumnId === columnId) {
+              if (searchActive || !placement) {
+                return;
+              }
+              const orderedUris = buildOrderedUris(
+                cardsForOrder,
+                cardUri,
+                placement.targetUri,
+                placement.position
+              );
+              if (hasSameOrder(cardsForOrder, orderedUris)) {
+                return;
+              }
+              vscode.postMessage({
+                type: "reorderCards",
+                cardUri,
+                sourceColumnId,
+                targetColumnId: columnId,
+                orderedUris,
+              });
               return;
             }
-            const movePosition = sourceColumnId && sourceColumnId !== columnId ? "start" : "after";
-            const orderedUris = buildOrderedUris(allCards, cardUri, null, movePosition);
+            const orderedUris = placement
+              ? buildOrderedUris(cardsForOrder, cardUri, placement.targetUri, placement.position)
+              : buildOrderedUris(cardsForOrder, cardUri, null, "start");
             vscode.postMessage({
               type: "reorderCards",
               cardUri,
@@ -5623,16 +6955,33 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           }
         });
 
+        let topSectionEl = null;
+        let regularSectionEl = null;
+        if (hasVisibleTopCards) {
+          topSectionEl = document.createElement("div");
+          topSectionEl.className = topCards.length ? "top-card-section" : "top-card-section empty";
+          topSections.push(topSectionEl);
+          columnEl.appendChild(topSectionEl);
+
+          const dividerEl = document.createElement("div");
+          dividerEl.className = "top-section-divider";
+          columnEl.appendChild(dividerEl);
+
+          regularSectionEl = document.createElement("div");
+          regularSectionEl.className = "regular-card-section";
+          columnEl.appendChild(regularSectionEl);
+        }
+
         if (!visibleCards.length) {
           const emptyEl = document.createElement("div");
           emptyEl.className = "column-empty";
           emptyEl.textContent = searchActive ? "No matches in this column." : "No cards yet.";
-          columnEl.appendChild(emptyEl);
+          (regularSectionEl || columnEl).appendChild(emptyEl);
         }
 
-        for (const card of visibleCards) {
+        for (const card of displayCards) {
           const cardEl = document.createElement("div");
-          cardEl.className = "card";
+          cardEl.className = card.top ? "card is-top" : "card";
           cardEl.draggable = true;
           cardEl.dataset.uri = card.uri;
           cardEl.dataset.column = columnId;
@@ -5646,7 +6995,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const createdLabel = created.toLocaleDateString();
           const createdRelative = formatRelativeTime(created);
           const metaLine = createdLabel + " · " + createdRelative;
-          const isFirstCard = allCards[0]?.uri === card.uri;
+          const isFirstCard = cardsForOrder[0]?.uri === card.uri;
           cardEl.innerHTML = \`
             <div class="card-title-row">
               <h3 title="\${escapeHtml(card.title)}">\${escapeHtml(card.title)}</h3>
@@ -5671,7 +7020,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             if (actionButton?.getAttribute("data-card-action") === "bump") {
               event.preventDefault?.();
               event.stopPropagation?.();
-              bumpCardToTop(card, columnId, allCards);
+              bumpCardToTop(card, columnId, cardsForOrder);
               return;
             }
             renderDetails(card);
@@ -5684,6 +7033,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               return;
             }
             openCard(card);
+          });
+          cardEl.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            showCardContextMenu(card, event.clientX, event.clientY);
           });
           cardEl.addEventListener("dragstart", (event) => {
             draggingCard = { uri: card.uri, columnId };
@@ -5726,20 +7080,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               if (cardUri === card.uri) {
                 return;
               }
-              let sourceColumnId = draggingCard?.columnId;
-              if (!sourceColumnId) {
-                try {
-                  const payload = JSON.parse(event.dataTransfer.getData(cardDragType) || "{}");
-                  sourceColumnId = payload.columnId;
-                } catch {}
-              }
-              if (!sourceColumnId) {
-                sourceColumnId = findCardColumnId(lastBoard, cardUri);
-              }
+              const sourceColumnId = getDraggedCardSourceColumnId(event, cardUri);
               const rect = cardEl.getBoundingClientRect();
               const position = event.clientY < rect.top + rect.height / 2 ? "before" : "after";
-              const orderedUris = buildOrderedUris(allCards, cardUri, card.uri, position);
-              if (sourceColumnId === columnId && hasSameOrder(allCards, orderedUris)) {
+              const orderedUris = buildOrderedUris(cardsForOrder, cardUri, card.uri, position);
+              if (sourceColumnId === columnId && hasSameOrder(cardsForOrder, orderedUris)) {
                 return;
               }
               vscode.postMessage({
@@ -5751,11 +7096,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               });
             });
           }
-          columnEl.appendChild(cardEl);
+          const cardTargetEl = hasVisibleTopCards && card.top
+            ? topSectionEl
+            : (regularSectionEl || columnEl);
+          cardTargetEl.appendChild(cardEl);
         }
         boardEl.appendChild(columnEl);
       }
       updateSearchUi(board.columns, visibleColumns);
+      if (hasVisibleTopCards) {
+        scheduleTopSectionHeightSync(topSections);
+      }
     };
 
     const refreshBoard = () => {
@@ -5807,7 +7158,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     };
 
     if (searchInputEl) {
-      searchInputEl.placeholder = \`Search cards (\${searchShortcutLabel})\`;
+      searchInputEl.placeholder = \`Search cards or #tags (\${searchShortcutLabel})\`;
       searchInputEl.addEventListener("input", () => {
         setSearchQuery(searchInputEl.value);
       });
@@ -5886,13 +7237,28 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     applyDetailsPaneWidth(detailsPaneWidth);
+    applyDetailsPaneVisibility(detailsPaneVisible);
 
     if (detailsResizerEl) {
       detailsResizerEl.addEventListener("mousedown", beginDetailsResize);
     }
+    if (detailsToggleEl) {
+      detailsToggleEl.addEventListener("click", () => {
+        const visible = applyDetailsPaneVisibility(!detailsPaneVisible);
+        if (visible) {
+          syncDetails();
+        }
+        vscode.postMessage({
+          type: "saveDetailsPaneVisibility",
+          visible,
+        });
+      });
+    }
 
     window.addEventListener("mousemove", updateDetailsResize);
     window.addEventListener("mouseup", finishDetailsResize);
+    window.addEventListener("click", hideCardContextMenu);
+    window.addEventListener("scroll", hideCardContextMenu, true);
 
     detailsEl.addEventListener("change", (event) => {
       const target = event.target instanceof Element
@@ -5934,6 +7300,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       if (!actionType || !actionValue) {
+        return;
+      }
+      if (actionType === "toggleTopCard") {
+        vscode.postMessage({
+          type: actionType,
+          cardUri: actionValue,
+          top: actionButton.getAttribute("aria-pressed") !== "true",
+        });
         return;
       }
       if (actionType === "resumeAgent") {
@@ -5999,12 +7373,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (message?.type === "detailsPaneWidth") {
         applyDetailsPaneWidth(message?.width);
       }
+      if (message?.type === "detailsPaneVisibility") {
+        const visible = applyDetailsPaneVisibility(message?.visible);
+        if (visible) {
+          syncDetails();
+        }
+      }
       if (message?.type === "runnerStatus") {
         runnerStatus = message.status || { enabled: false, running: false };
         runnerStartPending = false;
         runnerCreatePending = false;
         renderRunnerPanel();
-        renderActiveAgentCount();
         if (lastBoard) {
           refreshBoard();
         }
@@ -6078,6 +7457,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     });
 
     window.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && cardContextMenuEl) {
+        event.preventDefault();
+        hideCardContextMenu();
+        return;
+      }
       const modifier = isMac ? event.metaKey : event.ctrlKey;
       if (!modifier) {
         return;
@@ -6166,17 +7550,6 @@ function parseColumnMarkdown(
   return { title, order };
 }
 
-function slugifyFileName(value: string): string {
-  const trimmed = value.trim().toLowerCase();
-  if (!trimmed) {
-    return "";
-  }
-  return trimmed
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "");
-}
-
 function buildCardPriorityList(orderedUris: string[]): string[] {
   const priorities: string[] = [];
   const seen = new Set<string>();
@@ -6199,6 +7572,18 @@ function buildCardPriorityList(orderedUris: string[]): string[] {
   }
 
   return priorities;
+}
+
+function areStringSetsEqual(left: Set<string>, right: Set<string>): boolean {
+  if (left.size !== right.size) {
+    return false;
+  }
+  for (const value of left) {
+    if (!right.has(value)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function buildCardSearchText(
@@ -6283,6 +7668,64 @@ function renderAgentOutputMarkdown(markdown: string): string {
   return normalized ? agentOutputMd.render(normalized) : "";
 }
 
+function defaultModelValuesFromObject(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return [];
+  }
+
+  const values: string[] = [];
+  for (const [agent, model] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof model !== "string") {
+      continue;
+    }
+    const normalized = normalizeDefaultModelValue(agent, model);
+    if (normalized) {
+      values.push(normalized);
+    }
+  }
+  return values;
+}
+
+function normalizeDefaultModelValue(agent: unknown, value: unknown): string | null {
+  const kind = normalizeAgentKindValue(agent);
+  const trimmedValue = String(value ?? "").trim();
+  if (!kind || !trimmedValue) {
+    return null;
+  }
+
+  const parts = trimmedValue.split("/").map((part) => part.trim());
+  if (parts.some((part) => !part)) {
+    return null;
+  }
+
+  const explicitKind = normalizeAgentKindValue(parts[0]);
+  if (explicitKind) {
+    return explicitKind === kind ? trimmedValue : null;
+  }
+  return `${kind}/${trimmedValue}`;
+}
+
+function findNearestKanbanMarker(fsPath: string): string | null {
+  let directory = path.dirname(fsPath);
+  while (true) {
+    const directMarker = path.join(directory, ".kanban");
+    if (existsSync(directMarker)) {
+      return directMarker;
+    }
+
+    const nestedMarker = path.join(directory, "tasks", ".kanban");
+    if (existsSync(nestedMarker)) {
+      return nestedMarker;
+    }
+
+    const parent = path.dirname(directory);
+    if (parent === directory) {
+      return null;
+    }
+    directory = parent;
+  }
+}
+
 function normalizeAgentKindValue(value: unknown): AgentKind | null {
   const normalized = String(value ?? "").trim().toLowerCase();
   if (normalized === "claude" || normalized === "agent:claude") {
@@ -6294,11 +7737,132 @@ function normalizeAgentKindValue(value: unknown): AgentKind | null {
   if (normalized === "kimi" || normalized === "agent:kimi") {
     return "kimi";
   }
+  if (
+    normalized === "opencode" ||
+    normalized === "oc" ||
+    normalized === "agent:opencode" ||
+    normalized === "agent:oc"
+  ) {
+    return "opencode";
+  }
+  if (
+    normalized === "deepseek" ||
+    normalized === "deepcode" ||
+    normalized === "ds" ||
+    normalized === "agent:deepseek" ||
+    normalized === "agent:deepcode" ||
+    normalized === "agent:ds"
+  ) {
+    return "deepseek";
+  }
   return null;
+}
+
+function deepcodeProjectCode(projectRoot: string): string {
+  const legacyCode = projectRoot.replace(/[\\/]/g, "-").replace(/:/g, "");
+  if (legacyCode.length <= 64) {
+    return legacyCode;
+  }
+  const normalizedRoot = path.resolve(projectRoot);
+  const hashInput =
+    process.platform === "win32" ? normalizedRoot.toLowerCase() : normalizedRoot;
+  const digest = createHash("sha256")
+    .update(hashInput, "utf8")
+    .digest("hex")
+    .slice(0, 16);
+  const prefixLimit = 64 - 16 - 1;
+  const prefix = sanitizeDeepcodeProjectCodePart(path.basename(normalizedRoot))
+    .slice(0, prefixLimit)
+    .replace(/[-.]+$/g, "");
+  return `${prefix || "project"}-${digest}`;
+}
+
+function sanitizeDeepcodeProjectCodePart(value: string): string {
+  return value
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
+}
+
+async function ensureKimiWorkspaceTrusted(workDir: string): Promise<void> {
+  const home = getKimiHomeDir();
+  if (!home) {
+    return;
+  }
+  const root = isWindowsAbsolutePath(workDir)
+    ? path.win32.resolve(workDir)
+    : path.resolve(workDir);
+  const trustDir = path.join(home, "workspace-trust");
+  const trustPath = path.join(trustDir, encodeKimiWorkDirKey(root));
+  try {
+    await vscode.workspace.fs.stat(vscode.Uri.file(trustPath));
+    return;
+  } catch {
+    // Missing trust markers are created below.
+  }
+  try {
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(trustDir));
+    await vscode.workspace.fs.writeFile(
+      vscode.Uri.file(trustPath),
+      Buffer.from(
+        JSON.stringify({
+          root,
+          trustedAt: Date.now(),
+        }),
+        "utf8"
+      )
+    );
+  } catch {
+    // Kimi will still show its own prompt if this best-effort pre-trust fails.
+  }
+}
+
+function getKimiHomeDir(): string | null {
+  const configuredHome = process.env.KIMI_CODE_HOME?.trim();
+  if (configuredHome) {
+    return path.resolve(configuredHome);
+  }
+  const home = process.env.USERPROFILE || process.env.HOME;
+  return home ? path.join(home, ".kimi-code") : null;
+}
+
+function encodeKimiWorkDirKey(workDir: string): string {
+  const normalized = normalizeKimiWorkDir(workDir);
+  const name = normalized.replace(/\\/g, "/").split("/").at(-1) || normalized;
+  const slug = slugifyKimiWorkDirName(name);
+  const digest = createHash("sha256")
+    .update(normalized, "utf8")
+    .digest("hex")
+    .slice(0, 12);
+  return `wd_${slug}_${digest}`;
+}
+
+function normalizeKimiWorkDir(workDir: string): string {
+  const normalized = isWindowsAbsolutePath(workDir)
+    ? path.win32.resolve(workDir).replace(/\\/g, "/")
+    : path.resolve(workDir).replace(/\\/g, "/");
+  return normalized.length > 3 ? normalized.replace(/\/+$/g, "") : normalized;
+}
+
+function isWindowsAbsolutePath(value: string): boolean {
+  return /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+)/.test(value);
+}
+
+function slugifyKimiWorkDirName(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/^-+|-+$/g, "");
+  return slug && slug !== "." && slug !== ".." ? slug : "workspace";
 }
 
 function agentKindFromAgentId(value: unknown): AgentKind | null {
   const normalized = String(value ?? "").trim().toLowerCase();
+  if (isOpencodeSessionId(normalized)) {
+    return "opencode";
+  }
   if (
     /^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
       normalized
@@ -6321,6 +7885,10 @@ function agentKindFromAgentId(value: unknown): AgentKind | null {
     return "claude";
   }
   return null;
+}
+
+function isOpencodeSessionId(value: unknown): boolean {
+  return /^ses_[a-z0-9]+$/i.test(String(value ?? "").trim());
 }
 
 function extractClaudeRecordText(entry: unknown): string {
@@ -6370,6 +7938,86 @@ function extractClaudeContentText(content: unknown): string {
         && (!record.type || String(record.type).toLowerCase() === "text")
       ) {
         return record.text.trim();
+      }
+      return "";
+    })
+    .filter((item) => item.length > 0)
+    .join("\n\n")
+    .trim();
+}
+
+function extractDeepCodeRecordText(entry: unknown): string {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const record = entry as {
+    role?: unknown;
+    content?: unknown;
+    messageParams?: unknown;
+  };
+  if (String(record.role || "").toLowerCase() !== "assistant") {
+    return "";
+  }
+  if (typeof record.content === "string" && record.content.trim()) {
+    return record.content.trim();
+  }
+  const messageParams = record.messageParams as
+    | { reasoning_content?: unknown }
+    | undefined;
+  if (
+    typeof messageParams?.reasoning_content === "string" &&
+    messageParams.reasoning_content.includes("ORCHESTRATOR_STATUS:")
+  ) {
+    return messageParams.reasoning_content.trim();
+  }
+  return "";
+}
+
+function extractOpencodeRecordText(entry: unknown): string {
+  if (!entry || typeof entry !== "object") {
+    return "";
+  }
+  const record = entry as {
+    role?: unknown;
+    info?: unknown;
+    parts?: unknown;
+    content?: unknown;
+    text?: unknown;
+    message?: unknown;
+  };
+  const info = record.info && typeof record.info === "object"
+    ? record.info as { role?: unknown }
+    : null;
+  const role = String(record.role || info?.role || "").toLowerCase();
+  if (role && role !== "assistant") {
+    return "";
+  }
+  if (typeof record.content === "string" && record.content.trim()) {
+    return record.content.trim();
+  }
+  if (typeof record.text === "string" && record.text.trim()) {
+    return record.text.trim();
+  }
+  if (record.message && typeof record.message === "object") {
+    const messageText = extractOpencodeRecordText(record.message);
+    if (messageText) {
+      return messageText;
+    }
+  }
+  if (!Array.isArray(record.parts)) {
+    return "";
+  }
+  return record.parts
+    .map((part) => {
+      if (!part || typeof part !== "object") {
+        return "";
+      }
+      const item = part as { type?: unknown; text?: unknown };
+      if (
+        typeof item.text === "string"
+        && String(item.type || "text").toLowerCase() === "text"
+      ) {
+        return item.text.trim();
       }
       return "";
     })
@@ -6461,6 +8109,55 @@ function findNestedString(value: unknown, key: string): string | null {
     const found = findNestedString(child, key);
     if (found) {
       return found;
+    }
+  }
+  return null;
+}
+
+function parseFirstJsonValue(text: string): unknown {
+  for (let start = 0; start < text.length; start += 1) {
+    const open = text[start];
+    if (open !== "{" && open !== "[") {
+      continue;
+    }
+    const close = open === "{" ? "}" : "]";
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const char = text[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (inString && char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = !inString;
+        continue;
+      }
+      if (inString) {
+        continue;
+      }
+      if (char === open) {
+        depth += 1;
+      } else if (char === close) {
+        depth -= 1;
+        if (depth === 0) {
+          try {
+            return JSON.parse(text.slice(start, index + 1));
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+    try {
+      return JSON.parse(text.slice(start));
+    } catch {
+      continue;
     }
   }
   return null;

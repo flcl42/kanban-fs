@@ -22,6 +22,8 @@ export type BoardConfig = {
   folders: BoardFolderConfig[];
   folderMap: Map<string, BoardFolderConfig>;
   ignoredFolders: Set<string>;
+  topCards: Set<string>;
+  defaultModels: Record<string, string>;
   sourceText: string;
   valid: boolean;
 };
@@ -35,6 +37,8 @@ export function createEmptyBoardConfig(
     folders: [],
     folderMap: new Map(),
     ignoredFolders: new Set(),
+    topCards: new Set(),
+    defaultModels: {},
     sourceText,
     valid,
   };
@@ -110,12 +114,16 @@ export function parseBoardConfig(content: string): BoardConfig {
     }
   }
   const ignoredFolders = readIgnoredFolders(data);
+  const topCards = readTopCards(data);
+  const defaultModels = readDefaultModels(data);
 
   return {
     data,
     folders,
     folderMap: new Map(folders.map((folder) => [folder.id, folder])),
     ignoredFolders,
+    topCards,
+    defaultModels,
     sourceText: content,
     valid,
   };
@@ -126,6 +134,134 @@ export function isIgnoredFolder(
   folderId: string
 ): boolean {
   return boardConfig.ignoredFolders.has(normalizeFolderId(folderId));
+}
+
+export function cardTopKey(columnId: string, fileName: string): string {
+  return normalizeTopCardKey(`${columnId}/${fileName}`);
+}
+
+export function isTopCard(
+  boardConfig: BoardConfig,
+  columnId: string,
+  fileName: string
+): boolean {
+  return hasMatchingTopCardKey(boardConfig.topCards, columnId, fileName);
+}
+
+export function setTopCardInSet(
+  topCards: Set<string>,
+  columnId: string,
+  fileName: string,
+  top: boolean
+): Set<string> {
+  const nextTopCards = new Set(topCards);
+  removeMatchingTopCardKeys(nextTopCards, columnId, fileName);
+  if (top) {
+    nextTopCards.add(cardTopKey(columnId, fileName));
+  }
+  return nextTopCards;
+}
+
+export function moveTopCardInSet(
+  topCards: Set<string>,
+  sourceColumnId: string,
+  sourceFileName: string,
+  targetColumnId: string,
+  targetFileName: string
+): Set<string> {
+  const nextTopCards = new Set(topCards);
+  const wasTop = removeMatchingTopCardKeys(
+    nextTopCards,
+    sourceColumnId,
+    sourceFileName
+  );
+  if (wasTop) {
+    nextTopCards.add(cardTopKey(targetColumnId, targetFileName));
+  }
+  return nextTopCards;
+}
+
+export function reconcileTopCardsWithColumns(
+  topCards: Set<string>,
+  columns: { id: string; cards: { fileName: string }[] }[]
+): Set<string> {
+  if (topCards.size === 0) {
+    return new Set();
+  }
+
+  const locationsByFileName = new Map<
+    string,
+    { columnId: string; fileName: string }[]
+  >();
+  const locationsByKey = new Map<string, { columnId: string; fileName: string }>();
+
+  for (const column of columns) {
+    const columnId = String(column?.id ?? "").trim();
+    if (!columnId) {
+      continue;
+    }
+    for (const card of column.cards || []) {
+      const fileName = coerceString(card?.fileName);
+      if (!fileName) {
+        continue;
+      }
+      const location = { columnId, fileName };
+      const fileNameKey = normalizeTopCardKey(fileName).toLowerCase();
+      const existingLocations = locationsByFileName.get(fileNameKey) ?? [];
+      existingLocations.push(location);
+      locationsByFileName.set(fileNameKey, existingLocations);
+      locationsByKey.set(cardTopKey(columnId, fileName).toLowerCase(), location);
+    }
+  }
+
+  const reconciledTopCards = new Set<string>();
+  for (const cardKey of topCards) {
+    const normalizedKey = normalizeTopCardKey(cardKey);
+    if (!normalizedKey) {
+      continue;
+    }
+    const existingLocation = locationsByKey.get(normalizedKey.toLowerCase());
+    if (existingLocation) {
+      reconciledTopCards.add(
+        cardTopKey(existingLocation.columnId, existingLocation.fileName)
+      );
+      continue;
+    }
+
+    const fileName = topCardKeyFileName(normalizedKey);
+    const matchingLocations =
+      locationsByFileName.get(normalizeTopCardKey(fileName).toLowerCase()) ?? [];
+    if (matchingLocations.length === 1) {
+      const [location] = matchingLocations;
+      reconciledTopCards.add(cardTopKey(location.columnId, location.fileName));
+      continue;
+    }
+
+    reconciledTopCards.add(normalizedKey);
+  }
+
+  return reconciledTopCards;
+}
+
+export function setTopCardsInConfigData(
+  data: Record<string, unknown>,
+  topCards: Set<string>
+): void {
+  const key = getTopCardsConfigKey(data);
+  for (const alias of topCardsConfigKeys) {
+    if (alias !== key) {
+      delete data[alias];
+    }
+  }
+  const serializedTopCards = Array.from(topCards)
+    .map(normalizeTopCardKey)
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+  if (serializedTopCards.length > 0) {
+    data[key] = serializedTopCards;
+  } else {
+    delete data[key];
+  }
 }
 
 export function serializeBoardConfig(
@@ -357,6 +493,124 @@ function readIgnoredFolders(data: Record<string, unknown>): Set<string> {
     }
   }
   return ignoredFolders;
+}
+
+function readDefaultModels(data: Record<string, unknown>): Record<string, string> {
+  const raw =
+    data.defaultModels ??
+    data.defaultAgentModels ??
+    data.agentDefaultModels ??
+    data.models;
+  if (!isPlainObject(raw)) {
+    return {};
+  }
+
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const normalizedKey = key.trim().toLowerCase();
+    if (!normalizedKey || typeof value !== "string") {
+      continue;
+    }
+    const trimmedValue = value.trim();
+    if (!trimmedValue) {
+      continue;
+    }
+    result[normalizedKey] = trimmedValue;
+  }
+  return result;
+}
+
+const topCardsConfigKeys = [
+  "top",
+  "topCards",
+  "topItems",
+  "pinned",
+  "pinnedCards",
+];
+
+function readTopCards(data: Record<string, unknown>): Set<string> {
+  const topCards = new Set<string>();
+  for (const key of topCardsConfigKeys) {
+    for (const cardKey of readStringList(data[key])) {
+      const normalized = normalizeTopCardKey(cardKey);
+      if (normalized) {
+        topCards.add(normalized);
+      }
+    }
+  }
+  return topCards;
+}
+
+function getTopCardsConfigKey(data: Record<string, unknown>): string {
+  return topCardsConfigKeys.find((key) =>
+    Object.prototype.hasOwnProperty.call(data, key)
+  ) ?? "top";
+}
+
+function hasMatchingTopCardKey(
+  topCards: Set<string>,
+  columnId: string,
+  fileName: string
+): boolean {
+  const expectedKey = cardTopKey(columnId, fileName).toLowerCase();
+  const expectedLegacyKey = normalizeTopCardKey(fileName).toLowerCase();
+  for (const cardKey of topCards) {
+    const normalized = normalizeTopCardKey(cardKey).toLowerCase();
+    if (normalized === expectedKey) {
+      return true;
+    }
+    if (!normalized.includes("/") && normalized === expectedLegacyKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function removeMatchingTopCardKeys(
+  topCards: Set<string>,
+  columnId: string,
+  fileName: string
+): boolean {
+  const matchingKeys = Array.from(topCards).filter((cardKey) =>
+    isMatchingTopCardKey(cardKey, columnId, fileName)
+  );
+  for (const cardKey of matchingKeys) {
+    topCards.delete(cardKey);
+  }
+  return matchingKeys.length > 0;
+}
+
+function isMatchingTopCardKey(
+  cardKey: string,
+  columnId: string,
+  fileName: string
+): boolean {
+  const normalized = normalizeTopCardKey(cardKey).toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+  if (normalized === cardTopKey(columnId, fileName).toLowerCase()) {
+    return true;
+  }
+  return (
+    !normalized.includes("/") &&
+    normalized === normalizeTopCardKey(fileName).toLowerCase()
+  );
+}
+
+function topCardKeyFileName(cardKey: string): string {
+  const normalized = normalizeTopCardKey(cardKey);
+  const slashIndex = normalized.lastIndexOf("/");
+  return slashIndex === -1 ? normalized : normalized.slice(slashIndex + 1);
+}
+
+function normalizeTopCardKey(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
 }
 
 function readStringList(value: unknown): string[] {

@@ -2,7 +2,7 @@
   "name": "kanban-vsix",
   "displayName": "ai-kanban",
   "description": "AI-ready Kanban boards backed by folders, Markdown files, and an optional agent runner.",
-  "version": "1.0.31",
+  "version": "1.0.35",
   "license": "MIT",
   "publisher": "flcl42",
   "repository": "https://github.com/flcl42/kanban-fs",
@@ -12,6 +12,7 @@
     "tasks",
     "markdown",
     "codex",
+    "opencode",
     "agent",
     "workflow",
     "project-management"
@@ -86,6 +87,11 @@
         "category": "AI Kanban"
       },
       {
+        "command": "kanban.initializeTemplate",
+        "title": "Initialize Template",
+        "category": "AI Kanban"
+      },
+      {
         "command": "kanban.resumeAgent",
         "title": "Connect Agent",
         "category": "AI Kanban"
@@ -131,8 +137,14 @@
           "default": 360,
           "minimum": 280,
           "maximum": 720,
-          "scope": "application",
+          "scope": "resource",
           "description": "Width in pixels of the Kanban details pane."
+        },
+        "kanban.detailsPane.visible": {
+          "type": "boolean",
+          "default": true,
+          "scope": "resource",
+          "description": "Show the Kanban details pane by default."
         },
         "kanban.runnerPanel.enabled": {
           "type": "boolean",
@@ -159,28 +171,136 @@
             "--claude-executable",
             "${claudeExecutable}",
             "--kimi-executable",
-            "${kimiExecutable}"
+            "${kimiExecutable}",
+            "--deepseek-executable",
+            "${deepseekExecutable}",
+            "--opencode-executable",
+            "${opencodeExecutable}"
           ],
           "items": {
             "type": "string"
           },
           "scope": "application",
-          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, ${defaultAgent}, ${codexExecutable}, ${claudeExecutable}, and ${kimiExecutable}."
+          "description": "Arguments used to start the Kanban runner. Supports ${runnerScript}, ${runnerRoot}, ${kanbanDir}, ${workspaceFolder}, ${defaultAgent}, ${codexExecutable}, ${claudeExecutable}, ${kimiExecutable}, ${deepseekExecutable}, and ${opencodeExecutable}."
         },
         "kanban.defaultAgent": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "default": null,
+          "type": "string",
+          "default": "auto",
           "enum": [
-            null,
+            "auto",
             "claude",
             "codex",
-            "kimi"
+            "opencode",
+            "oc",
+            "kimi",
+            "deepseek",
+            "manual"
           ],
-          "scope": "application",
-          "description": "Default agent for runner tasks. When null, the runner auto-detects Claude first, then Codex, then Kimi. Task tags such as claude, codex, kimi, agent:claude, agent:codex, or agent:kimi override this per card."
+          "scope": "resource",
+          "description": "Default agent for runner tasks. Use auto to auto-detect Claude first, then Codex, then opencode, then Kimi, then DeepSeek. Use manual to keep unassigned cards user-managed by default. Task tags such as claude, codex, opencode, oc, kimi, deepseek, ds, deepcode, agent:claude, agent:codex, agent:opencode, agent:oc, agent:kimi, agent:deepseek, manual, or human override this per card."
+        },
+        "kanban.defaultModels": {
+          "type": "object",
+          "default": {
+            "codex": "",
+            "claude": "",
+            "kimi": "",
+            "deepseek": "",
+            "opencode": ""
+          },
+          "properties": {
+            "codex": {
+              "type": "string",
+              "description": "Default Codex Model: value for new runner sessions, for example codex/gpt-5.6-sol/ultra or gpt-5.6-sol/ultra."
+            },
+            "claude": {
+              "type": "string",
+              "description": "Default Claude Model: value for new runner sessions, for example claude/sonnet/max or sonnet/max."
+            },
+            "kimi": {
+              "type": "string",
+              "description": "Default Kimi Model: value for new runner sessions, for example kimi/k2 or k2."
+            },
+            "deepseek": {
+              "type": "string",
+              "description": "Default DeepSeek Model: value for new runner sessions, for example deepseek/deepseek-v4-pro/max or deepseek-v4-pro/max."
+            },
+            "opencode": {
+              "type": "string",
+              "description": "Default opencode Model: value for new runner sessions, for example opencode/moonshotai/kimi-k3 or moonshotai/kimi-k3."
+            }
+          },
+          "additionalProperties": {
+            "type": "string"
+          },
+          "scope": "resource",
+          "description": "Default Model: values used by the runner when a new task has no Model property. Board .kanban defaultModels override this per board, and task Model properties override both."
+        },
+        "kanban.modelCompletions": {
+          "type": "array",
+          "default": [
+            "codex/gpt-5.6-sol/ultra",
+            "codex/gpt-5.6-sol/max",
+            "codex/sol/ultra",
+            "codex/gpt-5.6-luna/ultra",
+            "codex/gpt-5.6-luna/max",
+            "codex/gpt-5.6-luna/high",
+            "codex/gpt-5.6-terra/max",
+            "codex/gpt-5.6-terra/ultra",
+            "codex/gpt-5.6-terra/high",
+            "claude/sonnet/ultra",
+            "claude/sonnet/max",
+            "claude/sonnet/high",
+            "claude/opus/ultra",
+            "kimi/k2",
+            "opencode/opencode/muse-spark-1.2-contributor-free",
+            "opencode/opencode/muse-spark-1.3-contributor-free",
+            "opencode/opencode/big-pickle",
+            "opencode/opencode/hy3-free",
+            "opencode/opencode/ling-3.0-flash-fin-free",
+            "opencode/opencode/mimo-v2.5-free",
+            "opencode/opencode/nemotron-3-ultra-free",
+            "opencode/opencode/nemotron-3.5-lightning-free",
+            "opencode/opencode/x-preview-f-free",
+            "opencode/opencode-go/deepseek-v4-flash",
+            "opencode/opencode-go/deepseek-v4-flash-vision-exp",
+            "opencode/opencode-go/deepseek-v4-pro",
+            "opencode/opencode-go/glm-5.1",
+            "opencode/opencode-go/glm-5.2",
+            "opencode/opencode-go/glm-5.3",
+            "opencode/opencode-go/glm-5.3-flash",
+            "opencode/opencode-go/gpt-5.6-luna",
+            "opencode/opencode-go/grok-4.6",
+            "opencode/opencode-go/hy3",
+            "opencode/opencode-go/hy4-preview",
+            "opencode/opencode-go/kimi-k2.6",
+            "opencode/opencode-go/kimi-k2.7-code",
+            "opencode/opencode-go/kimi-k3",
+            "opencode/opencode-go/longcat-2.0",
+            "opencode/opencode-go/mimo-v2.5",
+            "opencode/opencode-go/mimo-v2.5-pro",
+            "opencode/opencode-go/minimax-m2.7",
+            "opencode/opencode-go/minimax-m3",
+            "opencode/opencode-go/muse-spark-1.2-contributor",
+            "opencode/opencode-go/muse-spark-1.3-contributor",
+            "opencode/opencode-go/qwen3.6-plus",
+            "opencode/opencode-go/qwen3.7-max",
+            "opencode/opencode-go/qwen3.7-plus",
+            "opencode/opencode-go/qwen3.8-flash",
+            "opencode/opencode-go/qwen3.8-max",
+            "opencode/moonshotai/kimi-k3",
+            "opencode/deepseek/deepseek-v4-pro/max",
+            "opencode/deepseek/deepseek-v4-flash/high",
+            "deepseek/deepseek-v4-pro/max",
+            "deepseek/deepseek-v4-pro/high",
+            "deepseek/deepseek-v4-flash/max",
+            "deepseek/deepseek-v4-flash/high"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "scope": "resource",
+          "description": "Model: values suggested in Markdown task files. Supports values such as agent/model and agent/model/effort; custom typed values are still accepted."
         },
         "kanban.codexExecutable": {
           "type": "string",
@@ -199,6 +319,18 @@
           "default": "kimi",
           "scope": "application",
           "description": "Kimi CLI executable used by the Kanban runner and Kimi resume-agent terminals."
+        },
+        "kanban.deepseekExecutable": {
+          "type": "string",
+          "default": "deepcode",
+          "scope": "application",
+          "description": "Deep Code executable used by the Kanban runner and DeepSeek resume-agent terminals."
+        },
+        "kanban.opencodeExecutable": {
+          "type": "string",
+          "default": "opencode",
+          "scope": "application",
+          "description": "opencode executable used by the Kanban runner and opencode resume-agent terminals. The agent alias oc is accepted in task tags and default-agent settings."
         }
       }
     }
@@ -211,12 +343,14 @@
     "watch": "tsc -watch -p ./",
     "package:vsix": "npm test && vsce package",
     "publish:marketplace": "npm test && vsce publish",
-    "test": "npm run compile && npm run test:runner && npm run test:webview && npm run test:task-links && npm run test:board-config && npm run test:new-card && npm run test:fast-move-path",
+    "test": "npm run compile && npm run test:runner && npm run test:webview && npm run test:task-links && npm run test:model-completions && npm run test:file-names && npm run test:board-config && npm run test:new-card && npm run test:fast-move-path",
     "test:runner": "python -m py_compile runner.py && python scripts/test-runner-metadata.py",
     "test:board-config": "node scripts/test-board-config.js",
     "test:new-card": "node scripts/test-new-card.js",
     "test:webview": "node scripts/smoke-webview.js",
     "test:task-links": "node scripts/test-task-links.js",
+    "test:model-completions": "node scripts/test-model-completions.js",
+    "test:file-names": "node scripts/test-file-names.js",
     "test:fast-move-path": "node scripts/test-fast-move-path.js"
   },
   "devDependencies": {

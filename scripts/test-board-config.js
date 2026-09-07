@@ -4,9 +4,14 @@ const {
   buildFolderCardPriorityOverrides,
   buildFolderConfigMap,
   isIgnoredFolder,
+  isTopCard,
+  moveTopCardInSet,
   orderColumnsByConfig,
   parseBoardConfig,
+  reconcileTopCardsWithColumns,
   serializeBoardConfig,
+  setTopCardInSet,
+  setTopCardsInConfigData,
 } = require("../out/board-config.js");
 
 const sourceText = `folders:
@@ -18,6 +23,22 @@ const sourceText = `folders:
 
 const boardConfig = parseBoardConfig(sourceText);
 assert.equal(boardConfig.valid, true, "valid .kanban YAML should be marked valid");
+const defaultModelsConfig = parseBoardConfig(`defaultModels:
+  codex: codex/gpt-5.6-sol/ultra
+  claude: sonnet/max
+  kimi: kimi/k2
+  deepseek: deepseek-v4-pro/max
+`);
+assert.deepEqual(
+  defaultModelsConfig.defaultModels,
+  {
+    codex: "codex/gpt-5.6-sol/ultra",
+    claude: "sonnet/max",
+    kimi: "kimi/k2",
+    deepseek: "deepseek-v4-pro/max",
+  },
+  "defaultModels should parse per-agent board model defaults"
+);
 const ignoredConfig = parseBoardConfig(`ignoreFolders:
   - Archive
 ignoreDirs:
@@ -43,6 +64,75 @@ assert.equal(
   isIgnoredFolder(ignoredConfig, "doing"),
   false,
   "unlisted directory names should not be ignored"
+);
+
+const topConfig = parseBoardConfig(`top:
+  - Doing/task.md
+  - Backlog\\existing.md
+  - shared.md
+`);
+assert.equal(
+  isTopCard(topConfig, "Doing", "task.md"),
+  true,
+  "top entries should mark matching column card paths"
+);
+assert.equal(
+  isTopCard(topConfig, "Backlog", "existing.md"),
+  true,
+  "top entries should accept Windows-style separators"
+);
+assert.equal(
+  isTopCard(topConfig, "Done", "shared.md"),
+  true,
+  "legacy file-only top entries should match by file name"
+);
+let nextTopCards = setTopCardInSet(topConfig.topCards, "Doing", "task.md", false);
+nextTopCards = setTopCardInSet(nextTopCards, "Done", "review.md", true);
+nextTopCards = moveTopCardInSet(nextTopCards, "Backlog", "existing.md", "Done", "existing.md");
+const topData = { ...topConfig.data };
+setTopCardsInConfigData(topData, nextTopCards);
+const serializedTopConfig = parseBoardConfig(
+  serializeBoardConfig(topData, topConfig.sourceText)
+);
+assert.equal(
+  isTopCard(serializedTopConfig, "Doing", "task.md"),
+  false,
+  "clearing a top card should remove its .kanban entry"
+);
+assert.equal(
+  isTopCard(serializedTopConfig, "Done", "review.md"),
+  true,
+  "setting a top card should store its column-qualified .kanban entry"
+);
+assert.equal(
+  isTopCard(serializedTopConfig, "Done", "existing.md"),
+  true,
+  "moving a top card should rewrite its column-qualified .kanban entry"
+);
+const externallyMovedTopCards = reconcileTopCardsWithColumns(
+  new Set(["Doing/moved.md", "legacy.md", "Doing/duplicate.md"]),
+  [
+    { id: "Doing", cards: [] },
+    { id: "Done", cards: [{ fileName: "moved.md" }] },
+    { id: "Backlog", cards: [{ fileName: "legacy.md" }, { fileName: "duplicate.md" }] },
+    { id: "Blocked", cards: [{ fileName: "duplicate.md" }] },
+  ]
+);
+assert.deepEqual(
+  Array.from(externallyMovedTopCards).sort(),
+  ["Backlog/legacy.md", "Doing/duplicate.md", "Done/moved.md"],
+  "top entries should follow externally moved cards when the file name is unique"
+);
+const externallyMovedConfig = parseBoardConfig(
+  serializeBoardConfig(
+    { top: Array.from(externallyMovedTopCards).sort() },
+    topConfig.sourceText
+  )
+);
+assert.equal(
+  isTopCard(externallyMovedConfig, "Done", "moved.md"),
+  true,
+  "reconciled external moves should keep the moved card in the top section"
 );
 const columns = [
   { id: "Backlog", name: "Backlog", order: 2 },

@@ -55,6 +55,22 @@ assert.deepEqual(
   ]
 );
 
+const deepseekActions = findTaskLinkActions(`# DeepCode review
+
+Tags: ds, review
+Agent: ace7e642-05b3-4e2b-af77-3b95bd453032
+Repo: D:\\base\\projects\\nmc\\review-deepskeek
+
+## Description
+`);
+const deepseekConnect = deepseekActions.find(
+  (action) => action.command === "resumeAgent"
+);
+assert.ok(deepseekConnect, "DeepCode task should expose a Connect action");
+assert.equal(deepseekConnect.agentKind, "deepseek");
+assert.equal(deepseekConnect.repoPath, "D:\\base\\projects\\nmc\\review-deepskeek");
+assert.equal(deepseekConnect.ticketTitle, "DeepCode review");
+
 const noActions = findTaskLinkActions(`# Title
 
 Intro: this is body text without a separating blank line
@@ -88,6 +104,11 @@ assert.deepEqual(getTaskPropertyAction("Agent", "session_1d11f261-5711-42ff-8a3a
   command: "resumeAgent",
   title: "Connect",
   value: "session_1d11f261-5711-42ff-8a3a-fb7146ec5988",
+});
+assert.deepEqual(getTaskPropertyAction("Agent", "ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e"), {
+  command: "resumeAgent",
+  title: "Connect",
+  value: "ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e",
 });
 assert.deepEqual(getTaskPropertyAction("Project", "D:\\"), {
   command: "openPath",
@@ -221,6 +242,18 @@ Owner: Jane
 `,
   "fallback.md"
 );
+
+const opencodeActions = findTaskLinkActions(`# opencode task
+
+Tags: oc
+Agent: ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e
+Repo: D:\\base\\projects\\demo
+`);
+const opencodeConnect = opencodeActions.find(
+  (action) => action.command === "resumeAgent"
+);
+assert.ok(opencodeConnect, "opencode task should expose a Connect action");
+assert.equal(opencodeConnect.agentKind, "opencode");
 
 assert.deepEqual(
   cursorDisplay.properties,
