@@ -26,7 +26,7 @@ from urllib.parse import quote
 IS_WINDOWS = os.name == "nt"
 ENCODING = "utf-8"
 REPOSITORY_SWEEP_INTERVAL_SECONDS = 5 * 60
-GIT_COMMAND_TIMEOUT_SECONDS = 120
+GIT_COMMAND_TIMEOUT_SECONDS = 12 * 60
 MODEL_EFFORT_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 MANUAL_AGENT_VALUE: Literal["manual"] = "manual"
 

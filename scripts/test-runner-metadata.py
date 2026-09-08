@@ -16,6 +16,8 @@ assert spec.loader is not None
 sys.modules[spec.name] = runner
 spec.loader.exec_module(runner)
 
+assert runner.GIT_COMMAND_TIMEOUT_SECONDS == 12 * 60
+
 
 source = """# Example
 Tags:
