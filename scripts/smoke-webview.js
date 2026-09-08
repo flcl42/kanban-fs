@@ -41,6 +41,17 @@ const openLocalPathSource = source.match(
 
 assert.ok(scriptMatch, "webview script block not found");
 assert.ok(openLocalPathSource, "openLocalPath source block not found");
+assert.ok(
+  source.indexOf("webviewPanel.webview.onDidReceiveMessage") <
+    source.indexOf("webviewPanel.webview.html = this.getHtml"),
+  "webview message listener should be registered before loading HTML"
+);
+assert.match(html, /Loading board\.\.\./, "webview should show an initial loading state");
+assert.match(
+  scriptMatch[1],
+  /readyRetryTimer[\s\S]*requestInitialBoard\(\);[\s\S]*setInterval/,
+  "webview should retry the initial ready request until board data arrives"
+);
 assert.match(
   openLocalPathSource[0],
   /await vscode\.env\.openExternal\(uri\);/,

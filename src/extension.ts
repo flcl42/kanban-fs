@@ -1264,12 +1264,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       localResourceRoots: [this.context.extensionUri],
     };
 
-    webviewPanel.webview.html = this.getHtml(
-      webviewPanel.webview,
-      this.getDetailsPaneWidthSetting(),
-      this.getDetailsPaneVisibleSetting()
-    );
-
     let scheduledBoardRefresh: NodeJS.Timeout | undefined;
     let boardRefreshQueue = Promise.resolve();
     const runBoardRefresh = async () => {
@@ -1694,6 +1688,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         await this.openUrl(String(message.url));
       }
     });
+
+    webviewPanel.webview.html = this.getHtml(
+      webviewPanel.webview,
+      this.getDetailsPaneWidthSetting(),
+      this.getDetailsPaneVisibleSetting()
+    );
 
     await sendBoard();
   }
@@ -5301,7 +5301,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       stroke-linejoin: round;
       fill: none;
     }
-    .details .empty {
+    .details .empty,
+    .board-loading {
       color: var(--muted);
       border: 1px dashed var(--line);
       padding: 16px;
@@ -5599,7 +5600,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       </div>
       <div class="runner-panel" id="runner-panel" hidden></div>
       <div class="board-scroll">
-        <section class="board" id="board"></section>
+        <section class="board" id="board">
+          <div class="board-loading">Loading board...</div>
+        </section>
       </div>
     </section>
     <div class="details-resizer" id="details-resizer" aria-hidden="true"${detailsPaneVisible ? "" : " hidden"}></div>
@@ -5633,6 +5636,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const cardDetailsCache = new Map();
     let refreshTimer = null;
     let detailsRefreshTimer = null;
+    let readyRetryTimer = null;
+    let readyRetryCount = 0;
+    let hasInitialBoardResponse = false;
     const cardDragType = "application/x-kanban-card";
     const columnDragType = "application/x-kanban-column";
     const isMac = navigator.platform.toLowerCase().includes("mac");
@@ -5653,6 +5659,27 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#039;");
+    };
+
+    const renderBoardError = (message) => {
+      if (boardEl) {
+        boardEl.innerHTML = \`<div class="error">\${escapeHtml(message || "Failed to load board.")}</div>\`;
+      }
+    };
+
+    const stopReadyRetry = () => {
+      if (readyRetryTimer) {
+        clearInterval(readyRetryTimer);
+        readyRetryTimer = null;
+      }
+    };
+
+    const requestInitialBoard = () => {
+      readyRetryCount += 1;
+      vscode.postMessage({ type: "ready" });
+      if (readyRetryCount >= 5) {
+        stopReadyRetry();
+      }
     };
 
     const renderRunnerPanel = () => {
@@ -7355,8 +7382,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     });
 
     window.addEventListener("message", (event) => {
+      try {
       const message = event.data;
       if (message?.type === "boardData") {
+        hasInitialBoardResponse = true;
+        stopReadyRetry();
         lastBoard = message.board;
         pruneCardDetailsCache(lastBoard);
         refreshBoard();
@@ -7368,7 +7398,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
       }
       if (message?.type === "boardError") {
-        boardEl.innerHTML = \`<div class="error">\${escapeHtml(message.message || "Failed to load board.")}</div>\`;
+        hasInitialBoardResponse = true;
+        stopReadyRetry();
+        renderBoardError(message.message);
       }
       if (message?.type === "detailsPaneWidth") {
         applyDetailsPaneWidth(message?.width);
@@ -7454,6 +7486,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           renderDetails(selectedCard);
         }
       }
+      } catch (error) {
+        hasInitialBoardResponse = true;
+        stopReadyRetry();
+        console.error("Kanban webview render failed", error);
+        renderBoardError(error instanceof Error ? error.message : String(error ?? "Unknown webview error"));
+      }
     });
 
     window.addEventListener("keydown", (event) => {
@@ -7486,7 +7524,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
     });
 
-    vscode.postMessage({ type: "ready" });
+    requestInitialBoard();
+    readyRetryTimer = setInterval(() => {
+      if (hasInitialBoardResponse) {
+        stopReadyRetry();
+        return;
+      }
+      requestInitialBoard();
+    }, 1000);
 
     function formatRelativeTime(date) {
       const now = new Date();
