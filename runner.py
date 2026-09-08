@@ -3934,7 +3934,7 @@ def set_section_body(content: str, heading: str, body: str, level: int = 2) -> s
     )
     return re.sub(
         rf"(?ms)^{marker}\s+{re.escape(heading)}\s*\r?\n.*?(?=^#{{1,6}}\s+|\Z)",
-        replacement,
+        lambda _match: replacement,
         content,
     )
 

@@ -33,6 +33,10 @@ for path in [
     updated = runner.set_metadata_value(source, "Repo", path)
     assert f"Repo: {path}" in updated
 
+windows_path_note = r"> Repository provisioning failed for `D:\tmp\projects\kanban\clone`: bad"
+updated = runner.set_section_body(source, "Comments", windows_path_note)
+assert windows_path_note in updated
+
 
 ensured = runner.ensure_task_template("# Example\n\n## Description\n\n")
 assert "Agent Kind:" not in ensured
