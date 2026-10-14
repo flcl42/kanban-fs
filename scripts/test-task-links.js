@@ -110,6 +110,23 @@ assert.deepEqual(getTaskPropertyAction("Agent", "ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e"
   title: "Connect",
   value: "ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e",
 });
+assert.deepEqual(getTaskPropertyAction("Agent", "devin:abc12345"), {
+  command: "resumeAgent",
+  title: "Connect",
+  value: "devin:abc12345",
+});
+assert.equal(
+  getTaskPropertyAction("Agent", "clumsy-sesame"),
+  null,
+  "bare Devin session names should require a Devin task hint"
+);
+assert.deepEqual(getTaskPropertyActions("Agent", "clumsy-sesame", { agentKind: "devin" }), [
+  {
+    command: "resumeAgent",
+    title: "Connect",
+    value: "clumsy-sesame",
+  },
+]);
 assert.deepEqual(getTaskPropertyAction("Project", "D:\\"), {
   command: "openPath",
   title: "Terminal",
@@ -254,6 +271,32 @@ const opencodeConnect = opencodeActions.find(
 );
 assert.ok(opencodeConnect, "opencode task should expose a Connect action");
 assert.equal(opencodeConnect.agentKind, "opencode");
+
+const devinActions = findTaskLinkActions(`# Devin task
+
+Tags: agent=devin
+Agent: clumsy-sesame
+Repo: D:\\base\\projects\\demo
+`);
+const devinConnect = devinActions.find(
+  (action) => action.command === "resumeAgent"
+);
+assert.ok(devinConnect, "Devin task should expose a Connect action");
+assert.equal(devinConnect.agentKind, "devin");
+assert.equal(devinConnect.value, "clumsy-sesame");
+
+const devinModelActions = findTaskLinkActions(`# Devin model task
+
+Model: devin/adaptive
+Agent: artistic-source
+Repo: D:\\base\\projects\\demo
+`);
+const devinModelConnect = devinModelActions.find(
+  (action) => action.command === "resumeAgent"
+);
+assert.ok(devinModelConnect, "Devin Model task should expose a Connect action for bare session names");
+assert.equal(devinModelConnect.agentKind, "devin");
+assert.equal(devinModelConnect.value, "artistic-source");
 
 assert.deepEqual(
   cursorDisplay.properties,

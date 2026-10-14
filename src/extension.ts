@@ -29,6 +29,7 @@ import {
 } from "./task-metadata";
 import {
   findTaskLinkActions,
+  getTaskAgentKindHint,
   getTaskPropertyActions,
   isAbsoluteLocalPath as isTaskAbsoluteLocalPath,
   isExternalUrlValue as isTaskExternalUrlValue,
@@ -47,6 +48,10 @@ import {
   getMatchingModelValueCompletions,
   getModelValueCompletionContext,
 } from "./model-completions";
+import {
+  getMatchingTagCompletions,
+  getTagValueCompletionContext,
+} from "./tag-completions";
 import { makeUniqueFileName, slugifyFileName } from "./file-names";
 
 type CardProperty = TaskProperty & {
@@ -141,7 +146,12 @@ type RunnerStatusProbe = {
   activeAgentCount?: number;
 };
 
-type AgentKind = "claude" | "codex" | "kimi" | "deepseek" | "opencode";
+type AgentKind = "claude" | "codex" | "kimi" | "deepseek" | "opencode" | "devin";
+type DevinModelCompletionCacheEntry = {
+  expiresAt: number;
+  values: string[];
+  pending?: Promise<string[]>;
+};
 type WorkspaceMoveCallback = (
   root: string,
   sourcePath: string,
@@ -169,6 +179,7 @@ const CREATE_EMPTY_BOARD_COMMAND = "kanban.createEmptyBoard";
 const CREATE_BOARD_WITH_COLUMNS_COMMAND = "kanban.createBoardWithColumns";
 const CREATE_BOARD_WITH_RUNNER_COMMAND = "kanban.createBoardWithRunner";
 const INITIALIZE_RUNNER_COMMAND = "kanban.initializeRunner";
+const REPLACE_RUNNER_COMMAND = "kanban.replaceRunner";
 const INITIALIZE_TEMPLATE_COMMAND = "kanban.initializeTemplate";
 const KANBAN_CONFIGURATION_SECTION = "kanban";
 const DETAILS_PANE_WIDTH_SETTING = "detailsPaneWidth";
@@ -184,6 +195,7 @@ const CLAUDE_EXECUTABLE_SETTING = "claudeExecutable";
 const KIMI_EXECUTABLE_SETTING = "kimiExecutable";
 const DEEPSEEK_EXECUTABLE_SETTING = "deepseekExecutable";
 const OPENCODE_EXECUTABLE_SETTING = "opencodeExecutable";
+const DEVIN_EXECUTABLE_SETTING = "devinExecutable";
 const DEFAULT_DETAILS_PANE_WIDTH = 360;
 const MIN_DETAILS_PANE_WIDTH = 280;
 const MAX_DETAILS_PANE_WIDTH = 720;
@@ -192,6 +204,7 @@ const DEFAULT_CLAUDE_EXECUTABLE = "claude";
 const DEFAULT_KIMI_EXECUTABLE = "kimi";
 const DEFAULT_DEEPSEEK_EXECUTABLE = "deepcode";
 const DEFAULT_OPENCODE_EXECUTABLE = "opencode";
+const DEFAULT_DEVIN_EXECUTABLE = "devin";
 const RUNNER_STATUS_REFRESH_MS = 10_000;
 const BOARD_DISK_REFRESH_MS = 10_000;
 const RUNNER_STATUS_CONNECT_TIMEOUT_MS = 250;
@@ -201,11 +214,14 @@ const RUNNER_STATUS_PORT_RANGE = 20_000;
 const RUNNER_STATUS_PORT_STEP = 997;
 const RUNNER_STATUS_PORT_CANDIDATES = 32;
 const RUNNER_TOOL_CHECK_TIMEOUT_MS = 5000;
+const DEVIN_MODEL_LIST_CACHE_MS = 10 * 60 * 1000;
+const DEVIN_MODEL_LIST_TIMEOUT_MS = 5000;
 const CODEX_INSTALL_URL = "https://github.com/openai/codex";
 const CLAUDE_INSTALL_URL = "https://docs.anthropic.com/en/docs/claude-code";
 const KIMI_INSTALL_URL = "https://moonshotai.github.io/kimi-code/";
 const DEEPSEEK_INSTALL_URL = "https://api-docs.deepseek.com/quick_start/agent_integrations/deepcode/";
 const OPENCODE_INSTALL_URL = "https://opencode.ai/";
+const DEVIN_INSTALL_URL = "https://docs.devin.ai/cli";
 const PYWINPTY_INSTALL_URL = "https://pypi.org/project/pywinpty/";
 const PYTHON_INSTALL_URL = "https://www.python.org/downloads/";
 const KANBAN_FILE_NAME = ".kanban";
@@ -233,6 +249,8 @@ const DEFAULT_RUNNER_ARGS = [
   "${deepseekExecutable}",
   "--opencode-executable",
   "${opencodeExecutable}",
+  "--devin-executable",
+  "${devinExecutable}",
 ];
 const DEFAULT_PROJECTS_MAP_TEXT = "blank = https://github.com/flcl42/blank.git\n";
 const DEFAULT_TASK_TEMPLATE_TEXT = `# {{TITLE}}
@@ -298,6 +316,9 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand(INITIALIZE_RUNNER_COMMAND, async (target?: vscode.Uri) =>
       provider.initializeRunner(target)
     ),
+    vscode.commands.registerCommand(REPLACE_RUNNER_COMMAND, async (target?: vscode.Uri) =>
+      provider.replaceRunner(target)
+    ),
     vscode.commands.registerCommand(INITIALIZE_TEMPLATE_COMMAND, async (target?: vscode.Uri) =>
       provider.initializeTemplate(target)
     ),
@@ -312,17 +333,121 @@ export function activate(context: vscode.ExtensionContext) {
       ":",
       " ",
       "/"
+    ),
+    vscode.languages.registerCompletionItemProvider(
+      { language: "markdown" },
+      new TagValueCompletionProvider(),
+      ":",
+      " ",
+      ","
     )
   );
 }
 
 export function deactivate() {}
 
+class TagValueCompletionProvider implements vscode.CompletionItemProvider {
+  async provideCompletionItems(
+    document: vscode.TextDocument,
+    position: vscode.Position,
+    token: vscode.CancellationToken
+  ): Promise<vscode.CompletionItem[] | undefined> {
+    const context = getTagValueCompletionContext(
+      document.lineAt(position.line).text,
+      position.character
+    );
+    if (!context || !document.uri.path.toLowerCase().endsWith(".md")) {
+      return undefined;
+    }
+
+    const columnUri = vscode.Uri.joinPath(document.uri, "..");
+    const boardUri = vscode.Uri.joinPath(columnUri, "..");
+    const configUri = vscode.Uri.joinPath(boardUri, KANBAN_FILE_NAME);
+    let config: BoardConfig;
+    let columns: [string, vscode.FileType][];
+    try {
+      const [configBytes, entries] = await Promise.all([
+        vscode.workspace.fs.readFile(configUri),
+        vscode.workspace.fs.readDirectory(boardUri),
+      ]);
+      config = parseBoardConfig(Buffer.from(configBytes).toString("utf8"));
+      columns = entries;
+    } catch {
+      return undefined;
+    }
+    const columnName = path.posix.basename(columnUri.path);
+    if (
+      !columns.some(([name, type]) => name === columnName && type === vscode.FileType.Directory) ||
+      isIgnoredFolder(config, columnName)
+    ) {
+      return undefined;
+    }
+
+    const tags = new Set<string>();
+    for (const [name, type] of columns) {
+      if (token.isCancellationRequested) {
+        return undefined;
+      }
+      if (type !== vscode.FileType.Directory || isIgnoredFolder(config, name)) {
+        continue;
+      }
+      const folderUri = vscode.Uri.joinPath(boardUri, name);
+      let files: [string, vscode.FileType][];
+      try {
+        files = await vscode.workspace.fs.readDirectory(folderUri);
+      } catch {
+        continue;
+      }
+      const columnTags = await Promise.all(files.map(async ([fileName, fileType]) => {
+        if (
+          fileType !== vscode.FileType.File ||
+          !fileName.toLowerCase().endsWith(".md") ||
+          fileName.toLowerCase() === "folder.md"
+        ) {
+          return [];
+        }
+        const fileUri = vscode.Uri.joinPath(folderUri, fileName);
+        try {
+          const content = fileUri.toString() === document.uri.toString()
+            ? document.getText()
+            : Buffer.from(await vscode.workspace.fs.readFile(fileUri)).toString("utf8");
+          return parseTaskMarkdown(content, fileName).tags;
+        } catch {
+          // Files can disappear while tickets move between columns.
+          return [];
+        }
+      }));
+      for (const cardTags of columnTags) {
+        for (const tag of cardTags) {
+          tags.add(tag);
+        }
+      }
+    }
+    const range = new vscode.Range(
+      position.line,
+      context.valueStart,
+      position.line,
+      context.valueEnd
+    );
+    return getMatchingTagCompletions(tags, context).map((tag) => {
+      const item = new vscode.CompletionItem(tag, vscode.CompletionItemKind.Value);
+      item.insertText = tag;
+      item.range = range;
+      return item;
+    });
+  }
+}
+
 class ModelValueCompletionProvider implements vscode.CompletionItemProvider {
-  provideCompletionItems(
+  private static readonly devinModelCompletionsByExecutable = new Map<
+    string,
+    DevinModelCompletionCacheEntry
+  >();
+
+  async provideCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position
-  ): vscode.ProviderResult<vscode.CompletionItem[]> {
+  ): Promise<vscode.CompletionItem[] | undefined> {
     const lineText = document.lineAt(position.line).text;
     const completionContext = getModelValueCompletionContext(
       lineText,
@@ -339,9 +464,13 @@ class ModelValueCompletionProvider implements vscode.CompletionItemProvider {
       completionContext.valueEnd
     );
 
+    const configuredCompletions = await this.getConfiguredModelCompletions(
+      document.uri,
+      completionContext.prefix
+    );
     return getMatchingModelValueCompletions(
       completionContext.prefix,
-      this.getConfiguredModelCompletions(document.uri)
+      configuredCompletions
     ).map((completion) => {
         const item = new vscode.CompletionItem(
           completion.label,
@@ -361,7 +490,10 @@ class ModelValueCompletionProvider implements vscode.CompletionItemProvider {
       });
   }
 
-  private getConfiguredModelCompletions(resource: vscode.Uri): string[] {
+  private async getConfiguredModelCompletions(
+    resource: vscode.Uri,
+    prefix: string
+  ): Promise<string[]> {
     const configured = vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
       .get<unknown>(MODEL_COMPLETIONS_SETTING);
@@ -374,7 +506,76 @@ class ModelValueCompletionProvider implements vscode.CompletionItemProvider {
     return [
       ...configuredValues,
       ...this.getDefaultModelCompletionValues(resource),
+      ...(await this.getDevinModelCompletionValues(resource, prefix)),
     ];
+  }
+
+  private async getDevinModelCompletionValues(
+    resource: vscode.Uri,
+    prefix: string
+  ): Promise<string[]> {
+    const normalizedPrefix = prefix.trim().toLowerCase();
+    if (
+      normalizedPrefix &&
+      !normalizedPrefix.startsWith("devin/") &&
+      !("devin".startsWith(normalizedPrefix))
+    ) {
+      return [];
+    }
+
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
+      .get<string>(DEVIN_EXECUTABLE_SETTING, DEFAULT_DEVIN_EXECUTABLE)
+      .trim() || DEFAULT_DEVIN_EXECUTABLE;
+    return ModelValueCompletionProvider.getCachedDevinModelCompletionValues(executable);
+  }
+
+  private static async getCachedDevinModelCompletionValues(
+    executable: string
+  ): Promise<string[]> {
+    const cacheKey = executable.trim() || DEFAULT_DEVIN_EXECUTABLE;
+    const now = Date.now();
+    const cached = this.devinModelCompletionsByExecutable.get(cacheKey);
+    if (cached && cached.expiresAt > now && !cached.pending) {
+      return cached.values;
+    }
+    if (cached?.pending) {
+      return cached.pending;
+    }
+
+    const pending = this.readDevinModelCompletionValues(cacheKey)
+      .then((values) => {
+        this.devinModelCompletionsByExecutable.set(cacheKey, {
+          expiresAt: Date.now() + DEVIN_MODEL_LIST_CACHE_MS,
+          values,
+        });
+        return values;
+      })
+      .catch(() => {
+        this.devinModelCompletionsByExecutable.set(cacheKey, {
+          expiresAt: Date.now() + 60_000,
+          values: [],
+        });
+        return [];
+      });
+    this.devinModelCompletionsByExecutable.set(cacheKey, {
+      expiresAt: now + DEVIN_MODEL_LIST_CACHE_MS,
+      values: cached?.values || [],
+      pending,
+    });
+    return pending;
+  }
+
+  private static async readDevinModelCompletionValues(
+    executable: string
+  ): Promise<string[]> {
+    const result = await execFileAsync(executable, ["models", "list", "--format", "json"], {
+      windowsHide: true,
+      timeout: DEVIN_MODEL_LIST_TIMEOUT_MS,
+      maxBuffer: 4 * 1024 * 1024,
+      shell: process.platform === "win32",
+    });
+    return parseDevinModelCompletionValues(String(result.stdout || ""));
   }
 
   private getDefaultModelCompletionValues(resource: vscode.Uri): string[] {
@@ -752,9 +953,10 @@ async function resolveExistingLocalPath(
 async function getTaskPropertyActionsWithExistingLocalPath(
   key: string,
   value: string,
-  bases: string[]
+  bases: string[],
+  context: { agentKind?: string } = {}
 ): Promise<TaskPropertyAction[]> {
-  const actions = getTaskPropertyActions(key, value);
+  const actions = getTaskPropertyActions(key, value, context);
   const existingPath = await resolveExistingLocalPath(key, value, bases);
   if (
     existingPath &&
@@ -904,6 +1106,7 @@ function createDefaultBoardConfigText(): string {
       kimi: "",
       deepseek: "",
       opencode: "",
+      devin: "",
     },
     folders: Object.fromEntries(
       DEFAULT_BOARD_COLUMNS.map((column) => [column.id, column.name])
@@ -1053,6 +1256,22 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     );
   }
 
+  async replaceRunner(target?: vscode.Uri): Promise<void> {
+    const kanbanUri = await this.resolveExistingBoardTarget(
+      target,
+      "Select a board whose runner should be replaced"
+    );
+    if (!kanbanUri) {
+      return;
+    }
+    const runnerPath = await this.replaceRunnerForBoard(kanbanUri);
+    if (runnerPath) {
+      vscode.window.showInformationMessage(
+        `AI Kanban runner updated: ${runnerPath}. Restart any running runner to use it.`
+      );
+    }
+  }
+
   async initializeTemplate(target?: vscode.Uri): Promise<void> {
     const kanbanUri = await this.resolveTemplateInitializationTarget(target);
     if (!kanbanUri) {
@@ -1115,6 +1334,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private async resolveTemplateInitializationTarget(
     target?: vscode.Uri
   ): Promise<vscode.Uri | null> {
+    return this.resolveExistingBoardTarget(
+      target,
+      "Select a board to initialize a task template"
+    );
+  }
+
+  private async resolveExistingBoardTarget(
+    target: vscode.Uri | undefined,
+    title: string
+  ): Promise<vscode.Uri | null> {
     const directTarget = await this.resolveExistingKanbanUriFromTarget(target);
     if (directTarget) {
       return directTarget;
@@ -1142,7 +1371,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           uri,
         })),
         {
-          title: "Select a board to initialize a task template",
+          title,
           placeHolder: "Select .kanban",
         }
       );
@@ -1397,6 +1626,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         if (!columnId) {
           return;
         }
+        const top =
+          typeof message?.top === "boolean"
+            ? Boolean(message.top)
+            : undefined;
         const title = await vscode.window.showInputBox({
           prompt: "Ticket title",
           placeHolder: "New ticket",
@@ -1405,7 +1638,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         if (title === undefined) {
           return;
         }
-        await runBoardMutation(() => this.createCard(document.uri, columnId, title));
+        await runBoardMutation(() =>
+          this.createCard(document.uri, columnId, title, { top })
+        );
         await sendBoard();
         return;
       }
@@ -1502,10 +1737,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         return;
       }
       if (message?.type === "startRunner") {
+        const openInTerminal = Boolean(message?.openInTerminal);
         try {
-          await this.startRunner(document.uri);
+          await this.startRunner(document.uri, { openInTerminal });
           await sendRunnerStatus(
-            "Runner start requested. It runs in the background and is not tied to VS Code."
+            openInTerminal
+              ? "Runner terminal opened. Use Ctrl+C there to stop it; it is tied to that terminal."
+              : "Runner start requested. It runs in the background and is not tied to VS Code."
           );
           setTimeout(() => {
             void sendRunnerStatus();
@@ -1513,14 +1751,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         } catch (error) {
           const errorMessage =
             error instanceof Error ? error.message : String(error ?? "Unknown error");
-          webviewPanel.webview.postMessage({
-            type: "runnerStatus",
-            status: {
-              enabled: this.getRunnerPanelEnabledSetting(),
-              running: false,
-              message: `Failed to start runner: ${errorMessage}`,
-            },
-          });
+          await sendRunnerStatus(`Failed to start runner: ${errorMessage}`);
         }
         return;
       }
@@ -1550,6 +1781,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
               message: `Failed to create runner: ${errorMessage}`,
             },
           });
+        }
+        return;
+      }
+      if (message?.type === "replaceRunner") {
+        try {
+          const runnerPath = await this.replaceRunnerForBoard(document.uri);
+          await sendRunnerStatus(
+            runnerPath
+              ? `Runner updated: ${runnerPath}. Start it now to use the new version.`
+              : undefined
+          );
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          await sendRunnerStatus(`Failed to replace runner: ${errorMessage}`);
         }
         return;
       }
@@ -1930,12 +2175,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         fileUri,
         vscode.Uri.joinPath(columnUri, "..")
       );
+      const agentKindHint = getTaskAgentKindHint(properties) ?? undefined;
       const propertiesWithActions = await Promise.all(
         properties.map(async (property) => {
           const actions = await getTaskPropertyActionsWithExistingLocalPath(
             property.key,
             property.value,
-            actionBases
+            actionBases,
+            { agentKind: agentKindHint }
           );
           return {
             ...property,
@@ -2326,7 +2573,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   private async createCard(
     kanbanUri: vscode.Uri,
     columnId: string,
-    title: string
+    title: string,
+    options: { top?: boolean } = {}
   ): Promise<void> {
     const boardFolder = vscode.Uri.joinPath(kanbanUri, "..");
     const columnUri = vscode.Uri.joinPath(boardFolder, columnId);
@@ -2362,10 +2610,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const content = buildNewCardContent(safeTitle, templateContent);
     await this.ensureFile(fileUri);
     await this.applyContentEdit(fileUri, content);
+    const columnHasTopCards = existingCards.some((card) => card.top);
+    const createAsTop =
+      typeof options.top === "boolean"
+        ? options.top && columnHasTopCards
+        : columnHasTopCards;
     const topCardMutations: TopCardConfigMutation[] =
-      boardConfig.topCards.size > 0
+      createAsTop
         ? [{ type: "set", columnId, fileName, top: true }]
-        : [];
+        : [{ type: "delete", columnId, fileName }];
     await this.updateBoardCardPriorities(
       kanbanUri,
       [
@@ -2677,17 +2930,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     repoPath?: unknown
   ): Promise<void> {
     const trimmed = normalizeTaskPropertyValue(agentId);
-    if (!isTaskGuidValue(trimmed)) {
+    const explicitKind = normalizeAgentKindValue(agentKind);
+    if (
+      !isTaskGuidValue(trimmed) &&
+      !(explicitKind === "devin" && isDevinSessionId(trimmed, true))
+    ) {
       return;
     }
     const repoCwd =
       typeof repoPath === "string"
         ? await this.resolvePathDirectory(repoPath)
         : null;
-    const explicitKind = normalizeAgentKindValue(agentKind);
     const sessionKind = await this.detectAgentKindFromSessions(trimmed, repoCwd);
     const idKind = agentKindFromAgentId(trimmed);
-    const unambiguousIdKind = idKind === "codex" || idKind === "kimi"
+    const unambiguousIdKind = idKind === "codex" || idKind === "kimi" || idKind === "opencode" || idKind === "devin"
       ? idKind
       : null;
     const configuredDefaultKind = normalizeAgentKindValue(this.getDefaultAgentSetting());
@@ -2714,6 +2970,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           ? await this.readDeepSeekSessionCwd(trimmed)
         : kind === "opencode"
           ? await this.readOpencodeSessionCwd(trimmed)
+        : kind === "devin"
+          ? repoCwd
         : await this.readCodexSessionCwd(trimmed);
     const sessionCwd = recordedSessionCwd ?? repoCwd;
     if (kind === "kimi") {
@@ -2736,6 +2994,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           ? this.getDeepSeekExecutableSetting()
         : kind === "opencode"
           ? this.getOpencodeExecutableSetting()
+        : kind === "devin"
+          ? this.getDevinExecutableSetting()
         : this.getCodexExecutableSetting()
     );
     terminal.show(false);
@@ -2747,6 +3007,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       terminal.sendText(`${executableCommand} --resume ${trimmed}`, true);
     } else if (kind === "opencode") {
       terminal.sendText(`${executableCommand} --session ${trimmed} --auto`, true);
+    } else if (kind === "devin") {
+      terminal.sendText(`${executableCommand} --resume ${formatDevinCliSessionId(trimmed)}`, true);
     } else {
       terminal.sendText(
         sessionCwd
@@ -2932,6 +3194,14 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     return executable || DEFAULT_OPENCODE_EXECUTABLE;
   }
 
+  private getDevinExecutableSetting(): string {
+    const executable = vscode.workspace
+      .getConfiguration(KANBAN_CONFIGURATION_SECTION)
+      .get<string>(DEVIN_EXECUTABLE_SETTING, DEFAULT_DEVIN_EXECUTABLE)
+      .trim();
+    return executable || DEFAULT_DEVIN_EXECUTABLE;
+  }
+
   private getDefaultAgentSetting(resource?: vscode.Uri): string {
     const value = vscode.workspace
       .getConfiguration(KANBAN_CONFIGURATION_SECTION, resource)
@@ -3019,8 +3289,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ),
       };
     }
+    if (defaultAgent === "devin") {
+      return {
+        python: pythonStatus,
+        devin: await this.detectRunnerTool(
+          "Devin CLI",
+          this.getDevinExecutableSetting(),
+          ["--version"],
+          DEVIN_INSTALL_URL
+        ),
+      };
+    }
 
-    const [claudeStatus, codexStatus, opencodeStatus, kimiStatus, deepseekStatus] = await Promise.all([
+    const [claudeStatus, codexStatus, opencodeStatus, kimiStatus, deepseekStatus, devinStatus] = await Promise.all([
       this.detectRunnerTool(
         "Claude Code",
         this.getClaudeExecutableSetting(),
@@ -3051,13 +3332,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         ["--version"],
         DEEPSEEK_INSTALL_URL
       ),
+      this.detectRunnerTool(
+        "Devin CLI",
+        this.getDevinExecutableSetting(),
+        ["--version"],
+        DEVIN_INSTALL_URL
+      ),
     ]);
     const needsPywinpty =
       !claudeStatus.installed &&
       !codexStatus.installed &&
       !opencodeStatus.installed &&
       !kimiStatus.installed &&
-      deepseekStatus.installed;
+      deepseekStatus.installed &&
+      !devinStatus.installed;
     const pywinptyStatus = needsPywinpty
       ? await this.detectRunnerTool(
           "pywinpty",
@@ -3070,14 +3358,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       python: pythonStatus,
       ...(pywinptyStatus ? { pywinpty: pywinptyStatus } : {}),
       agent: {
-        label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
-        command: `${claudeStatus.command} / ${codexStatus.command} / ${opencodeStatus.command} / ${kimiStatus.command} / ${deepseekStatus.command}`,
+        label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+        command: `${claudeStatus.command} / ${codexStatus.command} / ${opencodeStatus.command} / ${kimiStatus.command} / ${deepseekStatus.command} / ${devinStatus.command}`,
         installed:
           claudeStatus.installed ||
           codexStatus.installed ||
           opencodeStatus.installed ||
           kimiStatus.installed ||
-          deepseekStatus.installed,
+          deepseekStatus.installed ||
+          devinStatus.installed,
         version: claudeStatus.installed
           ? `Claude Code ${claudeStatus.version}`
           : codexStatus.installed
@@ -3088,7 +3377,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
                 ? `Kimi CLI ${kimiStatus.version}`
                 : deepseekStatus.installed
                   ? `Deep Code ${deepseekStatus.version}`
-              : "",
+                  : devinStatus.installed
+                    ? `Devin CLI ${devinStatus.version}`
+                    : "",
         installUrl: OPENCODE_INSTALL_URL,
       },
     };
@@ -3140,6 +3431,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     runnerScriptRequired?: boolean;
     runnerScriptExists?: boolean;
     runnerScriptPath?: string;
+    runnerScriptDiffers?: boolean;
     port?: number;
     requirements?: RunnerToolStatuses;
     message?: string;
@@ -3157,6 +3449,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const runnerScriptRequired = this.getRunnerScriptRequiredSetting();
     const probe = await this.probeRunnerStatus(paths.runnerRoot);
     const requirements = enabled ? await this.getRunnerToolStatuses(kanbanUri) : undefined;
+    const runnerScriptDiffers = enabled && paths.localRunnerScript
+      ? await this.localRunnerDiffersFromBundled(paths.localRunnerScript)
+      : false;
     if (probe) {
       this.runnerLaunches.delete(normalizeMovePath(paths.runnerRoot));
       return {
@@ -3165,6 +3460,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerScriptRequired,
         runnerScriptExists: Boolean(paths.localRunnerScript),
         runnerScriptPath: paths.localRunnerScript ?? "",
+        runnerScriptDiffers,
         port: probe.port,
         activeAgentCount: probe.activeAgentCount,
         requirements,
@@ -3181,6 +3477,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerScriptRequired,
         runnerScriptExists: Boolean(paths.localRunnerScript),
         runnerScriptPath: paths.localRunnerScript ?? "",
+        runnerScriptDiffers,
         requirements,
         message:
           message ??
@@ -3197,12 +3494,16 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       runnerScriptRequired,
       runnerScriptExists: Boolean(paths.localRunnerScript),
       runnerScriptPath: paths.localRunnerScript ?? "",
+      runnerScriptDiffers,
       requirements,
       message,
     };
   }
 
-  private async startRunner(kanbanUri: vscode.Uri): Promise<void> {
+  private async startRunner(
+    kanbanUri: vscode.Uri,
+    options: { openInTerminal?: boolean } = {}
+  ): Promise<void> {
     if (kanbanUri.scheme !== "file") {
       throw new Error("Runner startup is only supported for local file boards.");
     }
@@ -3218,6 +3519,31 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const args = this.getRunnerArgsSetting().map((arg) =>
       this.expandRunnerTokens(arg, paths)
     );
+    if (
+      paths.localRunnerScript &&
+      args.includes(paths.localRunnerScript) &&
+      args.includes("--devin-executable")
+    ) {
+      const localScript = await vscode.workspace.fs.readFile(
+        vscode.Uri.file(paths.localRunnerScript)
+      );
+      if (!Buffer.from(localScript).toString("utf8").includes("--devin-executable")) {
+        throw new Error(
+          `Local runner does not support --devin-executable: ${paths.localRunnerScript}. Use "AI Kanban: Replace Runner with Bundled Version" first.`
+        );
+      }
+    }
+    if (options.openInTerminal) {
+      const terminal = vscode.window.createTerminal({
+        name: formatRunnerTerminalName(paths.runnerRoot),
+        cwd: paths.runnerRoot,
+      });
+      terminal.show(false);
+      terminal.sendText(formatTerminalCommand(command, args), true);
+      await this.focusTerminal();
+      this.runnerLaunches.set(normalizeMovePath(paths.runnerRoot), Date.now());
+      return;
+    }
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(command, args, {
@@ -3333,6 +3659,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     kimiExecutable: string;
     deepseekExecutable: string;
     opencodeExecutable: string;
+    devinExecutable: string;
   } {
     const kanbanDir = path.dirname(kanbanUri.fsPath);
     const runnerRoot =
@@ -3360,6 +3687,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       kimiExecutable: this.getKimiExecutableSetting(),
       deepseekExecutable: this.getDeepSeekExecutableSetting(),
       opencodeExecutable: this.getOpencodeExecutableSetting(),
+      devinExecutable: this.getDevinExecutableSetting(),
     };
   }
 
@@ -3390,6 +3718,57 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       await vscode.workspace.fs.writeFile(destinationUri, content);
     }
     return { runnerPath: destination, kanbanUri };
+  }
+
+  private async localRunnerDiffersFromBundled(localPath: string): Promise<boolean> {
+    try {
+      const [local, bundled] = await Promise.all([
+        vscode.workspace.fs.readFile(vscode.Uri.file(localPath)),
+        vscode.workspace.fs.readFile(vscode.Uri.file(this.context.asAbsolutePath(RUNNER_SCRIPT_NAME))),
+      ]);
+      return !Buffer.from(local).equals(Buffer.from(bundled));
+    } catch {
+      return false;
+    }
+  }
+
+  private async replaceRunnerForBoard(kanbanUri: vscode.Uri): Promise<string | null> {
+    if (kanbanUri.scheme !== "file") {
+      throw new Error("Runner replacement is only supported for local file boards.");
+    }
+    const paths = this.getRunnerTokenPaths(kanbanUri);
+    const destination = paths.localRunnerScript ?? path.join(paths.runnerRoot, RUNNER_SCRIPT_NAME);
+    const destinationUri = vscode.Uri.file(destination);
+    const bundled = await vscode.workspace.fs.readFile(
+      vscode.Uri.file(this.context.asAbsolutePath(RUNNER_SCRIPT_NAME))
+    );
+    let existing: Uint8Array | null = null;
+    try {
+      existing = await vscode.workspace.fs.readFile(destinationUri);
+    } catch (error) {
+      if (await this.fileExists(destinationUri)) {
+        throw error;
+      }
+    }
+    if (existing && Buffer.from(existing).equals(Buffer.from(bundled))) {
+      vscode.window.showInformationMessage(`Runner is already up to date: ${destination}`);
+      return null;
+    }
+    if (existing) {
+      const running = Boolean(await this.probeRunnerStatus(paths.runnerRoot));
+      const confirmation = await vscode.window.showWarningMessage(
+        `Replace ${destination} with the runner bundled in this extension? A backup will be saved beside it.${running ? " The running process will still need to be restarted." : ""}`,
+        { modal: true },
+        "Replace runner"
+      );
+      if (confirmation !== "Replace runner") {
+        return null;
+      }
+      const backupUri = vscode.Uri.file(`${destination}.backup-${Date.now()}`);
+      await vscode.workspace.fs.writeFile(backupUri, existing);
+    }
+    await vscode.workspace.fs.writeFile(destinationUri, bundled);
+    return destination;
   }
 
   private async ensureTaskTemplateFile(kanbanUri: vscode.Uri): Promise<vscode.Uri> {
@@ -3558,6 +3937,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       kimiExecutable: string;
       deepseekExecutable: string;
       opencodeExecutable: string;
+      devinExecutable: string;
     }
   ): string {
     return value
@@ -3570,7 +3950,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       .replace(/\$\{claudeExecutable\}/g, paths.claudeExecutable)
       .replace(/\$\{kimiExecutable\}/g, paths.kimiExecutable)
       .replace(/\$\{deepseekExecutable\}/g, paths.deepseekExecutable)
-      .replace(/\$\{opencodeExecutable\}/g, paths.opencodeExecutable);
+      .replace(/\$\{opencodeExecutable\}/g, paths.opencodeExecutable)
+      .replace(/\$\{devinExecutable\}/g, paths.devinExecutable);
   }
 
   private async resolvePathDirectory(rawPath: string): Promise<string | null> {
@@ -3672,6 +4053,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (requestedKind === "opencode") {
       return buildResult("opencode", this.readOpencodeOutput(trimmed));
     }
+    if (requestedKind === "devin") {
+      return buildResult("devin", this.readDevinOutput(trimmed));
+    }
 
     if (await this.findDeepSeekSessionFile(trimmed)) {
       return buildResult("deepseek", this.readDeepSeekOutput(trimmed));
@@ -3692,6 +4076,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
     if (inferredKind === "opencode") {
       return buildResult("opencode", this.readOpencodeOutput(trimmed));
+    }
+    if (inferredKind === "devin") {
+      return buildResult("devin", this.readDevinOutput(trimmed));
     }
 
     if (await this.findClaudeSessionFile(trimmed)) {
@@ -3715,6 +4102,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           ? this.readDeepSeekOutput(trimmed)
         : defaultKind === "opencode"
           ? this.readOpencodeOutput(trimmed)
+        : defaultKind === "devin"
+          ? this.readDevinOutput(trimmed)
         : this.readCodexOutput(trimmed)
     );
   }
@@ -3978,6 +4367,10 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
   }
 
+  private async readDevinOutput(_agentId: string): Promise<string | null> {
+    return null;
+  }
+
   private async readCodexSessionCwd(agentId: string): Promise<string | null> {
     const sessionFile = await this.findCodexSessionFile(agentId);
     if (!sessionFile) {
@@ -4139,6 +4532,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     agentId: string,
     repoPath?: string | null
   ): Promise<AgentKind | null> {
+    if (agentKindFromAgentId(agentId) === "devin") {
+      return "devin";
+    }
     if (repoPath && await this.findDeepSeekSessionFileForWorkdir(agentId, repoPath)) {
       return "deepseek";
     }
@@ -4195,26 +4591,30 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     if (configured) {
       return configured;
     }
-    const [claude, codex, opencode, kimi, deepseek] = await Promise.all([
+    const [claude, codex, opencode, kimi, deepseek, devin] = await Promise.all([
       this.canExecuteTool(this.getClaudeExecutableSetting()),
       this.canExecuteTool(this.getCodexExecutableSetting()),
       this.canExecuteTool(this.getOpencodeExecutableSetting()),
       this.canExecuteTool(this.getKimiExecutableSetting()),
       this.canExecuteTool(this.getDeepSeekExecutableSetting()),
+      this.canExecuteTool(this.getDevinExecutableSetting()),
     ]);
-    if (claude || (!codex && !opencode && !kimi && !deepseek)) {
+    if (claude || (!codex && !opencode && !kimi && !deepseek && !devin)) {
       return "claude";
     }
-    if (codex || (!opencode && !kimi && !deepseek)) {
+    if (codex || (!opencode && !kimi && !deepseek && !devin)) {
       return "codex";
     }
-    if (opencode || (!kimi && !deepseek)) {
+    if (opencode || (!kimi && !deepseek && !devin)) {
       return "opencode";
     }
-    if (kimi || !deepseek) {
+    if (kimi || (!deepseek && !devin)) {
       return "kimi";
     }
-    return "deepseek";
+    if (deepseek || !devin) {
+      return "deepseek";
+    }
+    return "devin";
   }
 
   private async canExecuteTool(executable: string): Promise<boolean> {
@@ -4714,6 +5114,43 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       align-items: center;
       gap: 12px;
       flex-wrap: wrap;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+      background: var(--bg);
+    }
+    .board-back-to-top {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 36px;
+      width: 36px;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      color: var(--ink);
+      cursor: pointer;
+    }
+    .board-back-to-top[hidden] {
+      display: none;
+    }
+    .board-back-to-top:hover {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .board-back-to-top:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
+    .board-back-to-top svg {
+      width: 18px;
+      height: 18px;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
     }
     .board-search {
       flex: 1 1 280px;
@@ -4909,6 +5346,25 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       gap: 8px;
       flex: 0 0 auto;
     }
+    .runner-start-actions {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 7px;
+      flex: 0 0 auto;
+    }
+    .runner-terminal-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+    .runner-terminal-option input {
+      margin: 0;
+    }
     .runner-hide-default {
       display: inline-flex;
       align-items: center;
@@ -5055,10 +5511,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       outline-offset: 2px;
     }
     .card-title-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
-      gap: 8px;
+      min-width: 0;
     }
     .card h3 {
       margin: 0;
@@ -5069,32 +5522,62 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       white-space: nowrap;
       font-size: 15px;
     }
-    .card-bump {
+    .card-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 6px;
+      margin-top: auto;
+      padding-top: 4px;
+    }
+    .card-action-button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 26px;
       border: 1px solid var(--line);
       background: var(--panel);
       color: var(--ink);
-      width: 24px;
-      height: 24px;
+      width: 26px;
+      height: 26px;
       border-radius: 999px;
       cursor: pointer;
-      font-family: var(--mono);
-      font-size: 13px;
-      line-height: 1;
       padding: 0;
     }
-    .card-bump:hover {
+    .card-action-button svg {
+      width: 16px;
+      height: 16px;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+    .card-action-button:hover {
       border-color: var(--accent);
       background: var(--accent-soft);
     }
-    .card-bump:focus {
+    .card-action-button:focus {
       outline: 2px solid var(--accent);
       outline-offset: 2px;
     }
-    .card-bump:disabled {
+    .card-action-button:disabled {
       cursor: default;
       opacity: 0.45;
       border-color: var(--line);
       background: var(--panel);
+    }
+    .card-star[aria-pressed="true"] {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+    .card-star[aria-pressed="true"] svg {
+      fill: currentColor;
+    }
+    .card-delete:hover,
+    .card-delete:focus {
+      color: var(--vscode-errorForeground, #f14c4c);
+      border-color: var(--vscode-errorForeground, #f14c4c);
     }
     .card-context-menu {
       position: fixed;
@@ -5221,85 +5704,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     .details h1 {
       margin: 0;
       font-size: 22px;
-    }
-    .details-header-actions {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex: 0 0 auto;
-    }
-    .details-top-toggle {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 32px;
-      height: 32px;
-      flex: 0 0 auto;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--panel);
-      color: var(--muted);
-      cursor: pointer;
-      padding: 0;
-    }
-    .details-top-toggle:hover {
-      border-color: var(--accent);
-      background: var(--accent-soft);
-      color: var(--ink);
-    }
-    .details-top-toggle:focus {
-      outline: 2px solid var(--accent);
-      outline-offset: 2px;
-    }
-    .details-top-toggle[aria-pressed="true"] {
-      border-color: var(--vscode-button-background, var(--accent));
-      background: var(--vscode-button-background, var(--accent));
-      color: var(--vscode-button-foreground, var(--bg));
-    }
-    .details-top-toggle[aria-pressed="true"]:hover {
-      border-color: var(--vscode-button-hoverBackground, var(--accent));
-      background: var(--vscode-button-hoverBackground, var(--accent));
-      color: var(--vscode-button-foreground, var(--bg));
-    }
-    .details-top-toggle svg {
-      width: 16px;
-      height: 16px;
-      stroke: currentColor;
-      stroke-width: 1.8;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      fill: none;
-    }
-    .details-delete {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 32px;
-      height: 32px;
-      flex: 0 0 auto;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: var(--panel);
-      color: var(--vscode-errorForeground, #f14c4c);
-      cursor: pointer;
-      padding: 0;
-    }
-    .details-delete:hover {
-      border-color: var(--vscode-errorForeground, #f14c4c);
-      background: var(--vscode-inputValidation-errorBackground, var(--surface));
-    }
-    .details-delete:focus {
-      outline: 2px solid var(--vscode-errorForeground, #f14c4c);
-      outline-offset: 2px;
-    }
-    .details-delete svg {
-      width: 16px;
-      height: 16px;
-      stroke: currentColor;
-      stroke-width: 1.8;
-      stroke-linecap: round;
-      stroke-linejoin: round;
-      fill: none;
     }
     .details .empty,
     .board-loading {
@@ -5572,6 +5976,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   <div class="layout${detailsPaneVisible ? "" : " details-hidden"}" id="layout">
     <section class="board-pane">
       <div class="board-toolbar">
+        <button class="board-back-to-top" id="board-back-to-top" type="button" title="Back to top" aria-label="Back to top" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 20V4m-6 6 6-6 6 6" /></svg>
+        </button>
         <label class="board-search" for="board-search-input">
           <span class="board-search-label">Search</span>
           <input
@@ -5599,7 +6006,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         <div class="search-meta" id="search-meta"></div>
       </div>
       <div class="runner-panel" id="runner-panel" hidden></div>
-      <div class="board-scroll">
+      <div class="board-scroll" id="board-scroll">
         <section class="board" id="board">
           <div class="board-loading">Loading board...</div>
         </section>
@@ -5613,6 +6020,8 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     const boardEl = document.getElementById("board");
+    const boardScrollEl = document.getElementById("board-scroll");
+    const backToTopEl = document.getElementById("board-back-to-top");
     const layoutEl = document.getElementById("layout");
     const detailsEl = document.getElementById("details");
     const detailsResizerEl = document.getElementById("details-resizer");
@@ -5623,6 +6032,13 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const detailsToggleEl = document.getElementById("details-pane-toggle");
     const runnerPanelEl = document.getElementById("runner-panel");
     const rootStyle = document.documentElement?.style || null;
+    const savedViewport = vscode.getState() || {};
+    const nonnegativeScroll = (value) => Math.max(0, Number(value) || 0);
+    let rememberedBoardTop = nonnegativeScroll(savedViewport.boardScrollTop);
+    let rememberedBoardLeft = nonnegativeScroll(savedViewport.boardScrollLeft);
+    let rememberedPageTop = nonnegativeScroll(savedViewport.pageScrollTop);
+    let boardRendered = false;
+    let restoringViewport = false;
     let selectedCard = null;
     let lastBoard = null;
     let searchQuery = "";
@@ -5630,6 +6046,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let runnerStatus = { enabled: false, running: false };
     let runnerStartPending = false;
     let runnerCreatePending = false;
+    let runnerReplacePending = false;
     let runnerPanelHiddenForSession = false;
     const gitStatusCache = new Map();
     const agentOutputCache = new Map();
@@ -5691,6 +6108,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         runnerPanelEl.innerHTML = "";
         runnerStartPending = false;
         runnerCreatePending = false;
+        runnerReplacePending = false;
         return;
       }
       runnerPanelEl.hidden = false;
@@ -5720,6 +6138,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <label class="runner-hide-default">[ <input type="checkbox" data-runner-hide-default /> by default ]</label>
         </div>
       \`;
+      const updateRunnerHtml = runnerStatus.runnerScriptDiffers
+        ? '<p class="runner-panel-text">The local runner differs from the bundled version and may not accept its startup arguments.</p>' +
+          '<button type="button" data-action-type="replaceRunner"' + (runnerReplacePending ? ' disabled' : '') + '>' +
+          (runnerReplacePending ? 'Replacing...' : 'Replace runner with bundled version') + '</button>'
+        : '';
       if (runnerStatus.runnerScriptRequired && !runnerStatus.runnerScriptExists) {
         runnerPanelEl.innerHTML = \`
           <div>
@@ -5738,13 +6161,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       runnerPanelEl.innerHTML = \`
         <div>
           <div class="runner-panel-title">No Kanban runner detected</div>
-          <p class="runner-panel-text">Start a background runner for this board. It keeps working if VS Code closes.</p>
+          <p class="runner-panel-text">Start a background runner for this board. It keeps working if VS Code closes unless opened in a terminal.</p>
           \${messageHtml}
           \${requirementsHtml}
+          \${updateRunnerHtml}
         </div>
-        <button type="button" data-action-type="startRunner" \${runnerStartPending || missingRequirements.length ? "disabled" : ""}>
-          \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
-        </button>
+        <div class="runner-start-actions">
+          <button type="button" data-action-type="startRunner" \${runnerStartPending || missingRequirements.length ? "disabled" : ""}>
+            \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
+          </button>
+          <label class="runner-terminal-option" title="Open the runner in a visible VS Code terminal so Ctrl+C is available.">
+            <input type="checkbox" data-runner-open-terminal \${runnerStartPending || missingRequirements.length ? "disabled" : ""} />
+            Open in integrated terminal
+          </label>
+        </div>
         \${hideActionHtml}
       \`;
     };
@@ -5899,7 +6329,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
 
     const getVisibleProperties = (properties) => {
       return (properties || [])
-        .filter((property) => String(property?.key || "").trim().toLowerCase() !== "tags")
+        .filter((property) => !/^tags?$/i.test(String(property?.key || "").trim()))
         .sort((a, b) => {
           const aLabel = String(a?.label || a?.key || "").trim();
           const bLabel = String(b?.label || b?.key || "").trim();
@@ -5972,11 +6402,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       ) {
         return "deepseek";
       }
+      if (normalized === "devin" || normalized === "agent:devin" || normalized === "agent=devin") {
+        return "devin";
+      }
       return null;
     };
 
     const getAgentKindFromId = (value) => {
       const normalized = String(value || "").trim().toLowerCase();
+      if (/^devin[:_-][a-z0-9][a-z0-9._-]{5,127}$/i.test(normalized)) {
+        return "devin";
+      }
       if (/^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(normalized)) {
         return "kimi";
       }
@@ -6006,13 +6442,20 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       return null;
     };
 
+    const getAgentKindFromModel = (card) => {
+      const modelValue = getPropertyValue(card, "Model");
+      const slashIndex = modelValue ? modelValue.indexOf("/") : -1;
+      return slashIndex > 0 ? normalizeAgentKind(modelValue.slice(0, slashIndex)) : null;
+    };
+
     const getAgentKind = (card) => {
       const idKind = getAgentKindFromId(getPropertyValue(card, "Agent"));
-      if (idKind === "codex" || idKind === "kimi" || idKind === "opencode") {
+      if (idKind === "codex" || idKind === "kimi" || idKind === "opencode" || idKind === "devin") {
         return idKind;
       }
       return normalizeAgentKind(getPropertyValue(card, ["Agent Kind", "AgentKind"]))
         || getAgentKindFromTags(card)
+        || getAgentKindFromModel(card)
         || idKind;
     };
 
@@ -6032,6 +6475,9 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (kind === "deepseek") {
         return "DeepSeek Output";
+      }
+      if (kind === "devin") {
+        return "Devin Output";
       }
       return "Agent Output";
     };
@@ -6236,37 +6682,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           <div class="details-title">
             <h1>\${escapeHtml(card.title)}</h1>
             <div class="meta">\${metaLine}</div>
-          </div>
-          <div class="details-header-actions">
-            <button
-              class="details-top-toggle"
-              type="button"
-              title="\${card.top ? "Remove from top section" : "Keep in top section"}"
-              aria-label="\${card.top ? "Remove " : "Keep "}\${escapeHtml(card.title)} \${card.top ? "from" : "in"} top section"
-              aria-pressed="\${card.top ? "true" : "false"}"
-              data-action-type="toggleTopCard"
-              data-action-value="\${escapeHtml(card.uri)}"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M12 3l2.7 5.5 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.8 1-6.1-4.4-4.3 6.1-.9L12 3z" />
-              </svg>
-            </button>
-            <button
-              class="details-delete"
-              type="button"
-              title="Delete ticket"
-              aria-label="Delete \${escapeHtml(card.title)}"
-              data-action-type="deleteCard"
-              data-action-value="\${escapeHtml(card.uri)}"
-            >
-              <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-                <path d="M4 7h16" />
-                <path d="M10 11v6" />
-                <path d="M14 11v6" />
-                <path d="M6 7l1 14h10l1-14" />
-                <path d="M9 7V4h6v3" />
-              </svg>
-            </button>
           </div>
         </div>
         \${tagsHtml}
@@ -6565,6 +6980,19 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       });
     };
 
+    const moveCardToBottom = (card, columnId, cards) => {
+      if (!card?.uri || !columnId) {
+        return;
+      }
+      vscode.postMessage({
+        type: "reorderCards",
+        cardUri: card.uri,
+        sourceColumnId: columnId,
+        targetColumnId: columnId,
+        orderedUris: buildOrderedUris(cards, card.uri, null, "end"),
+      });
+    };
+
     const hashString = (value) => {
       let hash = 0;
       for (let i = 0; i < value.length; i++) {
@@ -6841,6 +7269,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       const firstColumnId = board.columns[0]?.id ?? board.columns[0]?.name;
       for (const state of columnStates) {
         const { column, columnId, allCards, visibleCards, topCards, regularCards } = state;
+        const hasTopCardsInColumn = topCards.length > 0;
         const displayCards = hasVisibleTopCards
           ? [...topCards, ...regularCards]
           : visibleCards;
@@ -6887,7 +7316,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           addButton.textContent = "+ Add ticket";
           addButton.draggable = false;
           addButton.addEventListener("click", () => {
-            vscode.postMessage({ type: "requestNewCard", columnId });
+            vscode.postMessage({
+              type: "requestNewCard",
+              columnId,
+              top: hasTopCardsInColumn,
+            });
           });
           headerEl.appendChild(addButton);
         }
@@ -7022,32 +7455,84 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           const createdLabel = created.toLocaleDateString();
           const createdRelative = formatRelativeTime(created);
           const metaLine = createdLabel + " · " + createdRelative;
-          const isFirstCard = cardsForOrder[0]?.uri === card.uri;
+          const actionCards = hasVisibleTopCards
+            ? (card.top ? topCards : regularCards)
+            : cardsForOrder;
+          const isFirstCard = actionCards[0]?.uri === card.uri;
+          const lastActionCard = actionCards[actionCards.length - 1];
+          const isLastCard = lastActionCard?.uri === card.uri;
           cardEl.innerHTML = \`
             <div class="card-title-row">
               <h3 title="\${escapeHtml(card.title)}">\${escapeHtml(card.title)}</h3>
+            </div>
+            <div class="meta">\${metaLine}</div>
+            \${tagsHtml}
+            \${propertyBadgesHtml}
+            <div class="card-actions" aria-label="Card actions">
               <button
-                class="card-bump"
+                class="card-action-button card-bump"
                 type="button"
                 title="Move to top"
                 aria-label="Move \${escapeHtml(card.title)} to top"
                 data-card-action="bump"
                 draggable="false"
                 \${isFirstCard ? "disabled" : ""}
-              >↑</button>
+              ><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 20V4m-6 6 6-6 6 6" /></svg></button>
+              <button
+                class="card-action-button card-sink"
+                type="button"
+                title="Move to bottom"
+                aria-label="Move \${escapeHtml(card.title)} to bottom"
+                data-card-action="sink"
+                draggable="false"
+                \${isLastCard ? "disabled" : ""}
+              ><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 4v16m-6-6 6 6 6-6" /></svg></button>
+              <button
+                class="card-action-button card-star"
+                type="button"
+                title="\${card.top ? "Remove from top section" : "Keep in top section"}"
+                aria-label="\${card.top ? "Remove " : "Keep "}\${escapeHtml(card.title)} \${card.top ? "from" : "in"} top section"
+                aria-pressed="\${card.top ? "true" : "false"}"
+                data-card-action="star"
+                draggable="false"
+              ><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 3l2.7 5.5 6.1.9-4.4 4.3 1 6.1L12 17l-5.4 2.8 1-6.1-4.4-4.3 6.1-.9L12 3z" /></svg></button>
+              <button
+                class="card-action-button card-delete"
+                type="button"
+                title="Delete ticket"
+                aria-label="Delete \${escapeHtml(card.title)}"
+                data-card-action="delete"
+                draggable="false"
+              ><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 7h16M10 11v6m4-6v6M6 7l1 14h10l1-14M9 7V4h6v3" /></svg></button>
             </div>
-            <div class="meta">\${metaLine}</div>
-            \${tagsHtml}
-            \${propertyBadgesHtml}
           \`;
           cardEl.addEventListener("click", (event) => {
             const actionButton = event?.target instanceof Element
               ? event.target.closest("[data-card-action]")
               : null;
-            if (actionButton?.getAttribute("data-card-action") === "bump") {
+            const action = actionButton?.getAttribute("data-card-action");
+            if (action === "bump") {
               event.preventDefault?.();
               event.stopPropagation?.();
               bumpCardToTop(card, columnId, cardsForOrder);
+              return;
+            }
+            if (action === "sink") {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              moveCardToBottom(card, columnId, cardsForOrder);
+              return;
+            }
+            if (action === "star") {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              vscode.postMessage({ type: "toggleTopCard", cardUri: card.uri, top: !card.top });
+              return;
+            }
+            if (action === "delete") {
+              event.preventDefault?.();
+              event.stopPropagation?.();
+              vscode.postMessage({ type: "deleteCard", cardUri: card.uri, title: card.title });
               return;
             }
             renderDetails(card);
@@ -7136,13 +7621,58 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
     };
 
+    const updateBackToTop = () => {
+      if (backToTopEl) {
+        backToTopEl.hidden = Math.max(boardScrollEl?.scrollTop || 0, window.scrollY || 0) < 120;
+      }
+    };
+
+    const saveViewport = () => {
+      if (restoringViewport || document.hidden) {
+        return;
+      }
+      rememberedBoardTop = nonnegativeScroll(boardScrollEl?.scrollTop);
+      rememberedBoardLeft = nonnegativeScroll(boardScrollEl?.scrollLeft);
+      rememberedPageTop = nonnegativeScroll(window.scrollY);
+      vscode.setState({
+        ...(vscode.getState() || {}),
+        boardScrollTop: rememberedBoardTop,
+        boardScrollLeft: rememberedBoardLeft,
+        pageScrollTop: rememberedPageTop,
+      });
+      updateBackToTop();
+    };
+
+    const restoreViewport = (boardTop, boardLeft, pageTop) => {
+      restoringViewport = true;
+      try {
+        if (boardScrollEl) {
+          boardScrollEl.scrollTop = boardTop;
+          boardScrollEl.scrollLeft = boardLeft;
+        }
+        if (pageTop || window.scrollY) {
+          window.scrollTo(0, pageTop);
+        }
+      } finally {
+        restoringViewport = false;
+      }
+      updateBackToTop();
+    };
+
     const refreshBoard = () => {
       if (!lastBoard) {
         updateSearchUi([], []);
         return;
       }
-      renderBoard(lastBoard);
-      syncDetails();
+      restoringViewport = true;
+      try {
+        renderBoard(lastBoard);
+        syncDetails();
+      } finally {
+        restoringViewport = false;
+      }
+      restoreViewport(rememberedBoardTop, rememberedBoardLeft, rememberedPageTop);
+      boardRendered = true;
     };
 
     const setSearchQuery = (value) => {
@@ -7172,6 +7702,21 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       refreshBoard();
     };
+
+    boardScrollEl?.addEventListener("scroll", saveViewport);
+    window.addEventListener("scroll", saveViewport);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && boardRendered) {
+        restoreViewport(rememberedBoardTop, rememberedBoardLeft, rememberedPageTop);
+      }
+    });
+    backToTopEl?.addEventListener("click", () => {
+      if (boardScrollEl) {
+        boardScrollEl.scrollTop = 0;
+      }
+      window.scrollTo(0, 0);
+      saveViewport();
+    });
 
     const isEditableTarget = (target) => {
       if (!(target instanceof Element)) {
@@ -7227,6 +7772,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         if (
           actionType !== "startRunner" &&
           actionType !== "createRunner" &&
+          actionType !== "replaceRunner" &&
           actionType !== "openRunnerLink" &&
           actionType !== "hideRunnerPanel"
         ) {
@@ -7257,9 +7803,17 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
           vscode.postMessage({ type: "createRunner" });
           return;
         }
+        if (actionType === "replaceRunner") {
+          runnerReplacePending = true;
+          renderRunnerPanel();
+          vscode.postMessage({ type: "replaceRunner" });
+          return;
+        }
+        const openInTerminalInput = runnerPanelEl.querySelector("[data-runner-open-terminal]");
+        const openInTerminal = Boolean(openInTerminalInput?.checked);
         runnerStartPending = true;
         renderRunnerPanel();
-        vscode.postMessage({ type: "startRunner" });
+        vscode.postMessage({ type: "startRunner", openInTerminal });
       });
     }
 
@@ -7329,14 +7883,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (!actionType || !actionValue) {
         return;
       }
-      if (actionType === "toggleTopCard") {
-        vscode.postMessage({
-          type: actionType,
-          cardUri: actionValue,
-          top: actionButton.getAttribute("aria-pressed") !== "true",
-        });
-        return;
-      }
       if (actionType === "resumeAgent") {
         vscode.postMessage({
           type: actionType,
@@ -7362,13 +7908,6 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       if (actionType === "openUrl") {
         vscode.postMessage({ type: actionType, url: actionValue });
         return;
-      }
-      if (actionType === "deleteCard") {
-        vscode.postMessage({
-          type: actionType,
-          cardUri: actionValue,
-          title: selectedCard?.title || "",
-        });
       }
     });
     detailsEl.addEventListener("dblclick", (event) => {
@@ -7413,6 +7952,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       }
       if (message?.type === "runnerStatus") {
         runnerStatus = message.status || { enabled: false, running: false };
+        runnerReplacePending = false;
         runnerStartPending = false;
         runnerCreatePending = false;
         renderRunnerPanel();
@@ -7639,7 +8179,7 @@ function buildCardSearchText(
   properties: TaskProperty[]
 ): string {
   const propertiesText = properties
-    .filter((property) => property.key.trim().toLowerCase() !== "tags")
+    .filter((property) => !/^tags?$/i.test(property.key.trim()))
     .map((property) => {
       const label = String(property.label || property.key || "").trim();
       const value = String(property.value || "").trim();
@@ -7800,6 +8340,9 @@ function normalizeAgentKindValue(value: unknown): AgentKind | null {
   ) {
     return "deepseek";
   }
+  if (normalized === "devin" || normalized === "agent:devin" || normalized === "agent=devin") {
+    return "devin";
+  }
   return null;
 }
 
@@ -7908,6 +8451,9 @@ function agentKindFromAgentId(value: unknown): AgentKind | null {
   if (isOpencodeSessionId(normalized)) {
     return "opencode";
   }
+  if (isDevinSessionId(normalized)) {
+    return "devin";
+  }
   if (
     /^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
       normalized
@@ -7934,6 +8480,18 @@ function agentKindFromAgentId(value: unknown): AgentKind | null {
 
 function isOpencodeSessionId(value: unknown): boolean {
   return /^ses_[a-z0-9]+$/i.test(String(value ?? "").trim());
+}
+
+function isDevinSessionId(value: unknown, allowBare = false): boolean {
+  const normalized = String(value ?? "").trim();
+  if (/^devin[:_-][a-z0-9][a-z0-9._-]{5,127}$/i.test(normalized)) {
+    return true;
+  }
+  return allowBare && /^[a-z0-9][a-z0-9._-]{1,127}$/i.test(normalized);
+}
+
+function formatDevinCliSessionId(value: unknown): string {
+  return String(value ?? "").trim().replace(/^devin[:_-]/i, "");
 }
 
 function extractClaudeRecordText(entry: unknown): string {
@@ -8159,6 +8717,160 @@ function findNestedString(value: unknown, key: string): string | null {
   return null;
 }
 
+function parseDevinModelCompletionValues(output: string): string[] {
+  const payload = parseFirstJsonValue(output);
+  if (payload === null) {
+    return [];
+  }
+  const values = new Set<string>();
+  collectDevinModelCompletionValues(payload, values);
+  return Array.from(values).sort((left, right) => left.localeCompare(right));
+}
+
+function collectDevinModelCompletionValues(
+  value: unknown,
+  values: Set<string>
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectDevinModelCompletionValues(item, values);
+    }
+    return;
+  }
+  if (!value || typeof value !== "object") {
+    return;
+  }
+
+  const record = value as Record<string, unknown>;
+  const models = findDevinModelNames(record);
+  const efforts = findDevinModelEfforts(record);
+  for (const model of models) {
+    values.add(`devin/${model}`);
+    const modelEfforts = efforts.length > 0
+      ? efforts
+      : /^swe(?:[-_.]?\d+)?$/i.test(model)
+        ? ["max", "high", "medium"]
+        : [];
+    for (const effort of modelEfforts) {
+      values.add(`devin/${model}/${effort}`);
+    }
+  }
+
+  for (const child of Object.values(record)) {
+    collectDevinModelCompletionValues(child, values);
+  }
+}
+
+function findDevinModelNames(record: Record<string, unknown>): string[] {
+  const modelKeys = new Set([
+    "id",
+    "slug",
+    "name",
+    "model",
+    "model_id",
+    "modelId",
+    "alias",
+    "value",
+  ]);
+  const names = new Set<string>();
+  for (const [key, value] of Object.entries(record)) {
+    if (modelKeys.has(key)) {
+      addDevinModelName(names, value);
+    }
+    if (key === "aliases" || key === "models") {
+      addDevinModelName(names, value);
+    }
+  }
+  return Array.from(names);
+}
+
+function addDevinModelName(names: Set<string>, value: unknown): void {
+  if (typeof value === "string") {
+    const normalized = normalizeDevinModelName(value);
+    if (normalized) {
+      names.add(normalized);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      addDevinModelName(names, item);
+    }
+  }
+}
+
+function normalizeDevinModelName(value: string): string | null {
+  const normalized = value.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/+-]{1,127}$/.test(normalized)) {
+    return null;
+  }
+  const lower = normalized.toLowerCase();
+  if (["model", "models", "default", "latest", "available", "enabled"].includes(lower)) {
+    return null;
+  }
+  return normalized;
+}
+
+function findDevinModelEfforts(record: Record<string, unknown>): string[] {
+  const effortKeys = new Set([
+    "effort",
+    "efforts",
+    "reasoning_effort",
+    "reasoningEffort",
+    "reasoning_efforts",
+    "reasoningEfforts",
+    "reasoning_levels",
+    "reasoningLevels",
+    "thinking_levels",
+    "thinkingLevels",
+    "levels",
+    "variants",
+  ]);
+  const efforts = new Set<string>();
+  for (const [key, value] of Object.entries(record)) {
+    if (!effortKeys.has(key)) {
+      continue;
+    }
+    addDevinModelEffort(efforts, value);
+  }
+  return Array.from(efforts);
+}
+
+function addDevinModelEffort(efforts: Set<string>, value: unknown): void {
+  if (typeof value === "string") {
+    const normalized = normalizeDevinModelEffort(value);
+    if (normalized) {
+      efforts.add(normalized);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      addDevinModelEffort(efforts, item);
+    }
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const item of Object.keys(value)) {
+      addDevinModelEffort(efforts, item);
+    }
+  }
+}
+
+function normalizeDevinModelEffort(value: string): string | null {
+  const normalized = value.trim().toLowerCase().replace(/[_\s]+/g, "-");
+  if (normalized === "maximum") {
+    return "max";
+  }
+  if (normalized === "normal") {
+    return "medium";
+  }
+  if (["max", "high", "medium", "low", "minimal"].includes(normalized)) {
+    return normalized;
+  }
+  return null;
+}
+
 function parseFirstJsonValue(text: string): unknown {
   for (let start = 0; start < text.length; start += 1) {
     const open = text[start];
@@ -8250,6 +8962,17 @@ function formatAgentTerminalName(
   return `Kanban: ${trimmedTitle}`;
 }
 
+function formatRunnerTerminalName(runnerRoot: string): string {
+  const folderName = path.basename(runnerRoot.trim()) || runnerRoot.trim();
+  return folderName ? `Kanban Runner: ${folderName}` : "Kanban Runner";
+}
+
+function formatTerminalCommand(executable: string, args: readonly string[]): string {
+  const executableCommand = formatTerminalExecutable(executable);
+  const formattedArgs = args.map(formatTerminalArgument).join(" ");
+  return formattedArgs ? `${executableCommand} ${formattedArgs}` : executableCommand;
+}
+
 function formatTerminalExecutable(executable: string): string {
   const trimmed = executable.trim() || DEFAULT_CODEX_EXECUTABLE;
   if (!/\s/.test(trimmed)) {
@@ -8261,6 +8984,14 @@ function formatTerminalExecutable(executable: string): string {
   }
 
   return `'${trimmed.replace(/'/g, "'\\''")}'`;
+}
+
+function formatTerminalArgument(value: string): string {
+  if (process.platform === "win32") {
+    return `'${escapePowerShellSingleQuotedString(value)}'`;
+  }
+
+  return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function normalizeContentForEol(

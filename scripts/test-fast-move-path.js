@@ -46,6 +46,11 @@ assert.match(
 );
 assert.match(
   runnerSource,
+  /--devin-executable/,
+  "runner should expose a CLI option for choosing the Devin executable"
+);
+assert.match(
+  runnerSource,
   /--default-agent/,
   "runner should expose a CLI option for choosing the default agent"
 );
@@ -81,8 +86,8 @@ assert.match(
 );
 assert.match(
   runnerSource,
-  /AgentKind\.CLAUDE,[\s\S]*AgentKind\.CODEX,[\s\S]*AgentKind\.OPENCODE,[\s\S]*AgentKind\.KIMI,[\s\S]*AgentKind\.DEEPSEEK/,
-  "runner should auto-detect Claude before Codex before opencode before Kimi before DeepSeek"
+  /AgentKind\.CLAUDE,[\s\S]*AgentKind\.CODEX,[\s\S]*AgentKind\.OPENCODE,[\s\S]*AgentKind\.KIMI,[\s\S]*AgentKind\.DEEPSEEK,[\s\S]*AgentKind\.DEVIN/,
+  "runner should auto-detect Claude before Codex before opencode before Kimi before DeepSeek before Devin"
 );
 assert.match(
   runnerSource,

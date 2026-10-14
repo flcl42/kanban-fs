@@ -15,10 +15,11 @@ export type ModelValueCompletionContext = {
   valueEnd: number;
 };
 
-const MODEL_EFFORT_AGENTS = new Set(["codex", "claude", "deepseek", "opencode", "oc"]);
+const MODEL_EFFORT_AGENTS = new Set(["codex", "claude", "deepseek", "opencode", "oc", "devin"]);
 const MODEL_EFFORT_LEVELS = ["ultra", "max", "xhigh", "high", "medium", "low"];
 const DEEPSEEK_MODEL_EFFORT_LEVELS = ["max", "high"];
 const OPENCODE_MODEL_VARIANTS = ["max", "high", "medium", "low", "minimal"];
+const DEVIN_MODEL_EFFORT_LEVELS = ["max", "high", "medium"];
 
 export const DEFAULT_MODEL_VALUE_COMPLETION_VALUES = [
   "codex/gpt-5.6-sol/ultra",
@@ -77,6 +78,19 @@ export const DEFAULT_MODEL_VALUE_COMPLETION_VALUES = [
   "deepseek/deepseek-v4-pro/high",
   "deepseek/deepseek-v4-flash/max",
   "deepseek/deepseek-v4-flash/high",
+  "devin/swe-2/max",
+  "devin/swe-2/high",
+  "devin/swe-2/medium",
+  "devin/swe",
+  "devin/swe-1-7-lightning",
+  "devin/opus",
+  "devin/sonnet",
+  "devin/gpt",
+  "devin/codex",
+  "devin/gemini",
+  "devin/kimi",
+  "devin/deepseek",
+  "devin/glm",
 ] as const;
 
 const MODEL_VALUE_SNIPPET_COMPLETIONS: readonly ModelValueCompletion[] = [
@@ -119,6 +133,14 @@ const MODEL_VALUE_SNIPPET_COMPLETIONS: readonly ModelValueCompletion[] = [
     detail: "opencode model with variant",
     documentation: "Use opencode/provider/model/variant. The runner passes variant to opencode as --variant.",
     sortText: "0-opencode-template",
+  },
+  {
+    label: "devin/model/effort",
+    insertText: "devin/${1:swe-2}/${2:max}",
+    kind: "snippet",
+    detail: "Devin model with reasoning effort",
+    documentation: "Use devin/model/effort. The runner passes the selected model to Devin as --model.",
+    sortText: "0-devin-template",
   },
 ];
 
@@ -257,6 +279,8 @@ function getDynamicEffortCompletions(prefix: string): ModelValueCompletion[] {
     ? DEEPSEEK_MODEL_EFFORT_LEVELS
     : agent === "opencode" || agent === "oc"
       ? OPENCODE_MODEL_VARIANTS
+    : agent === "devin"
+      ? DEVIN_MODEL_EFFORT_LEVELS
       : MODEL_EFFORT_LEVELS;
   return effortLevels
     .filter((effort) => effort.startsWith(effortPrefix))
@@ -286,6 +310,9 @@ function getConfiguredModelDetail(value: string): string {
   }
   if (agent === "opencode" || agent === "oc") {
     return "opencode configured model";
+  }
+  if (agent === "devin") {
+    return "Devin configured model";
   }
   return "Configured model";
 }

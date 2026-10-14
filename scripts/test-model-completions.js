@@ -66,6 +66,19 @@ assert.deepEqual(
     "deepseek/deepseek-v4-pro/high",
     "deepseek/deepseek-v4-flash/max",
     "deepseek/deepseek-v4-flash/high",
+    "devin/swe-2/max",
+    "devin/swe-2/high",
+    "devin/swe-2/medium",
+    "devin/swe",
+    "devin/swe-1-7-lightning",
+    "devin/opus",
+    "devin/sonnet",
+    "devin/gpt",
+    "devin/codex",
+    "devin/gemini",
+    "devin/kimi",
+    "devin/deepseek",
+    "devin/glm",
   ],
   "default model completion values should match the documented examples"
 );
@@ -121,6 +134,13 @@ assert.ok(
     (completion) => completion.insertText === "opencode/${1:provider/model}/${2:max}"
   ),
   "empty Model values should offer the opencode snippet"
+);
+
+assert.ok(
+  getMatchingModelValueCompletions("").some(
+    (completion) => completion.insertText === "devin/${1:swe-2}/${2:max}"
+  ),
+  "empty Model values should offer the Devin snippet"
 );
 
 assert.ok(
@@ -203,6 +223,26 @@ assert.equal(
   getMatchingModelValueCompletions("deepseek/custom/u").length,
   0,
   "DeepSeek completions should not suggest unsupported ultra effort values"
+);
+
+assert.ok(
+  getMatchingModelValueCompletions("devin/swe-2/").some(
+    (completion) => completion.insertText === "devin/swe-2/max"
+  ),
+  "Devin model values should offer max effort completions"
+);
+
+assert.ok(
+  getMatchingModelValueCompletions("devin/swe-2/h").some(
+    (completion) => completion.insertText === "devin/swe-2/high"
+  ),
+  "Devin model values should offer filtered high effort completions"
+);
+
+assert.equal(
+  getMatchingModelValueCompletions("devin/swe-2/u").length,
+  0,
+  "Devin completions should not suggest unsupported ultra effort values"
 );
 
 assert.ok(

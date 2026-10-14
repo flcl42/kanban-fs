@@ -49,6 +49,7 @@ class AgentKind(enum.Enum):
     KIMI = "kimi"
     DEEPSEEK = "deepseek"
     OPENCODE = "opencode"
+    DEVIN = "devin"
 
 
 DefaultAgentSelection = AgentKind | Literal["manual"] | None
@@ -140,6 +141,7 @@ class OrchestratorSettings:
     kimi_executable: str
     deepseek_executable: str
     opencode_executable: str
+    devin_executable: str
 
     @staticmethod
     def parse(argv: Sequence[str], default_root: str) -> "OrchestratorSettings":
@@ -159,13 +161,14 @@ class OrchestratorSettings:
         parser.add_argument(
             "--default-agent",
             default=None,
-            help="Default agent kind: auto, claude, codex, opencode, kimi, deepseek, or manual.",
+            help="Default agent kind: auto, claude, codex, opencode, kimi, deepseek, devin, or manual.",
         )
         parser.add_argument("--codex-executable", default=None)
         parser.add_argument("--claude-executable", default=None)
         parser.add_argument("--kimi-executable", default=None)
         parser.add_argument("--deepseek-executable", default=None)
         parser.add_argument("--opencode-executable", default=None)
+        parser.add_argument("--devin-executable", default=None)
         args = parser.parse_args(argv)
 
         if args.max_agents < 1:
@@ -204,6 +207,11 @@ class OrchestratorSettings:
             or settings_string(vscode_settings, "kanban.opencodeExecutable")
             or "opencode"
         )
+        devin_executable = (
+            args.devin_executable
+            or settings_string(vscode_settings, "kanban.devinExecutable")
+            or "devin"
+        )
         default_models = parse_default_model_settings(
             settings_object(vscode_settings, "kanban.defaultModels"),
             "kanban.defaultModels",
@@ -224,6 +232,7 @@ class OrchestratorSettings:
             kimi_executable=kimi_executable.strip() or "kimi",
             deepseek_executable=deepseek_executable.strip() or "deepcode",
             opencode_executable=opencode_executable.strip() or "opencode",
+            devin_executable=devin_executable.strip() or "devin",
         )
 
 
@@ -241,6 +250,7 @@ def load_vscode_kanban_settings(root_path: str, invocation_directory: str) -> di
             "kanban.kimiExecutable",
             "kanban.deepseekExecutable",
             "kanban.opencodeExecutable",
+            "kanban.devinExecutable",
         ]:
             if key in data:
                 merged[key] = data[key]
@@ -494,6 +504,7 @@ class TaskOrchestrator:
             self.log.info(f"Kimi executable: {self.settings.kimi_executable}")
             self.log.info(f"DeepSeek executable: {self.settings.deepseek_executable}")
             self.log.info(f"opencode executable: {self.settings.opencode_executable}")
+            self.log.info(f"Devin executable: {self.settings.devin_executable}")
             if self.settings.default_models:
                 self.log.info(
             "Default models: "
@@ -579,7 +590,12 @@ class TaskOrchestrator:
                         f"Defaulted missing Project to `{card.project_alias}` for task: {card.path}"
                     )
 
-                if card.project_alias in project_map:
+                direct_repo_url = ProjectAliases.github_repo_url(card.project_alias)
+                if direct_repo_url:
+                    assignment = ProjectAssignment.repository(
+                        card.project_alias, direct_repo_url
+                    )
+                elif card.project_alias in project_map:
                     assignment = ProjectAssignment.repository(
                         card.project_alias, project_map[card.project_alias]
                     )
@@ -588,7 +604,7 @@ class TaskOrchestrator:
                 else:
                     self.block_task_for_issue(
                         card,
-                        f"Unknown project alias `{card.project_alias}` in projects.md. Use an alias from projects.md, or use `Project: -` for an empty workspace.",
+                        f"Unknown project alias `{card.project_alias}` in projects.md. Use an alias from projects.md, a GitHub repo like `owner/repo`, or `Project: -` for an empty workspace.",
                     )
                     continue
 
@@ -742,22 +758,33 @@ class TaskOrchestrator:
             self.log.info(f"Moved orphaned repo to trash: {destination}")
 
     def trash_completed_blank_workspaces(self) -> None:
-        for task_path in [
-            *self.enumerate_step_tasks(TaskStep.DONE),
-            *self.enumerate_step_tasks(TaskStep.CONFIRMED),
-        ]:
-            step = self.try_infer_managed_task_step(task_path)
-            if step is None:
-                continue
-            card = self.try_load_task_card(task_path, step)
+        for task_path in self.enumerate_step_tasks(TaskStep.CONFIRMED):
+            card = self.try_load_task_card(task_path, TaskStep.CONFIRMED)
             if card:
                 self.trash_completed_blank_workspace(card)
 
     def trash_completed_blank_workspace(self, card: "TaskCard") -> None:
-        if not ProjectAliases.is_blank(card.project_alias) or not card.repo_path:
+        if not card.is_confirmed or not ProjectAliases.is_blank(card.project_alias) or not card.repo_path:
             return
         repo_path = os.path.abspath(card.repo_path)
-        if not os.path.isdir(repo_path) or path_startswith(repo_path, self.paths.trash_root):
+        blank_projects_root = os.path.join(
+            self.paths.projects_root, ProjectAliases.BLANK_WORKSPACE_ALIAS
+        )
+        if (
+            not os.path.isdir(repo_path)
+            or path_equals(repo_path, blank_projects_root)
+            or not path_startswith(repo_path, blank_projects_root)
+        ):
+            return
+        normalized_repo_path = normalize_path(repo_path)
+        if normalized_repo_path in self.get_active_repository_paths():
+            return
+        references = [
+            reference
+            for reference in self.load_task_repository_references()
+            if normalize_path(reference.repo_path) == normalized_repo_path
+        ]
+        if any(not reference.is_confirmed for reference in references):
             return
 
         trash_project_dir = os.path.join(
@@ -773,7 +800,9 @@ class TaskOrchestrator:
             )
             return
 
-        card.with_updated_repo_path(destination)
+        for reference in references:
+            if reference.managed_card:
+                reference.managed_card.with_updated_repo_path(destination)
         self.log.info(f"Moved blank workspace to trash: {destination}")
 
     def reactivate_done_cards(self) -> None:
@@ -984,9 +1013,11 @@ class TaskOrchestrator:
         self, card: "TaskCard", result: AgentRunResult, agent_kind: AgentKind
     ) -> None:
         if result.exit_code != 0:
+            detail = opencode_failure_message(result) if agent_kind == AgentKind.OPENCODE else ""
             self.block_task_for_issue(
                 card,
-                f"{agent_kind.value} exited with code {result.exit_code}. Check logs for details.",
+                f"{agent_kind.value} exited with code {result.exit_code}."
+                + (f" {detail}" if detail else " Check logs for details."),
             )
             return
 
@@ -995,9 +1026,6 @@ class TaskOrchestrator:
             done_path = self.move_task(card, TaskStep.DONE)
             self.log.info(f"Task completed: {done_path}")
             self.notifications.show("Task complete", os.path.basename(done_path), done_path)
-            done_card = self.try_load_task_card(done_path, TaskStep.DONE)
-            if done_card:
-                self.trash_completed_blank_workspace(done_card)
             return
 
         if status == AgentOutcome.BLOCKED:
@@ -1444,7 +1472,7 @@ class AgentResolver:
         stored_agent = agent_kind_from_value(card.agent_kind_value)
         id_agent = agent_kind_from_agent_id(card.agent_id)
         if card.agent_id:
-            if id_agent in {AgentKind.CODEX, AgentKind.KIMI, AgentKind.OPENCODE}:
+            if id_agent in {AgentKind.CODEX, AgentKind.KIMI, AgentKind.OPENCODE, AgentKind.DEVIN}:
                 resume_agent = id_agent
             elif stored_agent:
                 resume_agent = stored_agent
@@ -1507,13 +1535,14 @@ class AgentResolver:
             AgentKind.OPENCODE,
             AgentKind.KIMI,
             AgentKind.DEEPSEEK,
+            AgentKind.DEVIN,
         ]:
             if self.is_agent_available(kind):
                 self._auto_agent = kind
                 self.log.info(f"Auto-detected default agent: {kind.value}")
                 return kind
         raise FileNotFoundError(
-            "No supported agent executable was found. Install Claude Code, Codex, opencode, Kimi CLI, or Deep Code, or configure `kanban.defaultAgent` and the matching executable setting."
+            "No supported agent executable was found. Install Claude Code, Codex, opencode, Kimi CLI, Deep Code, or Devin CLI, or configure `kanban.defaultAgent` and the matching executable setting."
         )
 
     def ensure_agent_available(self, kind: AgentKind) -> None:
@@ -1539,6 +1568,8 @@ class AgentResolver:
             return self.settings.deepseek_executable
         if kind == AgentKind.OPENCODE:
             return self.settings.opencode_executable
+        if kind == AgentKind.DEVIN:
+            return self.settings.devin_executable
         return self.settings.codex_executable
 
 
@@ -1560,6 +1591,8 @@ class AgentRunner:
             return DeepSeekRunner(settings, paths, log)
         if kind == AgentKind.OPENCODE:
             return OpencodeRunner(settings, paths, log)
+        if kind == AgentKind.DEVIN:
+            return DevinRunner(settings, paths, log)
         return CodexRunner(settings, paths, log)
 
     def run(
@@ -1877,43 +1910,113 @@ class OpencodeRunner(AgentRunner):
         else:
             args.extend(["--title", task_title(card)])
         args.append(prompt_arg)
-        try:
-            result = self._run_process(
-                args,
-                repo_path,
-                prompt_arg,
-                parse_opencode_json_line,
-                "opencode",
-                on_session_started,
-                write_prompt_to_stdin=False,
-                redacted_arg_indexes={args.index(prompt_arg)},
-                discover_session_id=(
-                    None
-                    if card.agent_id
-                    else lambda: OpencodeSessions.find_new_session_id_for_workdir(
-                        executable, repo_path, existing_session_ids
-                    )
-                ),
-            )
-        finally:
+        result = self._run_process(
+            args,
+            repo_path,
+            prompt_arg,
+            parse_opencode_json_line,
+            "opencode",
+            on_session_started,
+            write_prompt_to_stdin=False,
+            redacted_arg_indexes={args.index(prompt_arg)},
+            discover_session_id=(
+                None
+                if card.agent_id
+                else lambda: OpencodeSessions.find_new_session_id_for_workdir(
+                    executable, repo_path, existing_session_ids
+                )
+            ),
+        )
+        if not result.final_agent_message:
+            session_id = result.session_id or card.agent_id
+            final_message = OpencodeSessions.final_assistant_message(executable, session_id)
+            if final_message:
+                result = AgentRunResult(
+                    result.exit_code,
+                    result.session_id,
+                    final_message,
+                    result.stdout_lines,
+                    result.stderr_lines,
+                )
+
+        # Keep the attachment for failed or blocked sessions resumed in OpenCode.
+        if result.exit_code == 0 and PromptFactory.parse_status(result.final_agent_message) == AgentOutcome.DONE:
             try:
                 os.remove(prompt_file)
             except OSError:
                 pass
-        if result.final_agent_message:
-            return result
+        return result
 
-        session_id = result.session_id or card.agent_id
-        final_message = OpencodeSessions.final_assistant_message(executable, session_id)
-        if not final_message:
-            return result
-        return AgentRunResult(
-            result.exit_code,
-            result.session_id,
-            final_message,
-            result.stdout_lines,
-            result.stderr_lines,
+
+class DevinRunner(AgentRunner):
+    def run(
+        self,
+        card: "TaskCard",
+        repo_path: str,
+        prompt: str,
+        on_session_started: Callable[[str], None] | None,
+    ) -> AgentRunResult:
+        executable = ToolPaths.resolve_executable(
+            self.settings.devin_executable, AgentKind.DEVIN
         )
+        model_spec = self.model_spec_for(card, AgentKind.DEVIN)
+        prompt_file = os.path.join(
+            repo_path, f".kanban-runner-prompt-{hash_path(card.path)}.md"
+        )
+        export_file = os.path.join(
+            repo_path, f".kanban-runner-devin-{hash_path(card.path)}.json"
+        )
+        write_text(prompt_file, prompt)
+        exclude_local_git_path(repo_path, ".kanban-runner-prompt-*.md")
+        exclude_local_git_path(repo_path, ".kanban-runner-devin-*.json")
+        args = [
+            executable,
+            "--print",
+            "--prompt-file",
+            prompt_file,
+            "--export",
+            export_file,
+            "--respect-workspace-trust",
+            "false",
+            *devin_model_arguments(model_spec),
+            *devin_permission_arguments(self.settings.codex_mode),
+        ]
+        if card.agent_id:
+            args.extend(["--resume", devin_cli_session_id(card.agent_id)])
+        try:
+            result = self._run_process(
+                args,
+                repo_path,
+                "",
+                parse_devin_line,
+                "Devin",
+                on_session_started,
+                write_prompt_to_stdin=False,
+                redacted_arg_indexes={args.index(prompt_file)},
+            )
+            final_message = result.final_agent_message or devin_final_message_from_export(
+                export_file
+            )
+            session_id = (
+                result.session_id
+                or card.agent_id
+                or devin_session_id_from_export(export_file)
+            )
+            if final_message or session_id != result.session_id:
+                return AgentRunResult(
+                    result.exit_code,
+                    session_id,
+                    final_message,
+                    result.stdout_lines,
+                    result.stderr_lines,
+                )
+            return result
+        finally:
+            for temporary_file in [prompt_file, export_file]:
+                try:
+                    os.remove(temporary_file)
+                except OSError:
+                    pass
 
 
 class DeepSeekRunner(AgentRunner):
@@ -2250,7 +2353,9 @@ class TaskCard:
         self.agent_id = self.get_metadata_value("Agent")
         self.repo_path = self.get_metadata_value("Repo")
         self.model_value = self.get_metadata_value("Model")
-        self.tags = parse_tags(self.get_metadata_value("Tags"))
+        self.tags = parse_tags(self.get_metadata_value("Tags")) + parse_tags(
+            self.get_metadata_value("Tag")
+        )
         self.comments_body = self.get_section_body("Comments")
         if not self.comments_body.strip():
             self.comments_body = self.get_section_body("WIP")
@@ -2315,7 +2420,7 @@ class TaskCard:
     ) -> "TaskCard":
         updated = self.current_template_content()
         updated = set_metadata_value(updated, "Agent", agent_id)
-        if agent_kind == AgentKind.DEEPSEEK:
+        if agent_kind in {AgentKind.DEEPSEEK, AgentKind.DEVIN}:
             updated = set_metadata_value(updated, "Agent Kind", agent_kind.value)
         self.write(updated)
         return TaskCard.load(self.path, self.step, self.paths)
@@ -2506,26 +2611,25 @@ class GitCli:
         process = subprocess.Popen(
             command,
             env=git_env,
-            text=True,
-            encoding=ENCODING,
-            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        stdout_drain = GitCli._start_output_drain(process.stdout, log.info)
+        stderr_drain = GitCli._start_output_drain(process.stderr, log.warn)
         deadline = time.monotonic() + GIT_COMMAND_TIMEOUT_SECONDS
         while process.poll() is None:
             if stop_event is not None and stop_event.is_set():
                 terminate_process_tree(process.pid)
-                stdout, stderr = GitCli._communicate_after_terminate(process)
-                GitCli._log_output(stdout, stderr, log)
+                GitCli._wait_after_terminate(process)
+                GitCli._join_output_drains(stdout_drain, stderr_drain)
                 log.info(
                     f"Terminated git {' '.join(arguments)} because shutdown was requested."
                 )
                 raise ShutdownRequested("shutdown requested during git command")
             if time.monotonic() >= deadline:
                 terminate_process_tree(process.pid)
-                stdout, stderr = GitCli._communicate_after_terminate(process)
-                GitCli._log_output(stdout, stderr, log)
+                GitCli._wait_after_terminate(process)
+                GitCli._join_output_drains(stdout_drain, stderr_drain)
                 if not tolerate_failure:
                     raise RuntimeError(
                         f"git {' '.join(arguments)} timed out after {GIT_COMMAND_TIMEOUT_SECONDS} seconds"
@@ -2536,25 +2640,72 @@ class GitCli:
                 return
             time.sleep(0.2)
 
-        stdout, stderr = process.communicate()
-        GitCli._log_output(stdout, stderr, log)
+        process.wait()
+        GitCli._join_output_drains(stdout_drain, stderr_drain)
         if process.returncode != 0 and not tolerate_failure:
             raise RuntimeError(f"git {' '.join(arguments)} failed with exit code {process.returncode}")
 
     @staticmethod
-    def _communicate_after_terminate(process: subprocess.Popen[str]) -> tuple[str, str]:
-        try:
-            return process.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            terminate_process_tree(process.pid)
-            return process.communicate()
+    def _start_output_drain(
+        stream: object,
+        write: Callable[[str], None],
+    ) -> threading.Thread | None:
+        if stream is None:
+            return None
+
+        def drain() -> None:
+            pending = ""
+            try:
+                file_descriptor = stream.fileno()
+                while True:
+                    chunk = os.read(file_descriptor, 8192)
+                    if not chunk:
+                        break
+                    pending = GitCli._log_git_output_chunk(
+                        chunk.decode(ENCODING, errors="replace"),
+                        pending,
+                        write,
+                    )
+            except OSError as exc:
+                write(f"Could not read git output stream: {exc}")
+            finally:
+                if pending.strip():
+                    write(pending.strip())
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+
+        thread = threading.Thread(target=drain, name="kanban-git-output", daemon=True)
+        thread.start()
+        return thread
 
     @staticmethod
-    def _log_output(stdout: str | None, stderr: str | None, log: LogSink) -> None:
-        if stdout and stdout.strip():
-            log.info(stdout.strip())
-        if stderr and stderr.strip():
-            log.warn(stderr.strip())
+    def _log_git_output_chunk(
+        text: str,
+        pending: str,
+        write: Callable[[str], None],
+    ) -> str:
+        normalized = (pending + text).replace("\r", "\n")
+        lines = normalized.split("\n")
+        for line in lines[:-1]:
+            if line.strip():
+                write(line.strip())
+        return lines[-1]
+
+    @staticmethod
+    def _join_output_drains(*threads: threading.Thread | None) -> None:
+        for thread in threads:
+            if thread is not None:
+                thread.join(timeout=2)
+
+    @staticmethod
+    def _wait_after_terminate(process: subprocess.Popen[bytes]) -> None:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            terminate_process_tree(process.pid)
+            process.wait()
 
 
 class ProjectMap(dict[str, str]):
@@ -2591,11 +2742,44 @@ class ProjectMap(dict[str, str]):
 
 class ProjectAliases:
     BLANK_WORKSPACE_ALIAS = "blank"
+    GITHUB_REPO_PATH_RE = re.compile(
+        r"^(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+?)(?:\.git)?$"
+    )
 
     @staticmethod
     def is_blank(alias: str | None) -> bool:
         normalized = (alias or "").strip()
         return normalized.lower() == ProjectAliases.BLANK_WORKSPACE_ALIAS or normalized == "-"
+
+    @staticmethod
+    def github_repo_url(alias: str | None) -> str | None:
+        normalized = (alias or "").strip().replace("\\", "/")
+        if not normalized or any(char.isspace() for char in normalized):
+            return None
+
+        if normalized.startswith("git@github.com:"):
+            path_part = normalized.removeprefix("git@github.com:").removesuffix(".git")
+            return normalized if ProjectAliases.GITHUB_REPO_PATH_RE.fullmatch(path_part) else None
+
+        github_prefixes = (
+            "https://github.com/",
+            "http://github.com/",
+            "ssh://git@github.com/",
+            "github.com/",
+        )
+        for prefix in github_prefixes:
+            if normalized.lower().startswith(prefix):
+                path_part = normalized[len(prefix) :].strip("/").removesuffix(".git")
+                if ProjectAliases.GITHUB_REPO_PATH_RE.fullmatch(path_part):
+                    if prefix == "github.com/":
+                        return f"https://github.com/{path_part}.git"
+                    return normalized
+                return None
+
+        match = ProjectAliases.GITHUB_REPO_PATH_RE.fullmatch(normalized)
+        if not match:
+            return None
+        return f"https://github.com/{match.group('owner')}/{match.group('repo')}.git"
 
 
 class BoardTemplates:
@@ -2674,6 +2858,7 @@ Model:
             '  kimi: ""',
             '  deepseek: ""',
             '  opencode: ""',
+            '  devin: ""',
             "folders:",
         ]
         for folder in folders:
@@ -3062,8 +3247,10 @@ def parse_default_agent(value: str | None) -> DefaultAgentSelection:
         return AgentKind.DEEPSEEK
     if normalized in {"opencode", "oc"}:
         return AgentKind.OPENCODE
+    if normalized in {"devin"}:
+        return AgentKind.DEVIN
     raise ValueError(
-        "Default agent must be auto, claude, codex, opencode, kimi, deepseek, or manual."
+        "Default agent must be auto, claude, codex, opencode, kimi, deepseek, devin, or manual."
     )
 
 
@@ -3087,13 +3274,18 @@ def agent_kind_from_value(value: str | None) -> AgentKind | None:
         return AgentKind.KIMI
     if normalized in {
         "opencode",
+        "opencode-go",
         "oc",
         "agent:opencode",
         "agent=opencode",
+        "agent:opencode-go",
+        "agent=opencode-go",
         "agent:oc",
         "agent=oc",
     }:
         return AgentKind.OPENCODE
+    if normalized in {"devin", "agent:devin", "agent=devin"}:
+        return AgentKind.DEVIN
     if normalized in {
         "deepseek",
         "deepcode",
@@ -3281,6 +3473,8 @@ def agent_kind_from_agent_id(value: str | None) -> AgentKind | None:
     normalized = value.strip().lower()
     if is_opencode_session_id(normalized):
         return AgentKind.OPENCODE
+    if is_devin_session_id(normalized):
+        return AgentKind.DEVIN
     if re.fullmatch(
         r"session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
         normalized,
@@ -3314,6 +3508,25 @@ def is_opencode_session_id(value: str | None) -> bool:
     if value is None:
         return False
     return bool(re.fullmatch(r"ses_[a-z0-9]+", value.strip(), re.I))
+
+
+def is_devin_session_id(value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip()
+    return bool(re.fullmatch(r"devin[:_-][A-Za-z0-9][A-Za-z0-9._-]{5,127}", normalized, re.I))
+
+
+def devin_cli_session_id(value: str | None) -> str:
+    session_id = (value or "").strip()
+    return re.sub(r"^devin[:_-]", "", session_id, flags=re.I)
+
+
+def format_devin_session_id(value: str | None) -> str:
+    session_id = devin_cli_session_id(value)
+    if not session_id:
+        return ""
+    return f"devin:{session_id}"
 
 
 def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
@@ -3361,6 +3574,15 @@ def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
         "use-opencode",
         "use-oc",
     }
+    devin_markers = {
+        "devin",
+        "agent:devin",
+        "agent=devin",
+        "ai:devin",
+        "runner:devin",
+        "use:devin",
+        "use-devin",
+    }
     deepseek_markers = {
         "deepseek",
         "deepcode",
@@ -3388,16 +3610,19 @@ def agent_kind_from_tags(tags: Sequence[str]) -> AgentKind | None:
     has_codex = bool(normalized_tags & codex_markers)
     has_kimi = bool(normalized_tags & kimi_markers)
     has_opencode = bool(normalized_tags & opencode_markers)
+    has_devin = bool(normalized_tags & devin_markers)
     has_deepseek = bool(normalized_tags & deepseek_markers)
-    if has_claude and not has_codex and not has_kimi and not has_opencode and not has_deepseek:
+    if has_claude and not has_codex and not has_kimi and not has_opencode and not has_devin and not has_deepseek:
         return AgentKind.CLAUDE
-    if has_codex and not has_claude and not has_kimi and not has_opencode and not has_deepseek:
+    if has_codex and not has_claude and not has_kimi and not has_opencode and not has_devin and not has_deepseek:
         return AgentKind.CODEX
-    if has_kimi and not has_claude and not has_codex and not has_opencode and not has_deepseek:
+    if has_kimi and not has_claude and not has_codex and not has_opencode and not has_devin and not has_deepseek:
         return AgentKind.KIMI
-    if has_opencode and not has_claude and not has_codex and not has_kimi and not has_deepseek:
+    if has_opencode and not has_claude and not has_codex and not has_kimi and not has_devin and not has_deepseek:
         return AgentKind.OPENCODE
-    if has_deepseek and not has_claude and not has_codex and not has_kimi and not has_opencode:
+    if has_devin and not has_claude and not has_codex and not has_kimi and not has_opencode and not has_deepseek:
+        return AgentKind.DEVIN
+    if has_deepseek and not has_claude and not has_codex and not has_kimi and not has_opencode and not has_devin:
         return AgentKind.DEEPSEEK
     return None
 
@@ -3599,10 +3824,22 @@ def deepseek_model_environment(model_spec: ModelSpec | None) -> dict[str, str]:
 def opencode_model_arguments(model_spec: ModelSpec | None) -> list[str]:
     if not model_spec:
         return []
-    args = ["--model", model_spec.model]
+    model = model_spec.model
+    if model_spec.agent_kind == AgentKind.OPENCODE and "/" not in model:
+        model = f"opencode-go/{model}"
+    args = ["--model", model]
     if model_spec.effort:
         args.extend(["--variant", model_spec.effort])
     return args
+
+
+def devin_model_arguments(model_spec: ModelSpec | None) -> list[str]:
+    if not model_spec:
+        return []
+    model = model_spec.model
+    if model_spec.effort:
+        model = f"{model}-{model_spec.effort}"
+    return ["--model", model]
 
 
 def codex_mode_arguments(mode: CodexMode) -> list[str]:
@@ -3624,6 +3861,14 @@ def claude_permission_arguments(mode: CodexMode) -> list[str]:
 def opencode_permission_arguments(mode: CodexMode) -> list[str]:
     if mode in {CodexMode.DANGEROUS, CodexMode.FULL_AUTO}:
         return ["--auto"]
+    raise ValueError(f"Unsupported Codex mode: {mode}")
+
+
+def devin_permission_arguments(mode: CodexMode) -> list[str]:
+    if mode == CodexMode.DANGEROUS:
+        return ["--permission-mode", "bypass"]
+    if mode == CodexMode.FULL_AUTO:
+        return ["--permission-mode", "accept-edits"]
     raise ValueError(f"Unsupported Codex mode: {mode}")
 
 
@@ -3712,6 +3957,48 @@ def parse_opencode_json_line(line: str, state: dict[str, str]) -> None:
         state["final_agent_message"] = text
 
 
+def opencode_failure_message(result: AgentRunResult) -> str:
+    for line in result.stdout_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "error":
+            continue
+        error = event.get("error")
+        if not isinstance(error, dict):
+            continue
+        data = error.get("data")
+        message = data.get("message") if isinstance(data, dict) else None
+        if isinstance(message, str) and message.strip():
+            return " ".join(message.split())[:500]
+    return ""
+
+
+def parse_devin_line(line: str, state: dict[str, str]) -> None:
+    stripped = strip_ansi(line).strip()
+    if not stripped:
+        return
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        session_id = extract_devin_session_id_from_text(stripped)
+        if session_id:
+            state["session_id"] = format_devin_session_id(session_id)
+        if "ORCHESTRATOR_STATUS:" in stripped:
+            state["final_agent_message"] = stripped
+        else:
+            state["final_agent_message"] = stripped
+        return
+
+    session_id = find_devin_session_id(payload)
+    if session_id:
+        state["session_id"] = format_devin_session_id(session_id)
+    text = extract_devin_record_text(payload)
+    if text:
+        state["final_agent_message"] = text
+
+
 def parse_deepcode_line(line: str, state: dict[str, str]) -> None:
     text = strip_ansi(line).strip()
     if not text:
@@ -3794,6 +4081,48 @@ def find_nested_string(value: object, key: str) -> str | None:
     return None
 
 
+def find_nested_string_for_keys(value: object, keys: set[str]) -> str | None:
+    normalized_keys = {key.lower() for key in keys}
+    if isinstance(value, dict):
+        for raw_key, raw_value in value.items():
+            if str(raw_key).lower() in normalized_keys and isinstance(raw_value, str) and raw_value.strip():
+                return raw_value.strip()
+        for child in value.values():
+            found = find_nested_string_for_keys(child, normalized_keys)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_nested_string_for_keys(child, normalized_keys)
+            if found:
+                return found
+    return None
+
+
+def find_devin_session_id(value: object) -> str | None:
+    return find_nested_string_for_keys(
+        value,
+        {
+            "session_id",
+            "sessionId",
+            "sessionID",
+            "session",
+            "conversation_id",
+            "conversationId",
+            "id",
+        },
+    )
+
+
+def extract_devin_session_id_from_text(value: str) -> str | None:
+    match = re.search(
+        r"\b(?:devin\s+)?session(?:\s+id)?\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9._-]{5,127})\b",
+        value,
+        re.I,
+    )
+    return match.group(1) if match else None
+
+
 def extract_claude_message_text(message: object) -> str:
     if isinstance(message, str):
         return message
@@ -3809,6 +4138,73 @@ def extract_claude_message_text(message: object) -> str:
                 parts.append(item["text"])
         return "\n".join(parts).strip()
     return ""
+
+
+def extract_devin_record_text(entry: object) -> str:
+    if isinstance(entry, str):
+        return entry.strip()
+    if not isinstance(entry, dict):
+        return ""
+    role = str(entry.get("role") or entry.get("author") or "").lower()
+    if role and role not in {"assistant", "agent", "devin"}:
+        return ""
+    content = (
+        entry.get("content")
+        or entry.get("text")
+        or entry.get("message")
+        or entry.get("response")
+        or entry.get("result")
+    )
+    if isinstance(content, str) and content.strip():
+        return content.strip()
+    if isinstance(content, dict):
+        return extract_devin_record_text(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            text = extract_devin_record_text(item)
+            if text:
+                parts.append(text)
+        return "\n".join(parts).strip()
+    messages = entry.get("messages")
+    if isinstance(messages, list):
+        return devin_final_message_from_messages(messages)
+    return ""
+
+
+def devin_final_message_from_messages(messages: list[object]) -> str:
+    for message in reversed(messages):
+        text = extract_devin_record_text(message)
+        if text:
+            return text
+    return ""
+
+
+def devin_export_payload(path: str) -> object | None:
+    try:
+        return parse_first_json_value(read_text(path))
+    except OSError:
+        return None
+
+
+def devin_final_message_from_export(path: str) -> str:
+    payload = devin_export_payload(path)
+    if payload is None:
+        return ""
+    if isinstance(payload, dict):
+        messages = payload.get("messages") or payload.get("turns") or payload.get("items")
+        if isinstance(messages, list):
+            return devin_final_message_from_messages(messages)
+    text = extract_devin_record_text(payload)
+    return text
+
+
+def devin_session_id_from_export(path: str) -> str:
+    payload = devin_export_payload(path)
+    if payload is None:
+        return ""
+    session_id = find_devin_session_id(payload)
+    return format_devin_session_id(session_id) if session_id else ""
 
 
 def extract_opencode_message_text(entry: object) -> str:
@@ -3832,6 +4228,9 @@ def extract_opencode_message_text(entry: object) -> str:
             if isinstance(part, dict) and str(part.get("type") or "").lower() == "text"
         ]
         return "\n".join(part for part in text_parts if part).strip()
+    part = entry.get("part")
+    if isinstance(part, dict):
+        return extract_opencode_message_text(part)
     message = entry.get("message")
     if isinstance(message, dict):
         return extract_opencode_message_text(message)

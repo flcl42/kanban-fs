@@ -35,6 +35,7 @@ Use one of these commands:
 - `AI Kanban: Create Board with Columns` creates `.kanban` plus the default workflow folders: `new`, `backlog`, `doing`, `done`, `confirmed`.
 - `AI Kanban: Create Board with Initialized Runner` creates `tasks/.kanban`, the default workflow folders, a default `tasks/template.md`, and a local `runner.py` script beside `tasks`.
 - `AI Kanban: Initialize Runner` adds or refreshes runner support for an existing board by copying the bundled `runner.py` to the runner root. For `tasks/.kanban`, that means beside `tasks`; for a root `.kanban`, that means beside `.kanban`.
+- `AI Kanban: Replace Runner with Bundled Version` updates only the local `runner.py`, leaving tasks, projects, and context untouched. It asks before replacing a different script and saves a timestamped backup. Restart a running runner afterward.
 - `AI Kanban: Initialize Template` creates the default `template.md` beside the selected board `.kanban` file, or opens the existing non-empty template.
 - Runner initialization also creates `template.md` beside `.kanban` plus `projects.md`, `context.md`, and `knowledge/README.md` when those files are missing or empty. New boards start with `blank = https://github.com/flcl42/blank.git` in `projects.md`.
 
@@ -88,7 +89,7 @@ defaultModels:
 
 The runner is optional. If you never start it, ai-kanban remains a normal Markdown-and-folder Kanban board.
 
-The runner watches `tasks/backlog`, starts Claude Code, Codex, opencode, Kimi, or DeepSeek through Deep Code on cards, moves active cards to `doing`, and moves completed or blocked work to the matching workflow folders. It keeps running in the background after VS Code closes.
+The runner watches `tasks/backlog`, starts Claude Code, Codex, opencode, Kimi, DeepSeek through Deep Code, or Devin on cards, moves active cards to `doing`, and moves completed or blocked work to the matching workflow folders. It keeps running in the background after VS Code closes.
 
 To use it:
 
@@ -99,10 +100,10 @@ To use it:
 Runner prerequisites:
 
 - Python 3.10+.
-- Claude Code, Codex CLI, opencode, Kimi CLI, and/or Deep Code.
+- Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, and/or Devin CLI.
 - DeepSeek through Deep Code requires `pywinpty` in the Python environment used by the runner.
 
-Use `kanban.defaultAgent` to choose `auto`, `claude`, `codex`, `opencode`, `oc`, `kimi`, `deepseek`, or `manual`. Use `auto` to auto-detect Claude first, then Codex, then opencode, then Kimi, then DeepSeek. Use `manual` when new backlog cards should be user-managed unless they explicitly request an agent. Use `kanban.claudeExecutable`, `kanban.codexExecutable`, `kanban.opencodeExecutable`, `kanban.kimiExecutable`, or `kanban.deepseekExecutable` if an executable has a different name or path. You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
+Use `kanban.defaultAgent` to choose `auto`, `claude`, `codex`, `opencode`, `oc`, `kimi`, `deepseek`, `devin`, or `manual`. Use `auto` to auto-detect Claude first, then Codex, then opencode, then Kimi, then DeepSeek, then Devin. Use `manual` when new backlog cards should be user-managed unless they explicitly request an agent. Use `kanban.claudeExecutable`, `kanban.codexExecutable`, `kanban.opencodeExecutable`, `kanban.kimiExecutable`, `kanban.deepseekExecutable`, or `kanban.devinExecutable` if an executable has a different name or path. You can hide runner warnings from the panel if you want a board-only workflow. The setting is `kanban.runnerPanel.enabled`.
 
 ## Runner Task Format
 
@@ -123,20 +124,20 @@ Describe the work here.
 ## Comments
 ```
 
-`Project:` can name a repository alias from `projects.md`. New runner boards seed `blank = https://github.com/flcl42/blank.git`, so `Project: blank` uses that starter repository. If `Project:` is missing or empty, the runner writes `Project: blank` when starting the task. Use `Project: -` when the task should use a temporary empty workspace instead of a repository.
+`Project:` can name a repository alias from `projects.md` or a GitHub shorthand repo such as `NethermindEth/nethermind`. Shorthand repos bypass `projects.md` and clone `https://github.com/<owner>/<repo>.git` directly. New runner boards seed `blank = https://github.com/flcl42/blank.git`, so `Project: blank` uses that starter repository. If `Project:` is missing or empty, the runner writes `Project: blank` when starting the task. Use `Project: -` when the task should use a temporary empty workspace instead of a repository.
 
-`Tags:` can override the runner agent per card with values such as `claude`, `codex`, `opencode`, `oc`, `kimi`, `deepseek`, `ds`, `deepcode`, `agent:claude`, `agent:codex`, `agent:opencode`, `agent:oc`, `agent:kimi`, or `agent:deepseek`. Use `manual` or `human` to mark a card as user-managed; the runner leaves those cards in backlog and does not assign an agent.
+`Tags:` can override the runner agent per card with values such as `claude`, `codex`, `opencode`, `oc`, `kimi`, `deepseek`, `ds`, `deepcode`, `devin`, `agent:claude`, `agent:codex`, `agent:opencode`, `agent:oc`, `agent:kimi`, `agent:deepseek`, or `agent:devin`. Use `manual` or `human` to mark a card as user-managed; the runner leaves those cards in backlog and does not assign an agent.
 
-`Model:` can choose the initial agent model for a new session. Use `agent/model` or `agent/model/effort`, for example `Model: codex/gpt-5.6-luna/max`, `Model: opencode/moonshotai/kimi-k3/minimal`, `Model: opencode/opencode-go/glm-5.3`, or `Model: deepseek/deepseek-v4-pro/max`. Codex maps effort to `model_reasoning_effort`, Claude maps effort to `--effort`, opencode maps effort to `--variant`, DeepSeek maps model and `high` or `max` effort to Deep Code environment settings, and Kimi supports `agent/model` only. Supported Codex and Claude effort values are `ultra`, `max`, `xhigh`, `high`, `medium`, and `low`; opencode variants include `max`, `high`, `medium`, `low`, and `minimal`; Deep Code supports `max` and `high`. If `Model:` is empty, `.kanban` `defaultModels` applies for that board; if the board has no default for that agent, VS Code `kanban.defaultModels` applies; if neither is set, the agent CLI uses its own default. Markdown task files offer completions on `Model:` lines for these formats, values from `kanban.modelCompletions`, and configured defaults, but custom model names are still allowed. Existing sessions keep using `Agent:` and ignore `Model:` changes until you clear `Agent:`.
+`Model:` can choose the initial agent model for a new session. Use `agent/model` or `agent/model/effort`, for example `Model: codex/gpt-5.6-luna/max`, `Model: opencode/moonshotai/kimi-k3/minimal`, `Model: opencode/opencode-go/glm-5.3`, `Model: deepseek/deepseek-v4-pro/max`, or `Model: devin/swe-2/max`. Codex maps effort to `model_reasoning_effort`, Claude maps effort to `--effort`, opencode maps effort to `--variant`, DeepSeek maps model and `high` or `max` effort to Deep Code environment settings, Devin maps `model/effort` to a single `--model` value such as `swe-2-max`, and Kimi supports `agent/model` only. Supported Codex and Claude effort values are `ultra`, `max`, `xhigh`, `high`, `medium`, and `low`; opencode variants include `max`, `high`, `medium`, `low`, and `minimal`; Deep Code supports `max` and `high`; Devin completions include `max`, `high`, and `medium`. If `Model:` is empty, `.kanban` `defaultModels` applies for that board; if the board has no default for that agent, VS Code `kanban.defaultModels` applies; if neither is set, the agent CLI uses its own default. Markdown task files offer completions on `Model:` lines for these formats, values from `kanban.modelCompletions`, and configured defaults, but custom model names are still allowed. Existing sessions keep using `Agent:` and ignore `Model:` changes until you clear `Agent:`.
 
-`Agent:` and `Repo:` are managed by the runner. `Agent:` stores the session id and `Repo:` stores the working-copy path. The runner infers Codex, Claude, opencode, Kimi, or DeepSeek from the session id format and session files when resuming existing sessions, so new cards do not need an `Agent Kind:` line. Clear `Agent:` if you intentionally want a card to start a fresh session with a different agent.
+`Agent:` and `Repo:` are managed by the runner. `Agent:` stores the session id and `Repo:` stores the working-copy path. The runner infers Codex, Claude, opencode, Kimi, DeepSeek, or Devin from the session id format and session files when resuming existing sessions, so new cards do not need an `Agent Kind:` line. Clear `Agent:` if you intentionally want a card to start a fresh session with a different agent.
 
-The details pane shows recent agent output for Codex, Claude, opencode, Kimi, or DeepSeek sessions. `Connect` opens the matching CLI: Codex sessions use `codex resume`, Claude sessions use `claude --resume`, opencode sessions use `opencode --session --auto`, Kimi sessions use `kimi --session`, and DeepSeek sessions use `deepcode --resume`.
+The details pane shows recent agent output for Codex, Claude, opencode, Kimi, or DeepSeek sessions. `Connect` opens the matching CLI: Codex sessions use `codex resume`, Claude sessions use `claude --resume`, opencode sessions use `opencode --session --auto`, Kimi sessions use `kimi --session`, DeepSeek sessions use `deepcode --resume`, and Devin sessions use `devin --resume`.
 
 ## Settings
 
 - `kanban.detailsPaneWidth` controls the saved details pane width.
-- `kanban.defaultAgent` controls the default runner agent. Defaults to `auto`, which auto-detects Claude first, Codex second, opencode third, Kimi fourth, and DeepSeek fifth. Set it to `manual` to treat unassigned backlog cards as user-managed by default.
+- `kanban.defaultAgent` controls the default runner agent. Defaults to `auto`, which auto-detects Claude first, Codex second, opencode third, Kimi fourth, DeepSeek fifth, and Devin sixth. Set it to `manual` to treat unassigned backlog cards as user-managed by default.
 - `kanban.defaultModels` controls default model values per agent when a new runner task has no `Model:` value. Board `.kanban` `defaultModels` override this setting per board.
 - `kanban.modelCompletions` controls the model values suggested on `Model:` lines. It can be set globally or per workspace.
 - `kanban.claudeExecutable` controls the Claude Code executable used by the runner and Claude resume-agent terminals. Defaults to `claude`.
@@ -144,9 +145,10 @@ The details pane shows recent agent output for Codex, Claude, opencode, Kimi, or
 - `kanban.opencodeExecutable` controls the opencode executable used by the runner and opencode resume-agent terminals. Defaults to `opencode`.
 - `kanban.kimiExecutable` controls the Kimi CLI executable used by the runner and Kimi resume-agent terminals. Defaults to `kimi`.
 - `kanban.deepseekExecutable` controls the Deep Code executable used by the runner and DeepSeek resume-agent terminals. Defaults to `deepcode`.
+- `kanban.devinExecutable` controls the Devin CLI executable used by the runner and Devin resume-agent terminals. Defaults to `devin`.
 - `kanban.runnerPanel.enabled` shows or hides the optional runner warning panel.
 - `kanban.runner.command` controls the command used to start the runner.
-- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, `${defaultAgent}`, `${codexExecutable}`, `${claudeExecutable}`, `${opencodeExecutable}`, `${kimiExecutable}`, and `${deepseekExecutable}`.
+- `kanban.runner.args` controls runner startup arguments and supports `${runnerScript}`, `${runnerRoot}`, `${kanbanDir}`, `${workspaceFolder}`, `${defaultAgent}`, `${codexExecutable}`, `${claudeExecutable}`, `${opencodeExecutable}`, `${kimiExecutable}`, `${deepseekExecutable}`, and `${devinExecutable}`.
 
 ## Development
 

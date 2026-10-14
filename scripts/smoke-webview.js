@@ -53,6 +53,21 @@ assert.match(
   "webview should retry the initial ready request until board data arrives"
 );
 assert.match(
+  source,
+  /startRunner\(document\.uri,\s*\{ openInTerminal \}\)/,
+  "extension host should pass the terminal startup flag to startRunner"
+);
+assert.match(
+  source,
+  /createTerminal\(\{\s*name: formatRunnerTerminalName\(paths\.runnerRoot\),\s*cwd: paths\.runnerRoot,\s*\}\)/,
+  "terminal startup should create an integrated terminal in the runner root"
+);
+assert.match(
+  source,
+  /terminal\.sendText\(formatTerminalCommand\(command, args\), true\)/,
+  "terminal startup should send the configured runner command and args"
+);
+assert.match(
   openLocalPathSource[0],
   /await vscode\.env\.openExternal\(uri\);/,
   "local filesystem Open should use the OS external opener"
@@ -98,6 +113,8 @@ assert.deepEqual(
     "${deepseekExecutable}",
     "--opencode-executable",
     "${opencodeExecutable}",
+    "--devin-executable",
+    "${devinExecutable}",
   ],
   "default runner args should pass agent settings to runner.py"
 );
@@ -112,6 +129,10 @@ assert.ok(
 assert.ok(
   manifest.contributes.configuration.properties["kanban.defaultAgent"].enum.includes("opencode"),
   "default agent setting should include opencode"
+);
+assert.ok(
+  manifest.contributes.configuration.properties["kanban.defaultAgent"].enum.includes("devin"),
+  "default agent setting should include Devin"
 );
 assert.ok(
   manifest.contributes.configuration.properties["kanban.defaultAgent"].enum.includes("oc"),
@@ -129,6 +150,7 @@ assert.deepEqual(
     kimi: "",
     deepseek: "",
     opencode: "",
+    devin: "",
   },
   "manifest should expose default model settings for every supported agent"
 );
@@ -191,6 +213,19 @@ assert.deepEqual(
     "deepseek/deepseek-v4-pro/high",
     "deepseek/deepseek-v4-flash/max",
     "deepseek/deepseek-v4-flash/high",
+    "devin/swe-2/max",
+    "devin/swe-2/high",
+    "devin/swe-2/medium",
+    "devin/swe",
+    "devin/swe-1-7-lightning",
+    "devin/opus",
+    "devin/sonnet",
+    "devin/gpt",
+    "devin/codex",
+    "devin/gemini",
+    "devin/kimi",
+    "devin/deepseek",
+    "devin/glm",
   ],
   "manifest should expose configurable Model: completion values"
 );
@@ -204,6 +239,11 @@ assert.equal(
   "deepcode",
   "manifest should expose a Deep Code executable setting"
 );
+assert.equal(
+  manifest.contributes.configuration.properties["kanban.devinExecutable"].default,
+  "devin",
+  "manifest should expose a Devin executable setting"
+);
 assert.match(
   source,
   /const DEFAULT_AGENT_SETTING = "defaultAgent";/,
@@ -216,12 +256,16 @@ assert.match(
 );
 assert.match(
   source,
-  /defaultModels:[\s\S]*codex:[\s\S]*claude:[\s\S]*kimi:[\s\S]*deepseek:/,
+  /defaultModels:[\s\S]*codex:[\s\S]*claude:[\s\S]*kimi:[\s\S]*deepseek:[\s\S]*opencode:[\s\S]*devin:/,
   "new board .kanban files should seed defaultModels for every supported agent"
 );
 assert.ok(
   manifest.contributes.commands.some((command) => command.command === "kanban.initializeRunner"),
   "manifest should expose an Initialize Runner command"
+);
+assert.ok(
+  manifest.contributes.commands.some((command) => command.command === "kanban.replaceRunner"),
+  "manifest should expose a Replace Runner command"
 );
 assert.ok(
   manifest.contributes.commands.some((command) => command.command === "kanban.initializeTemplate"),
@@ -231,6 +275,26 @@ assert.match(
   source,
   /provider\.initializeRunner\(target\)/,
   "extension should register the Initialize Runner command"
+);
+assert.match(
+  source,
+  /provider\.replaceRunner\(target\)/,
+  "extension should register the Replace Runner command"
+);
+assert.match(
+  source,
+  /Local runner does not support --devin-executable/,
+  "runner startup should explain an incompatible local runner instead of silently launching it"
+);
+assert.match(
+  source,
+  /sendRunnerStatus\(`Failed to start runner:/,
+  "startup errors should retain the local runner status and replacement action"
+);
+assert.match(
+  source,
+  /backup-\$\{Date\.now\(\)\}/,
+  "runner replacement should preserve a backup of the previous script"
 );
 assert.match(
   source,
@@ -324,6 +388,31 @@ assert.match(
 );
 assert.match(
   source,
+  /kind === "devin"[\s\S]*terminal\.sendText\(`\$\{executableCommand\} --resume \$\{formatDevinCliSessionId\(trimmed\)\}`, true\)/,
+  "Devin Connect terminals should resume Devin sessions"
+);
+assert.match(
+  source,
+  /explicitKind === "devin" && isDevinSessionId\(trimmed, true\)/,
+  "Devin Connect should accept bare session names when the task identifies Devin"
+);
+assert.match(
+  scriptMatch[1],
+  /const getAgentKindFromModel = \(card\) =>[\s\S]*normalizeAgentKind\(modelValue\.slice\(0, slashIndex\)\)[\s\S]*getAgentKindFromModel\(card\)/,
+  "details Connect should infer Devin from agent-prefixed Model values"
+);
+assert.match(
+  source,
+  /\["models", "list", "--format", "json"\]/,
+  "Devin Model completions should try to read the CLI model list"
+);
+assert.match(
+  source,
+  /parseDevinModelCompletionValues/,
+  "Devin Model completions should parse CLI model list output"
+);
+assert.match(
+  source,
   /if \(kind === "kimi"\)[\s\S]*ensureKimiWorkspaceTrusted/,
   "resume-agent terminals should pre-trust Kimi workspaces before connecting"
 );
@@ -386,6 +475,8 @@ assert.match(
   /id="details-pane-toggle"/,
   "toolbar should expose a reachable details visibility toggle"
 );
+assert.match(html, /id="board-back-to-top"[^>]*aria-label="Back to top"[^>]*hidden>/, "board toolbar should include a hidden Back to Top icon");
+assert.match(html, /\.board-back-to-top\[hidden\]\s*\{\s*display:\s*none;/, "hidden Back to Top button should not occupy toolbar space");
 assert.match(
   html,
   /\.layout\.details-hidden\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\);/,
@@ -427,6 +518,11 @@ assert.match(
 );
 assert.match(
   html,
+  /\.card-actions\s*\{[^}]*justify-content:\s*flex-end;[^}]*margin-top:\s*auto;/,
+  "card action buttons should render at the bottom of the card"
+);
+assert.match(
+  html,
   /\.top-card-section\s*,\s*\.regular-card-section\s*\{[^}]*display:\s*flex;[^}]*flex-direction:\s*column;/,
   "top cards should render inside dedicated column sections"
 );
@@ -447,8 +543,8 @@ assert.doesNotMatch(
 );
 assert.match(
   html,
-  /\.details-top-toggle\[aria-pressed="true"\]\s*\{[^}]*background:\s*var\(--vscode-button-background,\s*var\(--accent\)\);[^}]*color:\s*var\(--vscode-button-foreground,\s*var\(--bg\)\);/,
-  "details top toggle should use contrasting button colors when pressed"
+  /\.card-star\[aria-pressed="true"\]\s*\{[^}]*color:\s*var\(--accent\);[^}]*border-color:\s*var\(--accent\);/,
+  "starred card buttons should show their pressed state"
 );
 assert.match(
   source,
@@ -457,8 +553,18 @@ assert.match(
 );
 assert.match(
   source,
-  /boardConfig\.topCards\.size\s*>\s*0[\s\S]*type:\s*"set"[\s\S]*top:\s*true[\s\S]*updateBoardCardPriorities/,
-  "new cards should be added to the top section when the board already has top cards"
+  /const columnHasTopCards = existingCards\.some\(\(card\) => card\.top\);[\s\S]*const createAsTop[\s\S]*options\.top && columnHasTopCards[\s\S]*type:\s*"set"[\s\S]*top:\s*true[\s\S]*type:\s*"delete"[\s\S]*fileName[\s\S]*updateBoardCardPriorities/,
+  "new cards should confirm current column top state and clear stale top-card markers"
+);
+assert.match(
+  scriptMatch[1],
+  /top:\s*hasTopCardsInColumn/,
+  "add ticket should pass the target column top-card state to the extension host"
+);
+assert.match(
+  scriptMatch[1],
+  /const hasTopCardsInColumn = topCards\.length > 0;/,
+  "add ticket should derive top placement from currently rendered top cards"
 );
 assert.match(
   html,
@@ -544,6 +650,7 @@ class FakeElement {
   set innerHTML(value) {
     this._innerHTML = String(value);
     this.children = [];
+    this.onInnerHTMLSet?.();
   }
 
   appendChild(child) {
@@ -630,6 +737,15 @@ class FakeElement {
 }
 
 const boardEl = new FakeElement("section");
+const boardScrollEl = new FakeElement("div");
+boardScrollEl.scrollTop = 0;
+boardScrollEl.scrollLeft = 0;
+const backToTopEl = new FakeElement("button");
+backToTopEl.hidden = true;
+boardEl.onInnerHTMLSet = () => {
+  boardScrollEl.scrollTop = 0;
+  boardScrollEl.scrollLeft = 0;
+};
 const layoutEl = new FakeElement("div");
 const detailsEl = new FakeElement("aside");
 const detailsResizerEl = new FakeElement("div");
@@ -641,7 +757,9 @@ const searchClearEl = new FakeElement("button");
 const detailsToggleEl = new FakeElement("button");
 const runnerPanelEl = new FakeElement("div");
 const windowListeners = {};
+const documentListeners = {};
 const messages = [];
+let webviewState = null;
 let activeElement = null;
 
 detailsEl.getBoundingClientRect = () => ({ left: 0, top: 0, width: 360, height: 100 });
@@ -680,8 +798,18 @@ const context = {
     postMessage(message) {
       messages.push(message);
     },
+    getState() {
+      return webviewState;
+    },
+    setState(state) {
+      webviewState = state;
+    },
   }),
   document: {
+    hidden: false,
+    addEventListener(type, handler) {
+      documentListeners[type] = handler;
+    },
     documentElement: {
       style: createStyleDeclaration(),
     },
@@ -689,6 +817,12 @@ const context = {
     getElementById(id) {
       if (id === "board") {
         return boardEl;
+      }
+      if (id === "board-scroll") {
+        return boardScrollEl;
+      }
+      if (id === "board-back-to-top") {
+        return backToTopEl;
       }
       if (id === "layout") {
         return layoutEl;
@@ -729,8 +863,15 @@ const context = {
   window: {
     innerWidth: 1440,
     innerHeight: 900,
+    scrollY: 0,
+    scrollTo(_x, y) {
+      this.scrollY = y;
+    },
     addEventListener(type, handler) {
-      windowListeners[type] = handler;
+      const previous = windowListeners[type];
+      windowListeners[type] = previous
+        ? (...args) => { previous(...args); handler(...args); }
+        : handler;
     },
   },
   Element: FakeElement,
@@ -778,8 +919,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
-          command: "claude / codex / opencode / kimi / deepcode",
+          label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+          command: "claude / codex / opencode / kimi / deepcode / devin",
           installed: false,
           version: "",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -796,7 +937,7 @@ assert.match(
   "runner panel should ask to create a local runner script when the default runner is missing"
 );
 assert.doesNotMatch(runnerPanelEl.innerHTML, /Python/, "runner panel should hide installed tool rows");
-assert.match(runnerPanelEl.innerHTML, /Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code/, "runner panel should show missing auto-agent status");
+assert.match(runnerPanelEl.innerHTML, /Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI/, "runner panel should show missing auto-agent status");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="openRunnerLink"/, "missing runner tools should render install links");
 assert.match(runnerPanelEl.innerHTML, /data-action-type="hideRunnerPanel"/, "runner panel should expose a hide action");
 assert.match(runnerPanelEl.innerHTML, /by default/, "runner panel hide should expose a persistent setting checkbox");
@@ -830,8 +971,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
-          command: "claude / codex / opencode / kimi / deepcode",
+          label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+          command: "claude / codex / opencode / kimi / deepcode / devin",
           installed: false,
           version: "",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -869,8 +1010,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
-          command: "claude / codex / opencode / kimi / deepcode",
+          label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+          command: "claude / codex / opencode / kimi / deepcode / devin",
           installed: true,
           version: "Claude Code 1.0.0",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -886,6 +1027,55 @@ assert.match(
   /keeps working if VS Code closes/,
   "runner panel should explain that the runner is detached from VS Code"
 );
+assert.match(
+  runnerPanelEl.innerHTML,
+  /data-runner-open-terminal/,
+  "runner panel should expose a terminal startup checkbox"
+);
+assert.match(
+  runnerPanelEl.innerHTML,
+  /Open in integrated terminal/,
+  "runner panel should label the terminal startup checkbox"
+);
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      runnerScriptDiffers: true,
+      requirements: {},
+    },
+  },
+});
+assert.match(runnerPanelEl.innerHTML, /Replace runner with bundled version/);
+const replaceRunnerButton = new FakeElement("button");
+replaceRunnerButton.setAttribute("data-action-type", "replaceRunner");
+replaceRunnerButton.closest = () => replaceRunnerButton;
+runnerPanelEl.listeners.click({
+  target: replaceRunnerButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(messages.at(-1)?.type, "replaceRunner");
+assert.match(runnerPanelEl.innerHTML, /Replacing\.\.\./);
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      runnerScriptDiffers: false,
+      requirements: {},
+    },
+  },
+});
+assert.doesNotMatch(runnerPanelEl.innerHTML, /Replace runner with bundled version/);
 
 const startRunnerButton = new FakeElement("button");
 startRunnerButton.setAttribute("data-action-type", "startRunner");
@@ -896,7 +1086,55 @@ runnerPanelEl.listeners.click({
   stopPropagation() {},
 });
 assert.equal(messages.at(-1)?.type, "startRunner", "runner panel should request runner startup");
+assert.equal(
+  messages.at(-1)?.openInTerminal,
+  false,
+  "runner panel should keep background startup as the default"
+);
 assert.match(runnerPanelEl.innerHTML, /Starting/, "runner panel should show pending startup state");
+
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      requirements: {
+        python: {
+          label: "Python",
+          command: "python",
+          installed: true,
+          version: "Python 3.11.9",
+          installUrl: "https://www.python.org/downloads/",
+        },
+        agent: {
+          label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+          command: "claude / codex / opencode / kimi / deepcode / devin",
+          installed: true,
+          version: "Claude Code 1.0.0",
+          installUrl: "https://docs.anthropic.com/en/docs/claude-code",
+        },
+      },
+    },
+  },
+});
+const openInTerminalInput = { checked: true };
+runnerPanelEl.querySelector = (selector) =>
+  selector === "[data-runner-open-terminal]" ? openInTerminalInput : null;
+runnerPanelEl.listeners.click({
+  target: startRunnerButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+assert.equal(messages.at(-1)?.type, "startRunner", "runner panel should request terminal runner startup");
+assert.equal(
+  messages.at(-1)?.openInTerminal,
+  true,
+  "runner panel should request integrated terminal startup when the checkbox is checked"
+);
+runnerPanelEl.querySelector = () => null;
 
 windowListeners.message({
   data: {
@@ -948,8 +1186,8 @@ windowListeners.message({
           installUrl: "https://www.python.org/downloads/",
         },
         agent: {
-          label: "Claude Code, Codex CLI, opencode, Kimi CLI, or Deep Code",
-          command: "claude / codex / opencode / kimi / deepcode",
+          label: "Claude Code, Codex CLI, opencode, Kimi CLI, Deep Code, or Devin CLI",
+          command: "claude / codex / opencode / kimi / deepcode / devin",
           installed: true,
           version: "Claude Code 1.0.0",
           installUrl: "https://docs.anthropic.com/en/docs/claude-code",
@@ -1168,6 +1406,41 @@ assert.equal(boardEl.children[1].children.length, 2, "expected second column hea
 assert.equal(boardEl.children[0].children[0].children[0].textContent, "Doing (2)");
 assert.equal(boardEl.children[1].children[0].children[0].textContent, "Backlog (1)");
 
+boardScrollEl.scrollTop = 480;
+boardScrollEl.scrollLeft = 90;
+boardScrollEl.listeners.scroll();
+assert.equal(backToTopEl.hidden, false, "Back to Top should appear after vertical board scrolling");
+assert.equal(webviewState.boardScrollTop, 480, "board scroll position should be saved in webview state");
+searchInputEl.listeners.input();
+assert.equal(boardScrollEl.scrollTop, 480, "board refresh should restore vertical scroll after clearing its contents");
+assert.equal(boardScrollEl.scrollLeft, 90, "board refresh should restore horizontal scroll after clearing its contents");
+
+context.document.hidden = true;
+documentListeners.visibilitychange();
+boardScrollEl.scrollTop = 0;
+boardScrollEl.scrollLeft = 0;
+boardScrollEl.listeners.scroll();
+searchInputEl.listeners.input();
+assert.equal(webviewState.boardScrollTop, 480, "a refresh while hidden must not overwrite saved scroll state");
+boardScrollEl.scrollTop = 0;
+boardScrollEl.scrollLeft = 0;
+context.document.hidden = false;
+documentListeners.visibilitychange();
+assert.equal(boardScrollEl.scrollTop, 480, "returning to the tab should restore the board position");
+assert.equal(boardScrollEl.scrollLeft, 90, "returning to the tab should restore horizontal position");
+
+backToTopEl.listeners.click();
+assert.equal(boardScrollEl.scrollTop, 0, "Back to Top should scroll the board to the top");
+assert.equal(boardScrollEl.scrollLeft, 90, "Back to Top should preserve the column position");
+assert.equal(backToTopEl.hidden, true, "Back to Top should hide again at the top");
+assert.equal(webviewState.boardScrollTop, 0, "Back to Top should update saved scroll state");
+context.window.scrollY = 240;
+windowListeners.scroll();
+assert.equal(backToTopEl.hidden, false, "Back to Top should also appear for page scrolling");
+backToTopEl.listeners.click();
+assert.equal(context.window.scrollY, 0, "Back to Top should scroll the page on narrow layouts");
+assert.equal(backToTopEl.hidden, true);
+
 let cardContextPrevented = false;
 let cardContextStopped = false;
 boardEl.children[0].children[1].listeners.contextmenu({
@@ -1330,8 +1603,33 @@ assert.equal(
 );
 assert.match(
   boardEl.children[0].children[2].innerHTML,
+  /class="card-actions"/,
+  "cards should render actions in a bottom action row"
+);
+assert.match(
+  boardEl.children[0].children[2].innerHTML,
   /data-card-action="bump"/,
   "cards should render a bump-to-top button"
+);
+assert.match(
+  boardEl.children[0].children[1].innerHTML,
+  /data-card-action="sink"/,
+  "cards should render a move-to-bottom button"
+);
+assert.match(
+  boardEl.children[0].children[1].innerHTML,
+  /data-card-action="star"/,
+  "cards should render a star button"
+);
+assert.match(
+  boardEl.children[0].children[1].innerHTML,
+  /data-card-action="delete"/,
+  "cards should render a delete button"
+);
+assert.equal(
+  (boardEl.children[0].children[1].innerHTML.match(/<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">/g) || []).length,
+  4,
+  "all card actions should use icons"
 );
 
 const bumpButton = new FakeElement("button");
@@ -1351,6 +1649,25 @@ assert.deepEqual(
   messages.at(-1)?.orderedUris,
   ["file:///second.md", "file:///task.md"],
   "bump button should move the card to the top of its column"
+);
+
+const sinkButton = new FakeElement("button");
+sinkButton.setAttribute("data-card-action", "sink");
+sinkButton.closest = () => sinkButton;
+
+boardEl.children[0].children[1].listeners.click({
+  target: sinkButton,
+  preventDefault() {},
+  stopPropagation() {},
+});
+
+assert.equal(messages.at(-1)?.type, "reorderCards", "move-to-bottom button should reorder cards");
+assert.equal(messages.at(-1)?.sourceColumnId, "Doing");
+assert.equal(messages.at(-1)?.targetColumnId, "Doing");
+assert.deepEqual(
+  messages.at(-1)?.orderedUris,
+  ["file:///second.md", "file:///task.md"],
+  "move-to-bottom button should move the card to the bottom of its column"
 );
 
 const sameColumnTransfer = createDataTransfer();
@@ -1541,49 +1858,17 @@ assert.match(
   /data-action-type="openUrl"/,
   "details should render an open-url action for URL properties"
 );
-assert.match(
-  detailsEl.innerHTML,
-  /class="details-top-toggle"/,
-  "details should render a top-section toggle button"
-);
-assert.match(
-  detailsEl.innerHTML,
-  /data-action-type="toggleTopCard"/,
-  "details top toggle should post a top-card action"
-);
-assert.match(
-  detailsEl.innerHTML,
-  /aria-pressed="false"/,
-  "details top toggle should be unpressed for regular cards"
-);
-assert.ok(
-  detailsEl.innerHTML.indexOf('data-action-type="toggleTopCard"') <
-    detailsEl.innerHTML.indexOf('data-action-type="deleteCard"'),
-  "details top toggle should render to the left of the delete button"
-);
-assert.match(
-  detailsEl.innerHTML,
-  /class="details-delete"/,
-  "details should render a delete ticket button"
-);
-assert.match(
-  detailsEl.innerHTML,
-  /data-action-type="deleteCard"/,
-  "details delete button should post a delete card action"
-);
 assert.doesNotMatch(
-  boardEl.children[0].children[2].innerHTML,
-  /deleteCard|details-delete/,
-  "card tiles should not render the delete action"
+  detailsEl.innerHTML,
+  /details-actions-row|details-top-toggle|details-delete|data-action-type="toggleTopCard"|data-action-type="deleteCard"/,
+  "star and delete actions should be on cards, not in details"
 );
 
 const topToggleButton = new FakeElement("button");
-topToggleButton.setAttribute("data-action-type", "toggleTopCard");
-topToggleButton.setAttribute("data-action-value", "file:///task.md");
-topToggleButton.setAttribute("aria-pressed", "false");
+topToggleButton.setAttribute("data-card-action", "star");
 topToggleButton.closest = () => topToggleButton;
 
-detailsEl.listeners.click({
+boardEl.children[0].children[1].listeners.click({
   target: topToggleButton,
   preventDefault() {},
   stopPropagation() {},
@@ -1748,11 +2033,10 @@ assert.equal(messages.at(-1)?.type, "openUrl");
 assert.equal(messages.at(-1)?.url, "https://example.com/task");
 
 const deleteButton = new FakeElement("button");
-deleteButton.setAttribute("data-action-type", "deleteCard");
-deleteButton.setAttribute("data-action-value", "file:///task.md");
+deleteButton.setAttribute("data-card-action", "delete");
 deleteButton.closest = () => deleteButton;
 
-detailsEl.listeners.click({
+boardEl.children[0].children[1].listeners.click({
   target: deleteButton,
   preventDefault() {},
   stopPropagation() {},
@@ -1909,6 +2193,69 @@ assert.equal(
   boardEl.children[0].children[1].style.getPropertyValue("--top-section-height"),
   "100px",
   "top section sync should write an explicit shared height"
+);
+boardEl.children[0].children[0].children[1].listeners.click();
+assert.equal(messages.at(-1)?.type, "requestNewCard", "add ticket should request a new card");
+assert.equal(messages.at(-1)?.columnId, "Doing");
+assert.equal(
+  messages.at(-1)?.top,
+  true,
+  "add ticket should request top placement when the target column has top cards"
+);
+
+windowListeners.message({
+  data: {
+    type: "boardData",
+    board: {
+      columns: [
+        {
+          id: "Doing",
+          name: "Doing",
+          order: 1,
+          cards: [
+            {
+              uri: "file:///regular.md",
+              fileName: "regular.md",
+              title: "Regular card",
+              searchText: "regular card\nregular.md",
+              properties: [],
+              tags: [],
+              priority: 1,
+              top: false,
+              createdAt: 1000,
+              updatedAt: 2000,
+            },
+          ],
+        },
+        {
+          id: "Backlog",
+          name: "Backlog",
+          order: 2,
+          cards: [
+            {
+              uri: "file:///top-elsewhere.md",
+              fileName: "top-elsewhere.md",
+              title: "Top elsewhere",
+              searchText: "top elsewhere\ntop-elsewhere.md",
+              properties: [],
+              tags: [],
+              priority: 1,
+              top: true,
+              createdAt: 1000,
+              updatedAt: 2000,
+            },
+          ],
+        },
+      ],
+    },
+  },
+});
+boardEl.children[0].children[0].children[1].listeners.click();
+assert.equal(messages.at(-1)?.type, "requestNewCard", "add ticket should request a new card in mixed top mode");
+assert.equal(
+  messages.at(-1)?.top,
+  false,
+  "add ticket should not request top placement only because another column has top cards"
 );
 
 windowListeners.message({

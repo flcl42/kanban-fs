@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 
 root = Path(__file__).resolve().parents[1]
@@ -50,14 +51,35 @@ assert runner.agent_kind_from_value("deepcode") == runner.AgentKind.DEEPSEEK
 assert runner.agent_kind_from_value("ds") == runner.AgentKind.DEEPSEEK
 assert runner.agent_kind_from_value("opencode") == runner.AgentKind.OPENCODE
 assert runner.agent_kind_from_value("oc") == runner.AgentKind.OPENCODE
+assert runner.agent_kind_from_value("devin") == runner.AgentKind.DEVIN
 assert runner.has_manual_agent_tag(["manual"])
 assert runner.has_manual_agent_tag(["human"])
 assert runner.has_manual_agent_tag(["agent:manual"])
+assert runner.TaskCard(
+    "ticket.md",
+    runner.TaskStep.BACKLOG,
+    runner.BoardPaths("."),
+    "# Ticket\nTags: runner\nTag: manual, UX\n",
+).tags == ["runner", "manual", "UX"]
 assert runner.parse_default_agent("manual") == runner.MANUAL_AGENT_VALUE
 assert runner.parse_default_agent("human") == runner.MANUAL_AGENT_VALUE
 assert runner.parse_default_agent("opencode") == runner.AgentKind.OPENCODE
 assert runner.parse_default_agent("oc") == runner.AgentKind.OPENCODE
+assert runner.parse_default_agent("devin") == runner.AgentKind.DEVIN
 assert runner.BoardTemplates.projects_template() == "blank = https://github.com/flcl42/blank.git\n"
+assert (
+    runner.ProjectAliases.github_repo_url("NethermindEth/nethermind")
+    == "https://github.com/NethermindEth/nethermind.git"
+)
+assert (
+    runner.ProjectAliases.github_repo_url("github.com/NethermindEth/nethermind")
+    == "https://github.com/NethermindEth/nethermind.git"
+)
+assert (
+    runner.ProjectAliases.github_repo_url("https://github.com/NethermindEth/nethermind")
+    == "https://github.com/NethermindEth/nethermind"
+)
+assert runner.ProjectAliases.github_repo_url("nmc") is None
 assert (
     runner.BoardTemplates.default_task_template()
     == "# {{TITLE}}\n\nTags: \nProject: {{CURSOR}}\nModel: \n\n## Description\n\n\n"
@@ -90,6 +112,7 @@ assert '  claude: ""' in seeded_kanban_config
 assert '  kimi: ""' in seeded_kanban_config
 assert '  deepseek: ""' in seeded_kanban_config
 assert '  opencode: ""' in seeded_kanban_config
+assert '  devin: ""' in seeded_kanban_config
 assert "knowledge/README.md" in runner.BoardTemplates.default_context_template()
 assert "# Knowledge" in runner.BoardTemplates.default_knowledge_readme_template()
 with tempfile.TemporaryDirectory() as temp_dir:
@@ -196,6 +219,79 @@ with tempfile.TemporaryDirectory() as temp_dir:
         runner.candidate_status_ports = original_candidate_status_ports
         stop_status_server.set()
         listener.close()
+class QuietLog:
+    def __init__(self):
+        self.info_messages = []
+        self.warn_messages = []
+
+    def info(self, message):
+        self.info_messages.append(message)
+
+    def warn(self, message):
+        self.warn_messages.append(message)
+
+
+original_popen = runner.subprocess.Popen
+quiet_log = QuietLog()
+
+
+def noisy_git_popen(_command, **kwargs):
+    script = (
+        "import sys\n"
+        "for index in range(20000):\n"
+        "    sys.stderr.write(f'remote: update {index}\\n')\n"
+        "sys.stderr.flush()\n"
+        "sys.stdout.write('git done\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+    return original_popen([sys.executable, "-c", script], **kwargs)
+
+
+try:
+    runner.subprocess.Popen = noisy_git_popen
+    started = time.monotonic()
+    runner.GitCli._run(["fetch", "--all", "--prune"], quiet_log)
+    assert time.monotonic() - started < 5
+    assert any("git done" in message for message in quiet_log.info_messages)
+    assert len(quiet_log.warn_messages) == 20000
+finally:
+    runner.subprocess.Popen = original_popen
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp_root = Path(temp_dir)
+    parsed = runner.OrchestratorSettings.parse(["--root", str(temp_root), "--once"], str(temp_root))
+    orchestrator = runner.TaskOrchestrator(parsed)
+    orchestrator.ensure_board_scaffold()
+    repo_path = temp_root / "projects" / "blank" / "lightclient-research"
+    repo_path.mkdir(parents=True)
+    (repo_path / "research.md").write_text("Keep this work.\n", encoding="utf-8")
+    done_path = temp_root / "tasks" / "done" / "lightclient-research.md"
+    done_path.write_text(
+        f"# Lightclient research\n\nProject: blank\nRepo: {repo_path}\n\n## Comments\n\n### Report\n",
+        encoding="utf-8",
+    )
+    done_card = runner.TaskCard.load(str(done_path), runner.TaskStep.DONE, orchestrator.paths)
+    orchestrator.trash_completed_blank_workspace(done_card)
+    orchestrator.sweep_repositories(force=True)
+    assert repo_path.is_dir(), "done blank workspaces must remain available for review"
+    assert str(repo_path) in done_path.read_text(encoding="utf-8")
+
+    confirmed_path = temp_root / "tasks" / "confirmed" / done_path.name
+    done_path.rename(confirmed_path)
+    shared_done_path = temp_root / "tasks" / "done" / "other-task.md"
+    shared_done_path.write_text(
+        f"# Other task\n\nProject: blank\nRepo: {repo_path}\n",
+        encoding="utf-8",
+    )
+    orchestrator.sweep_repositories(force=True)
+    assert repo_path.is_dir(), "an unconfirmed task reference must keep a shared workspace"
+
+    shared_done_path.unlink()
+    orchestrator.trash_completed_blank_workspaces()
+    trashed_path = temp_root / "trash" / "blank" / repo_path.name
+    assert not repo_path.exists()
+    assert (trashed_path / "research.md").read_text(encoding="utf-8") == "Keep this work.\n"
+    assert str(trashed_path) in confirmed_path.read_text(encoding="utf-8")
+
 with tempfile.TemporaryDirectory() as temp_dir:
     temp_root = Path(temp_dir)
     parsed = runner.OrchestratorSettings.parse(["--root", str(temp_root), "--once"], str(temp_root))
@@ -331,11 +427,15 @@ assert (
     runner.agent_kind_from_agent_id("ses_fd76fc5e6ffeQJ9GZMIaR6Hq5e")
     == runner.AgentKind.OPENCODE
 )
+assert runner.agent_kind_from_agent_id("devin:abc12345") == runner.AgentKind.DEVIN
+assert runner.devin_cli_session_id("devin:abc12345") == "abc12345"
+assert runner.format_devin_session_id("abc12345") == "devin:abc12345"
 assert runner.agent_kind_from_tags(["agent:kimi"]) == runner.AgentKind.KIMI
 assert runner.agent_kind_from_tags(["deepseek"]) == runner.AgentKind.DEEPSEEK
 assert runner.agent_kind_from_tags(["ds"]) == runner.AgentKind.DEEPSEEK
 assert runner.agent_kind_from_tags(["deepcode"]) == runner.AgentKind.DEEPSEEK
 assert runner.agent_kind_from_tags(["oc"]) == runner.AgentKind.OPENCODE
+assert runner.agent_kind_from_tags(["agent=devin"]) == runner.AgentKind.DEVIN
 assert runner.agent_kind_from_tags(["manual"]) is None
 assert runner.parse_kimi_json_line(
     '{"role":"meta","type":"session.resume_hint","session_id":"session_1d11f261-5711-42ff-8a3a-fb7146ec5988"}',
@@ -372,6 +472,13 @@ assert (
     )
     == "ORCHESTRATOR_STATUS: DONE"
 )
+devin_state = {}
+runner.parse_devin_line(
+    '{"session_id":"abc12345","role":"assistant","content":"ORCHESTRATOR_STATUS: DONE"}',
+    devin_state,
+)
+assert devin_state["session_id"] == "devin:abc12345"
+assert devin_state["final_agent_message"] == "ORCHESTRATOR_STATUS: DONE"
 claude_state = {}
 runner.parse_claude_json_line(
     '{"type":"system","session_id":"4d4c6b89-9a23-4bfc-a072-220e08f32dc6"}',
@@ -472,6 +579,12 @@ assert runner.opencode_model_arguments(opencode_go_glm_model) == [
     "--model",
     "opencode-go/glm-5.3",
 ]
+devin_model = runner.parse_model_spec("devin/swe-2/max")
+assert devin_model is not None
+assert devin_model.agent_kind == runner.AgentKind.DEVIN
+assert devin_model.model == "swe-2"
+assert devin_model.effort == "max"
+assert runner.devin_model_arguments(devin_model) == ["--model", "swe-2-max"]
 with tempfile.TemporaryDirectory() as temp_dir:
     temp_root = Path(temp_dir)
     settings = runner.OrchestratorSettings(
@@ -488,6 +601,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         kimi_executable="kimi",
         deepseek_executable="deepcode",
         opencode_executable="opencode",
+        devin_executable="devin",
     )
     log_path = temp_root / "runner.log"
     agent_runner = runner.AgentRunner(
@@ -511,6 +625,37 @@ with tempfile.TemporaryDirectory() as temp_dir:
     assert "NoSession did not report a session id within 0.2 seconds" in log_path.read_text(
         encoding="utf-8"
     )
+    repo_path = temp_root / "repo"
+    repo_path.mkdir()
+    card_path = temp_root / "opencode-task.md"
+    card_path.write_text("# OpenCode task\nModel: opencode/opencode-go/glm-5.3\n", encoding="utf-8")
+    card = runner.TaskCard.load(str(card_path), runner.TaskStep.DOING, agent_runner.paths)
+    opencode_runner = runner.OpencodeRunner(settings, agent_runner.paths, agent_runner.log)
+    failed = runner.AgentRunResult(
+        1,
+        "ses_abc123",
+        "",
+        [json.dumps({"type": "error", "error": {"data": {"message": "Model not found: example"}}})],
+        [],
+    )
+    assert runner.opencode_failure_message(failed) == "Model not found: example"
+    with (
+        patch.object(runner.ToolPaths, "resolve_executable", return_value="opencode"),
+        patch.object(runner.OpencodeSessions, "session_ids_for_workdir", return_value=set()),
+        patch.object(runner.OpencodeSessions, "final_assistant_message", return_value=""),
+        patch.object(opencode_runner, "_run_process", return_value=failed),
+    ):
+        opencode_runner.run(card, str(repo_path), "Read the task", None)
+    prompt_path = repo_path / f".kanban-runner-prompt-{runner.hash_path(card.path)}.md"
+    assert prompt_path.read_text(encoding="utf-8") == "Read the task"
+    completed = runner.AgentRunResult(0, "ses_abc123", "ORCHESTRATOR_STATUS: DONE", [], [])
+    with (
+        patch.object(runner.ToolPaths, "resolve_executable", return_value="opencode"),
+        patch.object(runner.OpencodeSessions, "session_ids_for_workdir", return_value=set()),
+        patch.object(opencode_runner, "_run_process", return_value=completed),
+    ):
+        opencode_runner.run(card, str(repo_path), "Read the task", None)
+    assert not prompt_path.exists()
 codex_default_model = runner.parse_agent_default_model(
     runner.AgentKind.CODEX, "gpt-5.6-sol/ultra"
 )
@@ -604,6 +749,9 @@ assert "else:\n                    listener.setsockopt(socket.SOL_SOCKET, socket
 assert "GIT_COMMAND_TIMEOUT_SECONDS" in runner_source
 assert '"GIT_TERMINAL_PROMPT": "0"' in runner_source
 assert '"GCM_INTERACTIVE": "never"' in runner_source
+assert "_start_output_drain(process.stdout" in runner_source
+assert "_start_output_drain(process.stderr" in runner_source
+assert "os.read(file_descriptor, 8192)" in runner_source
 assert "timed out after {GIT_COMMAND_TIMEOUT_SECONDS} seconds" in runner_source
 assert "exiting duplicate runner" in runner_source
 assert "model_spec = card.model_spec or (" in runner_source
@@ -647,6 +795,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
         kimi_executable="kimi",
         deepseek_executable="deepcode",
         opencode_executable="opencode",
+        devin_executable="devin",
     )
     resolver = runner.AgentResolver(settings, runner.LogSink(str(temp_root / "runner.log")))
     resolver.is_agent_available = lambda _kind: True
@@ -749,6 +898,7 @@ Repo:
         kimi_executable="kimi",
         deepseek_executable="deepcode",
         opencode_executable="opencode",
+        devin_executable="devin",
     )
     manual_default_resolver = runner.AgentResolver(
         manual_default_settings, runner.LogSink(str(temp_root / "manual-runner.log"))
@@ -998,10 +1148,12 @@ with tempfile.TemporaryDirectory() as temp_dir:
   "kanban.kimiExecutable": "custom-kimi",
   "kanban.deepseekExecutable": "custom-deepcode",
   "kanban.opencodeExecutable": "custom-opencode",
+  "kanban.devinExecutable": "custom-devin",
   "kanban.defaultModels": {
     "codex": "gpt-5.6-sol/ultra",
     "claude": "claude/sonnet/max",
-    "opencode": "moonshotai/kimi-k3/minimal"
+    "opencode": "moonshotai/kimi-k3/minimal",
+    "devin": "swe/high"
   },
 }
 """,
@@ -1014,6 +1166,7 @@ with tempfile.TemporaryDirectory() as temp_dir:
   codex: gpt-5.6-terra/high
   deepseek: deepseek-v4-flash/high
   opencode: opencode/deepseek/deepseek-v4-pro/max
+  devin: devin/swe-2/max
 folders:
   backlog: backlog
 """,
@@ -1029,6 +1182,7 @@ folders:
         assert parsed.kimi_executable == "custom-kimi"
         assert parsed.deepseek_executable == "custom-deepcode"
         assert parsed.opencode_executable == "custom-opencode"
+        assert parsed.devin_executable == "custom-devin"
         assert (
             parsed.default_models[runner.AgentKind.CODEX].raw
             == "codex/gpt-5.6-terra/high"
@@ -1045,6 +1199,7 @@ folders:
             parsed.default_models[runner.AgentKind.OPENCODE].raw
             == "opencode/deepseek/deepseek-v4-pro/max"
         )
+        assert parsed.default_models[runner.AgentKind.DEVIN].raw == "devin/swe-2/max"
 
         override = runner.OrchestratorSettings.parse(
             [
@@ -1060,6 +1215,8 @@ folders:
                 "cli-deepcode",
                 "--opencode-executable",
                 "cli-opencode",
+                "--devin-executable",
+                "cli-devin",
             ],
             str(temp_root),
         )
@@ -1069,6 +1226,7 @@ folders:
         assert override.kimi_executable == "cli-kimi"
         assert override.deepseek_executable == "cli-deepcode"
         assert override.opencode_executable == "cli-opencode"
+        assert override.devin_executable == "cli-devin"
         manual_override = runner.OrchestratorSettings.parse(
             ["--root", str(temp_root), "--default-agent", "manual"],
             str(temp_root),
@@ -1128,6 +1286,47 @@ Run with the default project.
     assert started["card"].project_alias == runner.ProjectAliases.BLANK_WORKSPACE_ALIAS
     assert started["assignment"].workspace_alias == runner.ProjectAliases.BLANK_WORKSPACE_ALIAS
     assert "Project: blank" in task_path.read_text(encoding="utf-8")
+
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    temp_root = Path(temp_dir)
+    parsed = runner.OrchestratorSettings.parse(["--root", str(temp_root), "--once"], str(temp_root))
+    orchestrator = runner.TaskOrchestrator(parsed)
+    orchestrator.ensure_board_scaffold()
+    (temp_root / "projects.md").write_text(
+        "NethermindEth/nethermind = https://example.invalid/wrong.git\n",
+        encoding="utf-8",
+    )
+    task_path = temp_root / "tasks" / "backlog" / "direct-github.md"
+    task_path.write_text(
+        """# Direct GitHub
+
+Tags:
+Project: NethermindEth/nethermind
+Model: codex/test
+Agent:
+Repo:
+
+## Description
+
+Use GitHub shorthand directly.
+""",
+        encoding="utf-8",
+    )
+    started = {}
+
+    def fake_start(card, assignment):
+        started["card"] = card
+        started["assignment"] = assignment
+
+    orchestrator.start_or_resume_task = fake_start
+    orchestrator.reconcile()
+    assert started["card"].project_alias == "NethermindEth/nethermind"
+    assert started["assignment"].workspace_alias == "NethermindEth/nethermind"
+    assert (
+        started["assignment"].repo_url
+        == "https://github.com/NethermindEth/nethermind.git"
+    )
 
 
 with tempfile.TemporaryDirectory() as temp_dir:

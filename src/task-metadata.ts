@@ -70,7 +70,7 @@ export function parseTaskMarkdown(
           value: sanitizeTaskDisplayValue(property.value),
         };
         properties.push(displayProperty);
-        if (displayProperty.key.toLowerCase() === "tags") {
+        if (/^tags?$/i.test(displayProperty.key)) {
           for (const tag of displayProperty.value
             .split(",")
             .map((item) => item.trim())
