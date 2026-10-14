@@ -73,7 +73,7 @@ Behavior:
 
 - `Project:` picks the repo alias from `projects.md`. Use `Project: blank` or `Project: -` for a temporary workspace. It stays available while the task is in `done` and moves to `trash/` after the task reaches `confirmed`.
 - `Tags:` can select an agent per card. Supported markers include `claude`, `codex`, `opencode`, `oc`, `kimi`, `deepseek`, `ds`, `deepcode`, `agent:claude`, `agent:codex`, `agent:opencode`, `agent:oc`, `agent:kimi`, and `agent:deepseek`. Use `manual` or `human` for user-managed cards that the runner should leave in backlog without assigning an agent.
-- `Model:` can choose the initial model for a new session. Use `agent/model` or `agent/model/effort`, for example `Model: codex/gpt-5.6-luna/max`, `Model: opencode/moonshotai/kimi-k3/minimal`, `Model: opencode/opencode-go/glm-5.3`, or `Model: deepseek/deepseek-v4-pro/max`. Codex maps effort to `model_reasoning_effort`, Claude maps effort to `--effort`, opencode maps effort to `--variant`, DeepSeek maps model and `high` or `max` effort to Deep Code environment settings, and Kimi supports `agent/model` only. Supported Codex and Claude effort values are `ultra`, `max`, `xhigh`, `high`, `medium`, and `low`; opencode variants include `max`, `high`, `medium`, `low`, and `minimal`; Deep Code supports `max` and `high`. If `Model:` is empty, `.kanban` `defaultModels` applies for that board; if the board has no default for that agent, VS Code `kanban.defaultModels` applies; if neither is set, the agent CLI uses its own default. The VS Code extension offers completions on `Model:` lines for these formats, configured defaults, and values from `kanban.modelCompletions`, while still accepting custom model names.
+- `Model:` can choose the initial model for a new session. Use `agent/model` or `agent/model/effort`, for example `Model: codex/gpt-6.1-sol/max`, `Model: opencode/opencode-go/kimi-k3/max`, `Model: opencode/opencode-go/glm-5.3`, or `Model: deepseek/deepseek-v4-pro/max`. Codex maps effort to `model_reasoning_effort`, Claude maps effort to `--effort`, opencode maps effort to `--variant`, DeepSeek maps model and `high` or `max` effort to Deep Code environment settings, and Kimi supports `agent/model` only. Supported Codex and Claude effort values are `ultra`, `max`, `xhigh`, `high`, `medium`, and `low`; opencode variants include `max`, `xhigh`, `high`, `medium`, `low`, and `minimal`; Deep Code supports `max` and `high`. If `Model:` is empty, `.kanban` `defaultModels` applies for that board; if the board has no default for that agent, VS Code `kanban.defaultModels` applies; if neither is set, the agent CLI uses its own default. The VS Code extension offers completions on `Model:` lines for these formats, configured defaults, and values from `kanban.modelCompletions`, while still accepting custom model names.
 - `Agent:` stores the agent session id so a task can resume later.
 - `Agent Kind:` is tolerated for older cards. New cards can rely on the `Agent:` id format and local session files: Codex uses UUIDv7-style ids, Claude uses UUIDv4-style ids, opencode uses `ses_...` ids, Kimi uses `session_<uuid>` ids, and Deep Code stores UUID session files under `.deepcode`. Clear `Agent:` if you intentionally want a card to start a fresh session with a different agent.
 - `Repo:` stores the repo working-copy path or cache path.
@@ -88,7 +88,7 @@ defaultModels:
   claude: claude/sonnet/max
   kimi: kimi/k2
   deepseek: deepseek/deepseek-v4-pro/max
-  opencode: opencode/moonshotai/kimi-k3
+  opencode: opencode/opencode-go/kimi-k3
 ```
 
 ## Running
