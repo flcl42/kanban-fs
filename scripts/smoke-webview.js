@@ -228,6 +228,12 @@ assert.deepEqual(
     "claude/haiku/high",
     "claude/haiku/medium",
     "claude/haiku/low",
+    "claude/claude-mythos-5-1/ultra",
+    "claude/claude-mythos-5-1/max",
+    "claude/claude-mythos-5-1/xhigh",
+    "claude/claude-mythos-5-1/high",
+    "claude/claude-mythos-5-1/medium",
+    "claude/claude-mythos-5-1/low",
     "kimi/k2",
     "opencode/opencode-go/cat-jam-free",
     "opencode/opencode-go/claude-haiku-5-5",
@@ -615,8 +621,8 @@ assert.match(
 );
 assert.match(
   source,
-  /const columnHasTopCards = existingCards\.some\(\(card\) => card\.top\);[\s\S]*const createAsTop[\s\S]*options\.top && columnHasTopCards[\s\S]*type:\s*"set"[\s\S]*top:\s*true[\s\S]*type:\s*"delete"[\s\S]*fileName[\s\S]*updateBoardCardPriorities/,
-  "new cards should confirm current column top state and clear stale top-card markers"
+  /const columnHasTopCards = existingCards\.some\(\(card\) => card\.top\);[\s\S]*const createAsTop[\s\S]*typeof options\.top === "boolean"[\s\S]*\? options\.top[\s\S]*: columnHasTopCards[\s\S]*type:\s*"set"[\s\S]*top:\s*true[\s\S]*type:\s*"delete"[\s\S]*fileName[\s\S]*updateBoardCardPriorities/,
+  "new cards should honor the requested top placement and clear stale top-card markers"
 );
 assert.match(
   scriptMatch[1],
@@ -627,6 +633,16 @@ assert.match(
   scriptMatch[1],
   /const hasTopCardsInColumn = topCards\.length > 0;/,
   "add ticket should derive top placement from currently rendered top cards"
+);
+assert.match(
+  html,
+  /\.card:hover\s*\{[^}]*border-color:[^}]*\}/,
+  "card hover should highlight edges without moving the card"
+);
+assert.doesNotMatch(
+  html,
+  /\.card:hover\s*\{[^}]*transform:/,
+  "card hover should not shift card position"
 );
 assert.match(
   html,

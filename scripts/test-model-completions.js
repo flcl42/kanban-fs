@@ -81,6 +81,12 @@ assert.deepEqual(
     "claude/haiku/high",
     "claude/haiku/medium",
     "claude/haiku/low",
+    "claude/claude-mythos-5-1/ultra",
+    "claude/claude-mythos-5-1/max",
+    "claude/claude-mythos-5-1/xhigh",
+    "claude/claude-mythos-5-1/high",
+    "claude/claude-mythos-5-1/medium",
+    "claude/claude-mythos-5-1/low",
     "kimi/k2",
     "opencode/opencode-go/cat-jam-free",
     "opencode/opencode-go/claude-haiku-5-5",
@@ -375,6 +381,13 @@ assert.ok(
     (completion) => completion.insertText === "claude/opus/medium"
   ),
   "Claude Opus model values should offer every effort completion"
+);
+
+assert.ok(
+  getMatchingModelValueCompletions("claude/claude-mythos").some(
+    (completion) => completion.insertText === "claude/claude-mythos-5-1/xhigh"
+  ),
+  "Claude Mythos model values should be built in"
 );
 
 assert.ok(

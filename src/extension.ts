@@ -2613,7 +2613,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     const columnHasTopCards = existingCards.some((card) => card.top);
     const createAsTop =
       typeof options.top === "boolean"
-        ? options.top && columnHasTopCards
+        ? options.top
         : columnHasTopCards;
     const topCardMutations: TopCardConfigMutation[] =
       createAsTop
@@ -5497,11 +5497,12 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
       display: flex;
       flex-direction: column;
       gap: 6px;
-      transition: transform 0.12s ease, box-shadow 0.12s ease;
+      transition: box-shadow 0.12s ease, border-color 0.12s ease;
     }
     .card:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 16px 24px -16px var(--shadow);
+      border-color: var(--accent);
+      border-left-color: var(--card-accent);
+      box-shadow: 0 0 0 1px var(--accent), 0 8px 16px -14px var(--shadow);
     }
     .card.static {
       cursor: default;
