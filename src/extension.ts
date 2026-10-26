@@ -6049,6 +6049,11 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     let runnerCreatePending = false;
     let runnerReplacePending = false;
     let runnerPanelHiddenForSession = false;
+    let openInTerminalPreferred = Boolean(savedViewport.openInTerminal);
+    const saveOpenInTerminalPreference = (value) => {
+      openInTerminalPreferred = Boolean(value);
+      vscode.setState({ ...(vscode.getState() || {}), openInTerminal: openInTerminalPreferred });
+    };
     const gitStatusCache = new Map();
     const agentOutputCache = new Map();
     const cardDetailsCache = new Map();
@@ -6172,7 +6177,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
             \${runnerStartPending ? "Starting..." : missingRequirements.length ? "Install requirements" : "Start runner"}
           </button>
           <label class="runner-terminal-option" title="Open the runner in a visible VS Code terminal so Ctrl+C is available.">
-            <input type="checkbox" data-runner-open-terminal \${runnerStartPending || missingRequirements.length ? "disabled" : ""} />
+            <input type="checkbox" data-runner-open-terminal \${openInTerminalPreferred ? "checked" : ""} \${runnerStartPending || missingRequirements.length ? "disabled" : ""} />
             Open in integrated terminal
           </label>
         </div>
@@ -7765,6 +7770,15 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
     }
 
     if (runnerPanelEl) {
+      runnerPanelEl.addEventListener("change", (event) => {
+        const terminalInput = event?.target instanceof Element
+          ? event.target.closest("[data-runner-open-terminal]")
+          : null;
+        if (!terminalInput) {
+          return;
+        }
+        saveOpenInTerminalPreference(terminalInput.checked);
+      });
       runnerPanelEl.addEventListener("click", (event) => {
         const actionButton = event.target instanceof Element
           ? event.target.closest("[data-action-type]")
@@ -7812,6 +7826,7 @@ class KanbanEditorProvider implements vscode.CustomEditorProvider {
         }
         const openInTerminalInput = runnerPanelEl.querySelector("[data-runner-open-terminal]");
         const openInTerminal = Boolean(openInTerminalInput?.checked);
+        saveOpenInTerminalPreference(openInTerminal);
         runnerStartPending = true;
         renderRunnerPanel();
         vscode.postMessage({ type: "startRunner", openInTerminal });

@@ -1212,6 +1212,55 @@ assert.equal(
   true,
   "runner panel should request integrated terminal startup when the checkbox is checked"
 );
+assert.equal(
+  webviewState.openInTerminal,
+  true,
+  "starting the runner should remember the terminal checkbox state"
+);
+assert.equal(typeof runnerPanelEl.listeners.change, "function", "terminal checkbox changes should be observed");
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      requirements: {},
+    },
+  },
+});
+assert.match(
+  runnerPanelEl.innerHTML,
+  /data-runner-open-terminal checked/,
+  "runner panel should restore the remembered terminal checkbox state"
+);
+const terminalCheckbox = new FakeElement("input");
+terminalCheckbox.checked = false;
+terminalCheckbox.closest = () => terminalCheckbox;
+runnerPanelEl.listeners.change({ target: terminalCheckbox });
+assert.equal(
+  webviewState.openInTerminal,
+  false,
+  "unchecking the terminal checkbox should clear the remembered preference"
+);
+windowListeners.message({
+  data: {
+    type: "runnerStatus",
+    status: {
+      enabled: true,
+      running: false,
+      runnerScriptRequired: true,
+      runnerScriptExists: true,
+      requirements: {},
+    },
+  },
+});
+assert.doesNotMatch(
+  runnerPanelEl.innerHTML,
+  /data-runner-open-terminal checked/,
+  "runner panel should not check the terminal checkbox after the preference is cleared"
+);
 runnerPanelEl.querySelector = () => null;
 
 windowListeners.message({
